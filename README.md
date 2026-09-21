@@ -10,7 +10,7 @@ Cloudflare Workers 1つで完結し、ビルドステップはありません。
 ## 必要なもの
 
 - Node.js 22 以上
-- Cloudflare アカウント(Workers AI と Workers KV を使います)
+- Cloudflare アカウント(Workers AI と Durable Objects を使います)
 
 ## セットアップ
 
@@ -34,25 +34,27 @@ npm test
 npm run check
 ```
 
-## KV ネームスペース
+## レート制限のカウンタ(Durable Object)
 
-レート制限のカウンタに Workers KV を使います。`wrangler.toml` の `RATE_LIMIT_KV` の `id` は
-**作成済みのものが入っている**ので、このリポジトリをそのまま使う場合の手作業はありません。
-フォークして自分のアカウントにデプロイする場合は、一度だけネームスペースを作り直して
-`id` を差し替えてください。
-
-```sh
-npx wrangler kv namespace create RATE_LIMIT_KV
-```
-
-出力された `id` を `wrangler.toml` の以下の箇所に書き込んでコミットします(id は秘密情報では
-ありません)。
+レート制限のカウンタは Durable Object(クラス `RateLimitCounter`、バインディング
+`RATE_LIMITER`)に置いています。**事前の手作業はありません**。`wrangler deploy` が
+`wrangler.toml` の `[[migrations]]` を見てクラスを作るので、フォークして自分のアカウントに
+デプロイする場合もそのまま動きます。
 
 ```toml
-[[kv_namespaces]]
-binding = "RATE_LIMIT_KV"
-id = "..."  # ← ここを差し替える
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimitCounter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimitCounter"]
 ```
+
+以前は Workers KV を使っていましたが、KV は結果整合で `get` がコロケーションごとに
+キャッシュされるため、複数拠点からの同時アクセスでカウントが上書きし合い、全体上限が
+本来の目的(分散アクセスへの最終防衛ライン)に対して効いていませんでした
+(`docs/DESIGN.md` 3.2)。
 
 ## デプロイ
 
@@ -86,6 +88,7 @@ npm run deploy
 `wrangler.toml` の `[vars]`(`RATE_LIMIT_PER_IP_MAX` / `RATE_LIMIT_GLOBAL_MAX` /
 `RATE_LIMIT_WINDOW_SECONDS`)だけで調整でき、コードを触る必要はありません。
 コストの上限を確保するための仕組みなので、理由なく緩めないでください。
+カウンタが使えないときは制限を通さず 503 を返します(フェイルクローズ)。
 
 ## ライセンス
 

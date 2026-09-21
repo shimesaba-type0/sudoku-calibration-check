@@ -6,13 +6,18 @@ compatibility_date = "2026-09-01"
 [ai]
 binding = "AI"
 
-# レート制限のカウンタ置き場(固定ウィンドウ)。ネームスペースは作成済み。
-# フォークして別アカウントで使う場合は次で作り直し、出力された id に差し替える:
-#   npx wrangler kv namespace create RATE_LIMIT_KV
-# id は秘密情報ではないのでコミットしてよい。
-[[kv_namespaces]]
-binding = "RATE_LIMIT_KV"
-id = "b0f9a6d4a03347d48671f039395a5274"
+# レート制限のカウンタ置き場(固定ウィンドウ)。Worker 内では env.RATE_LIMITER として見える。
+# Durable Object なのでネームスペースの事前作成は不要(deploy 時に migration で作られる)。
+# 以前は Workers KV を使っていたが、結果整合のため全体上限が分散アクセスに効かなかった
+# (GitHub Issue #10 / docs/DESIGN.md 3.2)。
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimitCounter"
+
+# Durable Object クラスの登録。SQLite バックエンドで作る。
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimitCounter"]
 
 # レート制限の唯一の調整つまみ。ここの値を書き換えて再デプロイするだけで
 # 上限が変わる(src/index.js は触らない)。数値は文字列として Worker に渡り、

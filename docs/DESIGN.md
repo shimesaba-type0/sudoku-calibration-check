@@ -19,16 +19,16 @@
 ````
 
 - **判定の順序制御・周回ロジック・採点はすべてブラウザ側**。Worker は「1マス分の確率を Jev に聞いて返す」だけの薄い層
-- 判定処理(`/api/judge`)はステートレス。リクエストで受け取った盤面だけを見て Jev に聞き、結果を返す。盤面・判定結果・セッションは一切保存しない。Workers KV はレート制限のカウンタ(3.2)にだけ使う
+- 判定処理(`/api/judge`)はステートレス。リクエストで受け取った盤面だけを見て Jev に聞き、結果を返す。盤面・判定結果・セッションは一切保存しない。永続化しているのはレート制限のカウンタ(Durable Object。3.2)だけ
 - 正解(`SOLUTION`)は `PAGE_HTML` 内のブラウザ用スクリプトにだけ定義する。Worker 側の判定コード(`handleJudge` とその配下)からは参照できない構造にし、Jev にも渡さない。採点はブラウザで行う(理由は 8 章、検証方法は 10 章)
 
 ## 2. ファイル構成と責務
 
 | ファイル | 責務 |
 |---|---|
-| `wrangler.toml` | Worker名、エントリ、`compatibility_date`、`[ai] binding = "AI"`、`[[kv_namespaces]] binding = "RATE_LIMIT_KV"`、`[vars]`(レート制限の上限値)。詳細は 6 章 |
+| `wrangler.toml` | Worker名、エントリ、`compatibility_date`、`[ai] binding = "AI"`、`[[durable_objects.bindings]] name = "RATE_LIMITER"` と `[[migrations]]`、`[vars]`(レート制限の上限値)。詳細は 6 章 |
 | `package.json` | wrangler 4.x を devDependency に固定。`check` / `deploy` / `dev` / `test` スクリプト |
-| `src/index.js` | Worker本体。`checkRateLimit`、`handleJudge`、`PAGE_HTML`、`fetch` ハンドラ |
+| `src/index.js` | Worker本体。`RateLimitCounter`(Durable Object)、`checkRateLimit`、`handleJudge`、`PAGE_HTML`、`fetch` ハンドラ |
 | `test/*.test.js` | Node 標準の `node:test` によるテスト。モックの `env` で Worker を直接呼ぶ(10 章) |
 | `.github/workflows/ci.yml` | GitHub Actions。push / PR ごとに `npm test` と `npm run check` を実行 |
 | `CLAUDE.md` | Claude Code 向けの作業ルール |
@@ -51,25 +51,45 @@ export default {
 
 ### 3.2 `checkRateLimit(request, env)`
 
-IP単位・全体、の2段構えの固定ウィンドウ・レート制限。`handleJudge` の先頭で呼ぶ。
+IP単位・全体、の2段構えの固定ウィンドウ・レート制限。`handleJudge` の先頭(415 の検査の後)で呼ぶ。カウンタは **Durable Object**(`RateLimitCounter`、バインディング `RATE_LIMITER`)に置く。
 
 - ウィンドウ幅 `windowSeconds`、IP単位上限 `perIpMax`、全体上限 `globalMax` は `env.RATE_LIMIT_WINDOW_SECONDS` / `env.RATE_LIMIT_PER_IP_MAX` / `env.RATE_LIMIT_GLOBAL_MAX` から読む(それぞれ既定 3600 / 30 / 500)
-- 現在時刻を `windowSeconds` で割った商を `bucket` とし、`rl:global:<bucket>` と `rl:ip:<ip>:<bucket>` の2つのKVキーでカウントする(固定ウィンドウ方式。ウィンドウの境界をまたぐ攻撃には多少甘いが、実装が単純で十分)
-- 戻り値は `{ allowed, scope?, reason?, headers }`。`scope` は拒否したときだけ入り、`"global"` / `"ip"` / `"kv"` のいずれか。`handleJudge` は `"kv"` を 503、それ以外を 429 に対応づける
-- 先に **全体** を見て、超過していれば即座に `{ allowed:false, scope:"global", reason, headers }` を返す(全体超過ならIP単位のチェックやKV書き込みをする意味が無いため、IP単位のキーは読みもしない)
-- 次に **IP単位** を見て、超過していれば同様に `scope:"ip"` で拒否
-- どちらも下回っていれば、両方のキーを +1 して `expirationTtl: windowSeconds + 60` で `Promise.all` で並行に書き込み、`{ allowed:true, headers }` を返す。TTLをウィンドウ幅より60秒長くしているのは、次のバケットの書き込みと若干重なっても古いキーが自然に消えるようにするため
+- 現在時刻を `windowSeconds` で割った商を `bucket` とする(固定ウィンドウ方式。ウィンドウの境界をまたぐ攻撃には多少甘いが、実装が単純で十分)
+- インスタンスは `env.RATE_LIMITER.idFromName("global")`(全体用に1個)と `idFromName("ip:" + ip)`(IPごとに1個)。`ip` は `CF-Connecting-IP`(無ければ `"unknown"`)を64文字に切り詰めたもの
+- 戻り値は `{ allowed, scope?, reason?, headers }`。`scope` は拒否したときだけ入り、`"global"` / `"ip"` / `"counter"` のいずれか。`handleJudge` は `"counter"` を 503、それ以外を 429 に対応づける
+- **呼ぶ順番と理由**(この順序が安全側に倒れる鍵)
+  1. 全体を **`peek`**(読むだけ)。超過していれば `scope:"global"` で拒否し、**IP 側のインスタンスには触らない**(数える意味も書き込む意味も無い)
+  2. IP単位を **`increment`**。超過していれば `scope:"ip"` で拒否(このとき全体はまだ +1 しない)
+  3. 全体を **`increment`**。1 の `peek` から時間が空いているので、際どい競合で `allowed:false` が返ることがある。そのときは `scope:"global"` で拒否し、**IP 側は 2 で +1 したままにする** —— 数え過ぎ(= 安全側)に倒し、数え漏れ(= コストの上限が外れる)を絶対に作らないため
+- 通過したときの `headers` は `X-RateLimit-Remaining-IP` / `X-RateLimit-Remaining-Global`(いずれも `max(0, 上限 - 加算後のカウント)`)。拒否したときは `Retry-After`(= `(bucket+1)*windowSeconds - now`。現在のバケットが終わるまでの秒数)と `X-RateLimit-Scope` を付け、残数は付けない
 - `[vars]` の値は **10進整数の文字列としてそのまま読めて1以上のときだけ** 採用し、それ以外(空文字・`" 30 "`・`"1e3"`・`"0x10"`・`"0"` など)は既定値に落とす。緩い数値変換をすると、書き間違いで上限が 0(全面停止)や想定外の値になる
-- KVに入っていたカウンタが10進整数として読めない場合は **上限超過として扱う**(フェイルクローズ)。数えられないまま AI を呼ぶよりは止める
-- **バインディングの有無と、KVの障害は区別する**
-  - `env.RATE_LIMIT_KV` が無い → 何もチェックせず `{ allowed:true, headers:{} }`(フェイルオープン。`wrangler dev` などKV未設定の環境でアプリ自体が動かなくなるのを防ぐ)
-  - バインディングはあるのに `get` / `put` が例外を投げる → **フェイルクローズ**。`console.error` でログを残し、`{ allowed:false, scope:"kv", reason:"レート制限の記録に失敗しました。しばらくしてから再試行してください", headers:{ "Retry-After": "60" } }` を返す。`handleJudge` はこれを 503 にする。回数を数えられない状態で Workers AI を呼ぶと、コストの上限が外れてしまうため
-- KVは強い一貫性を持たないので、同時に大量のリクエストが来た際に多少のオーバーカウント/アンダーカウントは起こり得る。このアプリの目的(コストの青天井を防ぐ大まかな安全弁)には十分な精度と判断し、Durable Objectsのような厳密な実装は採用しない
+- **バインディングの有無と、カウンタの障害は区別する**
+  - `env.RATE_LIMITER` が無い → 何もチェックせず `{ allowed:true, headers:{} }`(フェイルオープン。`wrangler dev` など Durable Object 未設定の環境でアプリ自体が動かなくなるのを防ぐ)
+  - バインディングはあるのに呼び出しが例外を投げる / 非2xx を返す / 応答の形が違う → **フェイルクローズ**。`console.error` でログを残し、`{ allowed:false, scope:"counter", reason:"レート制限の記録に失敗しました。しばらくしてから再試行してください", headers:{ "Retry-After": "60" } }` を返す。`handleJudge` はこれを 503 にする。回数を数えられない状態で Workers AI を呼ぶと、コストの上限が外れてしまうため
+
+#### `RateLimitCounter`(Durable Object)
+
+カウンタ本体。`ctx` / `env` をコンストラクタで受け取り、`fetch(request)` で操作する。
+
+- リクエスト: `POST { op: "peek" | "increment", bucket: <整数>, max: <上限> }` / レスポンス: `{ allowed: <真偽値>, count: <操作後のカウント> }`
+- `peek` … 読むだけ。`allowed` は `count < max`
+- `increment` … `count >= max` なら加算せずに `{ allowed:false, count }`、そうでなければ +1 して `{ allowed:true, count: count+1 }`
+- ストレージ(`ctx.storage.get/put/delete`)は `count:<bucket>` にカウント、`bucket` に「今生きているバケット番号」を持つ。バケットが変わっていたら呼び出し時に古い `count:<前のバケット>` を削除するので、残るカウンタのキーは常に1つ(KV の `expirationTtl` に相当する後始末)
+- ストレージの値が0以上の安全な整数でない(壊れている・改ざんされた)場合は **上限超過として扱う**(フェイルクローズ)。数えられないまま AI を呼ぶよりは止める
+- **`cloudflare:workers` の `DurableObject` を継承せず、`fetch` ハンドラ方式にしている**。RPC を使うには継承が必要だが、`cloudflare:workers` は Node の `node:test` から import できず、テストが `src/index.js` をそのまま import できなくなるため(10 章)。Workers ランタイムは継承していないクラスでも `fetch` ハンドラ方式なら動く
+
+#### なぜ KV をやめたか(GitHub Issue #10)
+
+当初はカウンタを Workers KV の固定ウィンドウ・カウンタ(`rl:global:<bucket>` / `rl:ip:<ip>:<bucket>` を読んで +1 して書き戻す)に置いていた。しかし **KV は結果整合で、`get` がコロケーションごとに最大60秒キャッシュされる**ため、複数のコロケーションから同時に来たリクエストが揃って古い値を読み、それぞれ +1 を上書きし合う(lost update)。結果として **全体上限(500回/時)が、それを設けた唯一の目的である分散アクセスに対してほとんど効いていなかった**(実測でも、別コロ経由のリクエストで残数が 28 → 29 に戻る現象を確認した)。
+
+Durable Object は同じ名前のインスタンスが世界に1つしか存在せず、そこへのリクエストは直列に実行され、`ctx.storage` の書き込みは暗黙のトランザクションにまとまる。したがって数え落としが起きない。Workers AI のコストを頭打ちにする砦(7 章 / `CLAUDE.md` 作業ルール4)としては、この厳密さが要る。
+
+なお **これは上限を緩める変更ではない**。`[vars]` の値(30 / 500 / 3600)は据え置きで、「数え漏れによって実質的に緩くなっていた」状態を、設計どおりの厳しさに戻すだけの変更である。
 
 ### 3.3 `handleJudge(request, env)`
 
 0. `content-type` ヘッダーのメディアタイプ(`;` の前)が `application/json` と一致しなければ 415(`charset` 等のパラメータは無視。前方一致にしないのは `application/json-patch+json` のような別タイプを通さないため)(`{ "error": "content-type は application/json である必要があります" }`)。**レート制限より前**に行う。これは 7 章のクロスサイト対策の要なので外さない
-1. `checkRateLimit` を呼ぶ。`allowed:false` かつ `scope` が `"ip"` / `"global"` なら 429(`error` に理由、レスポンスヘッダーに `Retry-After` と `X-RateLimit-Scope`)、`scope` が `"kv"` なら 503(`error` に理由、`Retry-After: 60`)
+1. `checkRateLimit` を呼ぶ。`allowed:false` かつ `scope` が `"ip"` / `"global"` なら 429(`error` に理由、レスポンスヘッダーに `Retry-After` と `X-RateLimit-Scope`)、`scope` が `"counter"` なら 503(`error` に理由、`Retry-After: 60`)
 2. `request.json()` → 失敗なら 400
 3. 入力を検証し、不備なら 400 を返す。検証項目は次の通り
    - `puzzle` が長さ9の配列で、各要素が9文字の文字列。文字は `1`〜`9` と `.` のみ
@@ -89,7 +109,7 @@ IP単位・全体、の2段構えの固定ウィンドウ・レート制限。`h
    - `choice` が文字列で、`"1"`〜`"9"` のいずれか
    - `confidence` が有限の数値。**値の妥当性は見ない**(Jev 独自の確信度で `probabilities[choice]` とは一致しないため。3.4 / SPEC 4章)
 7. `{ probabilities, choice, confidence }` に絞って 200 で返す。`confidence` は Jev の値をそのまま通す(`probabilities[choice]` に差し替えない)
-8. `X-RateLimit-Remaining-IP` / `X-RateLimit-Remaining-Global`(その時点の残り回数)は、**レート制限を通過したすべてのレスポンス** に付く(`RATE_LIMIT_KV` バインディングがあるとき。無いフェイルオープン時は残数が存在しないので付かない)。200 だけでなく、その後の 400(入力不正)や 502(AI 失敗・形式不正)にも付く(どれも1回として数えているため)。レート制限より手前で止まる 415 と、制限に引っかかった 429 / 503 には付かない
+8. `X-RateLimit-Remaining-IP` / `X-RateLimit-Remaining-Global`(その時点の残り回数)は、**レート制限を通過したすべてのレスポンス** に付く(`RATE_LIMITER` バインディングがあるとき。無いフェイルオープン時は残数が存在しないので付かない)。200 だけでなく、その後の 400(入力不正)や 502(AI 失敗・形式不正)にも付く(どれも1回として数えているため)。レート制限より手前で止まる 415 と、制限に引っかかった 429 / 503 には付かない
 
 `state` はオブジェクトで渡す(Jev は string / object / array を受け付ける):
 
@@ -294,8 +314,19 @@ var SOLUTION = [ "534678912", "672195348", "198342567", "859761423", "426853791"
 
 ## 6. 設定・デプロイ
 
-- `wrangler.toml`: `name`, `main = "src/index.js"`, `compatibility_date`, `[ai] binding = "AI"`, `[[kv_namespaces]] binding = "RATE_LIMIT_KV"`, `[vars]`(レート制限の上限値)。`account_id` は書かない(環境変数 `CLOUDFLARE_ACCOUNT_ID` で渡す)
-- KVネームスペースは **初回デプロイ前に1回だけ** 作る必要がある: `npx wrangler kv namespace create RATE_LIMIT_KV`。出力される `id` を `wrangler.toml` の `RATE_LIMIT_KV` の `id` に貼り付ける(このリポジトリでは 2026-09-21 に作成済みで、実際の `id` が入っている。フォークして別アカウントにデプロイする場合だけやり直す)
+- `wrangler.toml`: `name`, `main = "src/index.js"`, `compatibility_date`, `[ai] binding = "AI"`, `[vars]`(レート制限の上限値)、およびレート制限のカウンタ用の Durable Object。`account_id` は書かない(環境変数 `CLOUDFLARE_ACCOUNT_ID` で渡す)
+
+````toml
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimitCounter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimitCounter"]
+````
+
+- Durable Object は **事前の手作業が要らない**。`wrangler deploy` が `[[migrations]]` を見てクラスを作る(以前の Workers KV のような「ネームスペースを1回作って `id` を貼り付ける」手順は不要になった。3.2 / `docs/HANDOFF.md` 1.4)
 - `typesafe/jev` は AI Gateway 経由で提供されており、課金も AI Gateway のクレジットで行われる(3.4)。アカウント側で AI Gateway の課金を有効にしていないと、デプロイは通るのに `/api/judge` だけが失敗する(`docs/HANDOFF.md` 1.3)
 - `package.json`: `"wrangler": "^4"`、scripts は `test`(`node --test`)/`check`(`--dry-run`)/`deploy`/`dev`
 - 認証: `CLOUDFLARE_API_TOKEN`(非対話)。`wrangler login` はブラウザが要るのでクラウドセッションでは使えない
@@ -304,7 +335,7 @@ var SOLUTION = [ "534678912", "672195348", "198342567", "859761423", "426853791"
 ## 7. セキュリティ・運用上の注意
 
 - `/api/judge` は認証なしだが、F6のレート制限(IP単位30回/時・全体500回/時、既定値)でコストの上限を確保している。値は `wrangler.toml` の `[vars]` で調整可能
-- 上限を緩める(数値を大きくする、または `RATE_LIMIT_KV` バインディングを外す)と、コストの上限が無くなる。特にバインディングを外すとフェイルオープンの設計上、制限なしで動いてしまう(KVが一時的に落ちた場合は 3.2 のとおりフェイルクローズで 503)。**理由なく緩めない**
+- 上限を緩める(数値を大きくする、または `RATE_LIMITER` バインディングを外す)と、コストの上限が無くなる。特にバインディングを外すとフェイルオープンの設計上、制限なしで動いてしまう(カウンタが一時的に落ちた場合は 3.2 のとおりフェイルクローズで 503)。**理由なく緩めない**
 - リポジトリには秘密情報を置かない。`account_id` も置かない
 - `/api/judge` には CORS ヘッダーを付けない。加えて **`content-type` のメディアタイプが `application/json` でないリクエストは 415 で弾く**(`handleJudge` の最初、レート制限より前)。この2つはセットで意味を持つ: `application/json` の POST はブラウザで必ずプリフライトが必要になり、CORS ヘッダーを返していないのでプリフライトが通らず、他サイトのページからは呼べない。一方 `text/plain` などプリフライト不要の content-type はフォーム送信等でクロスサイトに投げられてしまうため、415 で入口を閉じる(第三者のサイトに埋め込まれて Workers AI のコストを消費される経路を塞ぐ)。`curl` 等からの直接アクセスはレート制限で頭打ちにする
 - `GET /` のレスポンスには `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、`Content-Security-Policy: frame-ancestors 'none'` を付ける(クリックジャッキング対策。インラインスクリプトを使うため、それ以上の CSP はかけない)
@@ -322,8 +353,9 @@ var SOLUTION = [ "534678912", "672195348", "198342567", "859761423", "426853791"
 | 固定の1問 | v0.1 の範囲を小さくするため。ジェネレーター/ソルバーは次のタスク |
 | 速度モード2択 | 「じっくり見る」と「Jevの速さを体感する」の両方が目的 |
 | IP単位+全体の2段レート制限 | IP単位だけだと分散アクセス(多数のIPからの同時アクセス)で回避され、コストが青天井になる。全体上限を最終防衛ラインとして併設 |
-| Durable ObjectsでなくKVの固定ウィンドウ | 要求される精度が「大まかにコストを頭打ちにする」程度で十分なため。実装がシンプルな方を優先 |
-| レート制限をフェイルオープンに | KVバインディングが無い環境(ローカルdevなど)でアプリ自体が止まらないようにするため。本番では必ずKVを設定する前提 |
+| カウンタをKVでなくDurable Objectに(Issue #10) | KVは結果整合で `get` がコロケーションごとに最大60秒キャッシュされるため、複数コロからの同時アクセスが lost update を起こし、**全体上限が「分散アクセスへの最終防衛ライン」という唯一の目的に対して効かなかった**(実測で確認)。Durable Object はインスタンスが1つで直列実行のため厳密に数えられる。カウンタが緩いと Workers AI のコストの上限が実質無くなるので、ここは実装の単純さより正確さを取る(3.2) |
+| Durable Object を `fetch` ハンドラ方式に(RPC にしない) | RPC を使うには `cloudflare:workers` の `DurableObject` を継承する必要があるが、そのモジュールは `node:test` から import できず、`src/index.js` をモックの `env` で直接呼ぶテスト方針(10 章)が使えなくなる。素のクラス + `fetch` なら Workers でもそのまま動く |
+| レート制限をフェイルオープンに | `RATE_LIMITER` バインディングが無い環境(ローカルdevなど)でアプリ自体が止まらないようにするため。本番では必ずバインディングを設定する前提 |
 | 採点をブラウザ側で行い、`SOLUTION` を Worker の判定コードから隔離 | `SOLUTION` は秘密ではなく、守るべきは「Jev に渡さないこと」。Worker 側で採点すると `SOLUTION` と Jev 呼び出しが同じ関数の近くに並び、将来の変更で `state` に混ざる事故が起きやすい。ブラウザ用スクリプトの中にだけ置けば、`handleJudge` からは参照のしようがなく、テストで機械的に検証できる(10 章) |
 | Cloudflare 公式のテストツールでなく `node:test` | 単一ファイルの Module Worker をモックの `env` で直接呼ぶだけなら Node 22 の標準機能で足りる。依存を増やさず、Cloudflare の認証なしで CI が回る |
 
@@ -345,15 +377,17 @@ var SOLUTION = [ "534678912", "672195348", "198342567", "859761423", "426853791"
 - `src/index.js` を ES Module として import し、`default.fetch(request, env)` をモックの `env` で直接呼ぶ。Node 22 のグローバル `Request` / `Response` をそのまま使う
 - モック `env`
   - `AI.run(model, payload)`: 呼び出しを記録し、3.4 の形式の固定レスポンスを返す。失敗や異常な形を返すケースも用意する
-  - `RATE_LIMIT_KV`: `Map` ベースの `get` / `put`(読んだキー・書いたキー・`expirationTtl` を記録する)。`get` / `put` が例外を投げるモードも用意する
-    - レート制限のキーにはバケット番号(現在時刻依存)が入る。テスト側でバケットを計算するとウィンドウ境界をまたいだ瞬間に落ちるので、**シードは前方一致で行い、検証は実際に読み書きされたキーからバケットを取り出して行う**
+  - `RATE_LIMITER`: `Map` ベースの Durable Object スタブ(`test/helpers.js` の `makeRateLimiter`)。本物と同じく `idFromName(name)` → `get(id)` → `stub.fetch(request)` で使え、中身は `RateLimitCounter` と同じ意味論(`peek` は読むだけ、`increment` は上限未満のときだけ +1、バケットが変われば数え直し)を再現する。`calls` に `{ name, op, bucket, max }` を順に記録するので「全体超過なら IP 側のインスタンスを呼ばない」ような**呼び出し順**まで検証できる。`fetch` が例外を投げるモード(`"throw"`)と 500 を返すモード(`"500"`)も用意する
+    - レート制限のバケット番号は現在時刻依存。テスト側でバケットを計算するとウィンドウ境界をまたいだ瞬間に落ちるので、**シードはインスタンス名の前方一致(`{"ip:*": 30}`)で行い、バケットが要る検証はスタブが実際に受け取った呼び出し(`limiter.calls[i].bucket`)から取り出して行う**
+  - `RateLimitCounter` 単体のテストには `makeStorageCtx`(`ctx.storage` の `get` / `put` / `delete` を `Map` で提供する)を使い、`increment` の境界・バケットが変わったときの数え直しと古いキーの削除・壊れた値のフェイルクローズを直接確かめる
   - `RATE_LIMIT_*`: 文字列で与える(`wrangler.toml` の `[vars]` は文字列として渡ってくるため)
 - 必ず含めるテスト
   - **不変条件1**: `AI.run` に渡された `payload` が期待どおりのオブジェクトと **完全に一致する**(`deepStrictEqual`)。期待値の `note` / `instructions` / `criteria` は実装から import せず、テスト側に意図的に複製して持つ(`state` に何かが足されたら落ちるようにするため)。加えて `JSON.stringify` した文字列に `SOLUTION` の9行のどれも含まれていないこと
   - **不変条件7**: `src/index.js` のソースを読み、`PAGE_HTML` のテンプレートリテラルの外に `SOLUTION` という文字列が現れない。開きバッククォートは「**行頭の** `var PAGE_HTML = \`` の宣言」とし、その文字列がファイル中に1つしか無いことも確認する(コメント中の同じ文字列を拾って切り出し範囲がずれると検査が無効になるため)。閉じバッククォートは「ファイル最後のバッククォート」とし、その後ろが `;` と空白だけであること(= `PAGE_HTML` が最後の宣言であること。3.5)も併せて検査する
-  - content-type: `text/plain` や content-type 無しのリクエストが 415 になり、`AI.run` もKVも触られないこと
+  - content-type: `text/plain` や content-type 無しのリクエストが 415 になり、`AI.run` もレート制限のカウンタも触られないこと
   - 入力検証: 3.3 の各項目について 400 になること(対象マスが空でない場合を含む)。正常入力で 200 と9キーの `probabilities` が返ること
-  - レート制限: IP上限・全体上限それぞれの超過で 429 と `Retry-After` / `X-RateLimit-Scope` が返ること。全体超過時にKVへ書き込まず、IP単位のキーを読みもしないこと。`Retry-After` が `(bucket+1)*window - now` であること。KVのカウンタが壊れていれば超過扱いになること。KV が無ければ通ること(フェイルオープン)。KVの `get` / `put` が例外を投げれば 503 になり `AI.run` が呼ばれないこと(フェイルクローズ)。`[vars]` の値が反映され、紛らわしい表記が既定値に落ちること
+  - レート制限: IP上限・全体上限それぞれの超過で 429 と `Retry-After` / `X-RateLimit-Scope` が返ること。全体超過時に全体を `peek` するだけで IP 側のインスタンスを呼ばないこと。`Retry-After` が `(bucket+1)*window - now` であること。`RATE_LIMITER` が無ければ通ること(フェイルオープン)。カウンタの呼び出しが例外を投げる / 500 を返せば 503 になり `AI.run` が呼ばれないこと(フェイルクローズ)。`[vars]` の値が反映され、紛らわしい表記が既定値に落ちること。残数ヘッダーが 200 / 400 / 502 に付き、429 / 503 には付かないこと
+  - `RateLimitCounter` 単体: `increment` の境界(`max-1` なら通って `max` になる、`max` なら加算せず拒否)、`peek` が加算しないこと、別バケットが独立していること、バケットが変わったときに古いバケットのキーが消えること、壊れた値が超過扱いになること
   - `AI.run` が例外を投げる / `answers.digit` が無い(ラッパーの有無どちらでも)/ `state` が `"Completed"` でない / `answers.digit` の形が 3.3 の条件を満たさない場合に 502 になること
   - ラッパー付き(3.4 の実測形式)とラッパー無し(素の `{ model, answers, usage }`)の **どちらでも** 200 になること。`confidence` は Jev の値がそのまま返り、`probabilities[choice]` に差し替えられていないこと
   - `GET /` が `text/html; charset=utf-8` と 7 章のセキュリティヘッダーを返し、それ以外のパスが 404 であること

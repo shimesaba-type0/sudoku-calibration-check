@@ -24,7 +24,7 @@ TypeSafe AI の決定モデル **Jev**(`typesafe/jev`、Cloudflare Workers AI �
 ├── README.md          # 人間向け概要とデプロイ手順
 ├── LICENSE            # MIT
 ├── package.json       # wrangler を devDependency として固定、npm scripts
-├── wrangler.toml      # Workers AI バインディング(env.AI)、レート制限用KV、[vars]
+├── wrangler.toml      # Workers AI バインディング(env.AI)、レート制限用 Durable Object(env.RATE_LIMITER)、[vars]
 ├── src/index.js       # Worker本体。GET / でHTML一式、POST /api/judge でJev呼び出し
 ├── test/              # node:test によるテスト(モックの env で Worker を直接呼ぶ)
 ├── .github/workflows/ci.yml  # push / PR で npm test と npm run check
@@ -69,7 +69,7 @@ npm run dev                 # ローカル起動。AIバインディングはリ
 1. **秘密情報をコミットしない**。トークン・アカウントIDをファイルに書かない。`wrangler.toml` に `account_id` を追記しない
 2. **`SOLUTION`(数独の正解)は絶対に Jev に送らない**。送ってよいのは「現時点で埋まっているマス(過去の周の推測込み、正誤問わず)」だけ。これが崩れると実験として無意味になる(`docs/DESIGN.md` の不変条件を参照)
 3. Jev のレスポンス形式(`answers.<key>.choice / confidence / probabilities`)は2026-09-21 に実環境で確認した形式(`docs/DESIGN.md` 3.4)。**実際に叩いて形が違ったら `handleJudge` を直し、`docs/DESIGN.md` の該当節も同時に更新する**
-4. **レート制限の上限を理由なく緩めない**(`RATE_LIMIT_PER_IP_MAX` / `RATE_LIMIT_GLOBAL_MAX` を上げる、または `RATE_LIMIT_KV` を外すなど)。コストの青天井を防ぐための唯一の砦なので、緩める変更を求められたら、なぜ必要かを報告に明記する
+4. **レート制限の上限を理由なく緩めない**(`RATE_LIMIT_PER_IP_MAX` / `RATE_LIMIT_GLOBAL_MAX` を上げる、または `RATE_LIMITER` バインディングを外すなど)。コストの青天井を防ぐための唯一の砦なので、緩める変更を求められたら、なぜ必要かを報告に明記する
 5. 変更後は必ず `npm test` と `npm run check` を通す。デプロイできる環境なら `npm run deploy` → `curl` で `/api/judge` を叩いて動作確認し、結果(レイテンシ・実際のレスポンスJSON)を報告に含める
 6. UIの見た目(ダーク基調、IBM Plex、緑=正解/赤=不正解/アクセント色=フォーカス)は維持する。大きなデザイン変更は指示があるときだけ
 7. コメント・ドキュメント・コミットメッセージは日本語でよい。識別子は英語
@@ -81,6 +81,6 @@ npm run dev                 # ローカル起動。AIバインディングはリ
 - v0.1 を Issue 単位で実装中。進捗は GitHub の Issues / PR を参照(`docs/HANDOFF.md` の「現在地」も併せて更新する)
 - デプロイ済み: https://sudoku-calibration-check.takashi-kono-rb.workers.dev 。フロントエンド(Issue #3)もマージ済みで、v0.1 の機能はすべて実装済み。実環境での UI 確認(SPEC 6章の「デプロイ後」の項目)はマージ後のデプロイで行う
 - **Jev は 2026-09-21 に Worker 経由で実環境検証済み**。レスポンスは AI Gateway のラッパー付きだった(`docs/DESIGN.md` 3.4)。`confidence` は `probabilities[choice]` と一致せず、同じ入力でも `choice` が揺れる
-- `wrangler.toml` の `RATE_LIMIT_KV` の `id` は実際のネームスペース ID に置き換え済み(手作業は完了)
-- 既知の未実装: 数独ジェネレーター/ソルバー(#5)、集計ビュー(信頼度較正図)(#6)。レート制限の強化(#10)は設計判断待ち
+- レート制限のカウンタは Durable Object(`RATE_LIMITER` / `RateLimitCounter`)。`wrangler deploy` が `[[migrations]]` から作るので、ネームスペース作成のような手作業は不要(Issue #10 で Workers KV から移行。KV は結果整合で全体上限が分散アクセスに効かなかった)
+- 既知の未実装: 数独ジェネレーター/ソルバー(#5)、集計ビュー(信頼度較正図)(#6)。レート制限の強化(#10)は Durable Object 化で対応済み(未デプロイ)
 - 要判断(オーナー): IP 単位の上限 30 回/時では 1 問(約 78 判定)を 1 時間で完走できない。上限を緩める変更は作業ルール4によりオーナーの判断が必要

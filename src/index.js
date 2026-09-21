@@ -30,8 +30,14 @@ var DEFAULT_WINDOW_SECONDS = 3600;
 var DEFAULT_PER_IP_MAX = 30;
 var DEFAULT_GLOBAL_MAX = 500;
 
-// KV 障害(フェイルクローズ)時に返す待ち時間(秒)
-var KV_FAILURE_RETRY_AFTER = 60;
+// レート制限カウンタの障害(フェイルクローズ)時に返す待ち時間(秒)
+var COUNTER_FAILURE_RETRY_AFTER = 60;
+
+// Durable Object の中で使うストレージキー。
+// BUCKET_KEY には「今カウンタが生きているバケット番号」を入れ、古いバケットのキーを
+// 次の呼び出しで消すために使う(生き残るカウンタのキーは常に1つ)。
+var BUCKET_KEY = "bucket";
+var COUNT_KEY_PREFIX = "count:";
 
 // 502 の raw に入れるメッセージの最大長
 var RAW_MAX_LENGTH = 200;
@@ -73,31 +79,131 @@ function readLimit(value, fallback) {
 }
 
 /**
- * KV に入っているカウンタの読み取り。キーが無ければ 0。
- * 10進整数として読めない値(壊れている・改ざんされた)は「上限超過」として扱う
- * = フェイルクローズ。カウントできないまま AI を呼ぶよりは止める。
+ * Durable Object のストレージから読んだカウンタを正規化する。
+ * 未設定(そのバケットの初回)は 0。0以上の安全な整数でない値(壊れている・
+ * 改ざんされた)は上限そのものを返して「超過扱い」にする = フェイルクローズ。
+ * 数えられないまま AI を呼ぶよりは止める。
  */
-function readCount(value) {
-  if (value === null || value === undefined) return 0;
-  if (typeof value !== "string" || !/^\d+$/.test(value)) return Number.POSITIVE_INFINITY;
-  var parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < 0) return Number.POSITIVE_INFINITY;
-  return parsed;
+function normalizeCount(value, max) {
+  if (value === undefined || value === null) return 0;
+  if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) return max;
+  return value;
+}
+
+function counterResponse(allowed, count) {
+  return new Response(JSON.stringify({ allowed: allowed, count: count }), {
+    status: 200,
+    headers: { "content-type": "application/json; charset=utf-8" },
+  });
+}
+
+/**
+ * レート制限のカウンタ本体(docs/DESIGN.md 3.2)。固定ウィンドウのカウンタを
+ * Durable Object 1インスタンスに閉じ込めて、厳密に数える。
+ *
+ * 以前は Workers KV に置いていたが、KV は結果整合で `get` がコロケーションごとに
+ * 最大60秒キャッシュされるため、複数コロから同時に来たリクエストが古い値に +1 を
+ * 上書きし合い(lost update)、全体上限が分散アクセスに対してほとんど効かなかった
+ * (GitHub Issue #10。別コロで残数が 28 → 29 に戻る現象を実測)。Durable Object は
+ * 同じ名前のインスタンスが世界に1つで、そこへのリクエストは直列に実行され、
+ * `ctx.storage` の書き込みは暗黙のトランザクションになるので数え落としが起きない。
+ *
+ * インスタンスは `idFromName("global")`(全体用に1個)と `idFromName("ip:" + ip)`
+ * (IPごとに1個)。
+ *
+ * RPC ではなく **fetch ハンドラ方式** にしてあるのは、`cloudflare:workers` の
+ * `DurableObject` を継承しないため。RPC を使うには継承が必要だが、`cloudflare:workers`
+ * は Node の `node:test` から import できず、テストが `src/index.js` をそのまま
+ * import できなくなる(docs/DESIGN.md 10章)。
+ *
+ * リクエスト: POST `{ op: "peek" | "increment", bucket: <整数>, max: <上限> }`
+ * レスポンス: `{ allowed: <真偽値>, count: <操作後のカウント> }`
+ * - `peek`     … 読むだけ。`allowed` は `count < max`
+ * - `increment`… `count >= max` なら加算せずに拒否、そうでなければ +1 して許可
+ */
+export class RateLimitCounter {
+  constructor(ctx, env) {
+    this.ctx = ctx;
+    this.env = env;
+  }
+
+  async fetch(request) {
+    var body = await request.json();
+    var bucket = body.bucket;
+    var max = body.max;
+    var countKey = COUNT_KEY_PREFIX + bucket;
+
+    // 別のウィンドウに入っていたら、前のバケットのカウンタを消してから数え直す。
+    // 固定ウィンドウなので古い値を持ち越してはいけない(KV の TTL に相当する処理)。
+    var storedBucket = await this.ctx.storage.get(BUCKET_KEY);
+    var staleBucket =
+      storedBucket !== undefined && storedBucket !== null && storedBucket !== bucket;
+    if (staleBucket) {
+      await this.ctx.storage.delete(COUNT_KEY_PREFIX + storedBucket);
+    }
+
+    var count = normalizeCount(await this.ctx.storage.get(countKey), max);
+
+    if (body.op === "peek") return counterResponse(count < max, count);
+
+    if (count >= max) return counterResponse(false, count);
+
+    count = count + 1;
+    await this.ctx.storage.put(countKey, count);
+    if (storedBucket !== bucket) await this.ctx.storage.put(BUCKET_KEY, bucket);
+    return counterResponse(true, count);
+  }
+}
+
+/**
+ * カウンタの Durable Object を1回呼ぶ。
+ * 例外・非2xx・壊れた応答はすべて例外に揃えて、呼び出し側(checkRateLimit)の
+ * catch = フェイルクローズに倒す。
+ */
+async function callCounter(limiter, name, op, bucket, max) {
+  var stub = limiter.get(limiter.idFromName(name));
+  var res = await stub.fetch(
+    new Request("https://rate-limiter.invalid/", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ op: op, bucket: bucket, max: max }),
+    })
+  );
+  if (!res || typeof res.status !== "number" || res.status < 200 || res.status > 299) {
+    throw new Error("rate limit counter returned " + (res && res.status));
+  }
+  var data = await res.json();
+  if (
+    data === null ||
+    typeof data !== "object" ||
+    typeof data.allowed !== "boolean" ||
+    !Number.isSafeInteger(data.count)
+  ) {
+    throw new Error("rate limit counter returned an unexpected body");
+  }
+  return data;
 }
 
 /**
  * IP単位・全体の2段構えの固定ウィンドウ・レート制限(docs/DESIGN.md 3.2)。
+ * `handleJudge` の先頭(415 の検査の後)で呼ぶ。
  *
- * 全体 → IP単位 の順に見て、どちらか超過していれば書き込まずに拒否する。
- * 両方下回っていたときだけ2つのカウンタを +1 する。
+ * 呼ぶ順番と理由:
+ *   1. 全体を **peek**(読むだけ)。超過していれば `scope:"global"` で拒否し、
+ *      IP 側のインスタンスには触らない(数える意味も書き込む意味も無い)
+ *   2. IP を **increment**。超過していれば `scope:"ip"` で拒否(全体はまだ +1 しない)
+ *   3. 全体を **increment**。1 の peek から時間が空いているので、際どい競合で
+ *      `allowed:false` が返ることがある。そのときは `scope:"global"` で拒否する。
+ *      IP 側は 2 で +1 したままにする —— 数え過ぎ(= 安全側)に倒し、
+ *      数え漏れ(= コストの上限が外れる)を絶対に作らないため
  *
- * バインディングの有無で挙動が変わる:
- * - RATE_LIMIT_KV が無い       → フェイルオープン(制限なしで通す。ローカル開発の利便性)
- * - RATE_LIMIT_KV が例外を投げる → フェイルクローズ(scope:"kv" で拒否。handleJudge が 503)
+ * バインディングの有無と、カウンタの障害は区別する:
+ * - `RATE_LIMITER` が無い          → フェイルオープン(制限なしで通す。ローカル開発の利便性)
+ * - 呼び出しが例外/非2xx を返す    → フェイルクローズ(scope:"counter" で拒否。handleJudge が 503)
  */
 async function checkRateLimit(request, env) {
-  var kv = env && env.RATE_LIMIT_KV;
-  if (!kv) return { allowed: true, headers: {} };
+  var limiter = env && env.RATE_LIMITER;
+  if (!limiter) return { allowed: true, headers: {} };
 
   var windowSeconds = readLimit(env.RATE_LIMIT_WINDOW_SECONDS, DEFAULT_WINDOW_SECONDS);
   var perIpMax = readLimit(env.RATE_LIMIT_PER_IP_MAX, DEFAULT_PER_IP_MAX);
@@ -108,29 +214,30 @@ async function checkRateLimit(request, env) {
   // 今のバケットが終わるまでの秒数
   var retryAfter = (bucket + 1) * windowSeconds - nowSeconds;
 
-  // CF-Connecting-IP はエッジが付けるので偽装はできないが、KV のキー長上限(512バイト)を
-  // 超えて put が投げる想定外を避けるため念のため長さを抑える。
+  // CF-Connecting-IP はエッジが付けるので偽装はできないが、Durable Object の名前が
+  // 際限なく長くならないよう念のため長さを抑える。
   var ip = (request.headers.get("CF-Connecting-IP") || "unknown").slice(0, 64);
-  var globalKey = "rl:global:" + bucket;
-  var ipKey = "rl:ip:" + ip + ":" + bucket;
+
+  function denyGlobal() {
+    return {
+      allowed: false,
+      scope: "global",
+      reason: "全体のレート制限(" + globalMax + "回/" + windowSeconds + "秒)を超えました",
+      headers: {
+        "Retry-After": String(retryAfter),
+        "X-RateLimit-Scope": "global",
+      },
+    };
+  }
 
   try {
-    // 先に全体。超過していれば IP 単位を読む意味も書き込む意味も無い。
-    var globalCount = readCount(await kv.get(globalKey));
-    if (globalCount >= globalMax) {
-      return {
-        allowed: false,
-        scope: "global",
-        reason: "全体のレート制限(" + globalMax + "回/" + windowSeconds + "秒)を超えました",
-        headers: {
-          "Retry-After": String(retryAfter),
-          "X-RateLimit-Scope": "global",
-        },
-      };
-    }
+    // 1. 全体を読むだけ。超過していれば IP 側のインスタンスには触らない。
+    var globalPeek = await callCounter(limiter, "global", "peek", bucket, globalMax);
+    if (!globalPeek.allowed) return denyGlobal();
 
-    var ipCount = readCount(await kv.get(ipKey));
-    if (ipCount >= perIpMax) {
+    // 2. IP 単位を +1。
+    var ipResult = await callCounter(limiter, "ip:" + ip, "increment", bucket, perIpMax);
+    if (!ipResult.allowed) {
       return {
         allowed: false,
         scope: "ip",
@@ -143,30 +250,25 @@ async function checkRateLimit(request, env) {
       };
     }
 
-    // ウィンドウ幅より60秒長い TTL。次のバケットと多少重なっても古いキーは自然に消える。
-    // 片方だけ成功して片方が失敗した場合(全体だけ +1 されて 503)は、数え過ぎ=安全側に倒れる
-    // ので許容する。数え漏れは起きない。
-    var options = { expirationTtl: windowSeconds + 60 };
-    await Promise.all([
-      kv.put(globalKey, String(globalCount + 1), options),
-      kv.put(ipKey, String(ipCount + 1), options),
-    ]);
+    // 3. 全体を +1。1 の peek との隙間で埋まっていたら拒否する(IP 側は +1 のまま)。
+    var globalResult = await callCounter(limiter, "global", "increment", bucket, globalMax);
+    if (!globalResult.allowed) return denyGlobal();
 
     return {
       allowed: true,
       headers: {
-        "X-RateLimit-Remaining-IP": String(Math.max(0, perIpMax - (ipCount + 1))),
-        "X-RateLimit-Remaining-Global": String(Math.max(0, globalMax - (globalCount + 1))),
+        "X-RateLimit-Remaining-IP": String(Math.max(0, perIpMax - ipResult.count)),
+        "X-RateLimit-Remaining-Global": String(Math.max(0, globalMax - globalResult.count)),
       },
     };
   } catch (err) {
-    // バインディングはあるのに KV が使えない。回数を数えられないので通さない。
-    console.error("rate limit KV error", err);
+    // バインディングはあるのにカウンタが使えない。回数を数えられないので通さない。
+    console.error("rate limit counter error", err);
     return {
       allowed: false,
-      scope: "kv",
+      scope: "counter",
       reason: "レート制限の記録に失敗しました。しばらくしてから再試行してください",
-      headers: { "Retry-After": String(KV_FAILURE_RETRY_AFTER) },
+      headers: { "Retry-After": String(COUNTER_FAILURE_RETRY_AFTER) },
     };
   }
 }
@@ -345,7 +447,7 @@ async function handleJudge(request, env) {
 
   var rate = await checkRateLimit(request, env);
   if (!rate.allowed) {
-    if (rate.scope === "kv") {
+    if (rate.scope === "counter") {
       return errorResponse(rate.reason, 503, rate.headers);
     }
     return errorResponse(rate.reason, 429, rate.headers);
