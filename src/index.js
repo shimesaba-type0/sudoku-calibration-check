@@ -276,8 +276,11 @@ async function handleJudge(request, env) {
   // 0. content-type の検査。application/json 以外は 415。
   //    これがあるおかげで他サイトからの POST は CORS プリフライトを強いられ、
   //    CORS ヘッダーを返していない以上ブラウザに止められる(docs/DESIGN.md 7章)。
+  //    メディアタイプ(";" の前)を取り出して完全一致で比べる。前方一致だと
+  //    application/json-patch+json のような別のタイプまで通ってしまうため。
   var contentType = request.headers.get("content-type") || "";
-  if (!contentType.toLowerCase().trim().startsWith("application/json")) {
+  var mediaType = contentType.split(";")[0].trim().toLowerCase();
+  if (mediaType !== "application/json") {
     return errorResponse("content-type は application/json である必要があります", 415);
   }
 

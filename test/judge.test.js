@@ -49,6 +49,8 @@ test("415: content-type が application/json でない", async () => {
   await expect415("text/plain;charset=utf-8", "text/plain;charset=utf-8");
   await expect415("application/x-www-form-urlencoded", "application/x-www-form-urlencoded");
   await expect415("content-type なし", null);
+  await expect415("別のメディアタイプ(前方一致で通してはいけない)", "application/json-patch+json");
+  await expect415("application/jsonx", "application/jsonx");
 });
 
 test("415 にならない content-type(charset 付き・大文字)", async () => {

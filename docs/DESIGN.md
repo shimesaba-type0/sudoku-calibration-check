@@ -68,7 +68,7 @@ IP単位・全体、の2段構えの固定ウィンドウ・レート制限。`h
 
 ### 3.3 `handleJudge(request, env)`
 
-0. `content-type` ヘッダーが `application/json` で始まらなければ 415(`{ "error": "content-type は application/json である必要があります" }`)。**レート制限より前**に行う。これは 7 章のクロスサイト対策の要なので外さない
+0. `content-type` ヘッダーのメディアタイプ(`;` の前)が `application/json` と一致しなければ 415(`charset` 等のパラメータは無視。前方一致にしないのは `application/json-patch+json` のような別タイプを通さないため)(`{ "error": "content-type は application/json である必要があります" }`)。**レート制限より前**に行う。これは 7 章のクロスサイト対策の要なので外さない
 1. `checkRateLimit` を呼ぶ。`allowed:false` かつ `scope` が `"ip"` / `"global"` なら 429(`error` に理由、レスポンスヘッダーに `Retry-After` と `X-RateLimit-Scope`)、`scope` が `"kv"` なら 503(`error` に理由、`Retry-After: 60`)
 2. `request.json()` → 失敗なら 400
 3. 入力を検証し、不備なら 400 を返す。検証項目は次の通り
@@ -233,7 +233,7 @@ var SOLUTION = [ "534678912", "672195348", "198342567", "859761423", "426853791"
 - `/api/judge` は認証なしだが、F6のレート制限(IP単位30回/時・全体500回/時、既定値)でコストの上限を確保している。値は `wrangler.toml` の `[vars]` で調整可能
 - 上限を緩める(数値を大きくする、または `RATE_LIMIT_KV` バインディングを外す)と、コストの上限が無くなる。特にバインディングを外すとフェイルオープンの設計上、制限なしで動いてしまう(KVが一時的に落ちた場合は 3.2 のとおりフェイルクローズで 503)。**理由なく緩めない**
 - リポジトリには秘密情報を置かない。`account_id` も置かない
-- `/api/judge` には CORS ヘッダーを付けない。加えて **`content-type` が `application/json` で始まらないリクエストは 415 で弾く**(`handleJudge` の最初、レート制限より前)。この2つはセットで意味を持つ: `application/json` の POST はブラウザで必ずプリフライトが必要になり、CORS ヘッダーを返していないのでプリフライトが通らず、他サイトのページからは呼べない。一方 `text/plain` などプリフライト不要の content-type はフォーム送信等でクロスサイトに投げられてしまうため、415 で入口を閉じる(第三者のサイトに埋め込まれて Workers AI のコストを消費される経路を塞ぐ)。`curl` 等からの直接アクセスはレート制限で頭打ちにする
+- `/api/judge` には CORS ヘッダーを付けない。加えて **`content-type` のメディアタイプが `application/json` でないリクエストは 415 で弾く**(`handleJudge` の最初、レート制限より前)。この2つはセットで意味を持つ: `application/json` の POST はブラウザで必ずプリフライトが必要になり、CORS ヘッダーを返していないのでプリフライトが通らず、他サイトのページからは呼べない。一方 `text/plain` などプリフライト不要の content-type はフォーム送信等でクロスサイトに投げられてしまうため、415 で入口を閉じる(第三者のサイトに埋め込まれて Workers AI のコストを消費される経路を塞ぐ)。`curl` 等からの直接アクセスはレート制限で頭打ちにする
 - `GET /` のレスポンスには `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、`Content-Security-Policy: frame-ancestors 'none'` を付ける(クリックジャッキング対策。インラインスクリプトを使うため、それ以上の CSP はかけない)
 - 3.3 の検証を通った盤面文字列だけが Jev に渡る(形式・`GIVEN` との一致・対象マスが空であることまで見る)
 - `SOLUTION` は Wikipedia の例題の答えなので秘密ではない。守るべきは「Jev に渡る `state` に `SOLUTION` が混ざらないこと」であり、そのために `SOLUTION` をブラウザ用スクリプトの中にだけ置き、Worker の判定コードから構造的に隔離する(8 章)
