@@ -11,6 +11,9 @@ node_modules
 # Build output
 dist/
 
+# E2E スモークテストのスクリーンショット
+scripts/e2e/out/
+
 # Logs
 *.log
 npm-debug.log*
