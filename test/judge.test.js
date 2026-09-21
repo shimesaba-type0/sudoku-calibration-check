@@ -6,7 +6,7 @@ import worker from "../src/index.js";
 import {
   GIVEN,
   makeEnv,
-  makeKV,
+  makeRateLimiter,
   judgeRequest,
   validBody,
   jevResponse,
@@ -62,17 +62,16 @@ test("CORS ヘッダーは付けない", async () => {
 // --- 415: content-type 検査(レート制限より前) ------------------------------
 
 async function expect415(label, contentType) {
-  var kv = makeKV();
-  var env = makeEnv({ kv: kv });
+  var limiter = makeRateLimiter();
+  var env = makeEnv({ limiter: limiter });
   var res = await worker.fetch(judgeRequest(validBody(), "203.0.113.1", contentType), env);
   assert.equal(res.status, 415, label + ": 415 を期待したが " + res.status);
   assert.equal(res.headers.get("content-type"), "application/json; charset=utf-8");
   var body = await res.json();
   assert.equal(body.error, "content-type は application/json である必要があります");
   assert.equal(env.aiCalls.length, 0, label + ": AI.run が呼ばれている");
-  // レート制限より前で止まるので KV には一切触らない(回数にも数えない)
-  assert.equal(kv.gets.length, 0, label + ": KV を読んでいる");
-  assert.equal(kv.puts.length, 0, label + ": KV に書いている");
+  // レート制限より前で止まるのでカウンタには一切触らない(回数にも数えない)
+  assert.equal(limiter.calls.length, 0, label + ": レート制限のカウンタを呼んでいる");
 }
 
 test("415: content-type が application/json でない", async () => {

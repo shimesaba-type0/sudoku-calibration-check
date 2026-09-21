@@ -1,14 +1,26 @@
 // レート制限(docs/DESIGN.md 3.2 / SPEC F6)。
 //
-// レート制限のキーにはバケット番号(現在時刻 ÷ ウィンドウ幅)が入る。テスト側で
-// バケットを計算するとウィンドウ境界をまたいだ瞬間に落ちるので、シードは makeKV の
-// 前方一致(`"rl:global:*"`)で行い、検証は KV が実際に読み書きしたキーから
-// バケットを取り出して行う。
+// カウンタは Durable Object(`RateLimitCounter`)に入っている。ウィンドウのバケット番号は
+// 現在時刻依存なので、テスト側でバケットを計算するとウィンドウ境界をまたいだ瞬間に落ちる。
+// シードは makeRateLimiter の前方一致(`"ip:*"`)で行い、バケットが要る検証は
+// スタブが実際に受け取った呼び出し(`limiter.calls[i].bucket`)から取り出して行う。
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import worker from "../src/index.js";
-import { makeEnv, makeKV, bucketFromKey, judgeRequest, validBody } from "./helpers.js";
+import worker, { RateLimitCounter } from "../src/index.js";
+import {
+  makeEnv,
+  makeRateLimiter,
+  makeStorageCtx,
+  counterRequest,
+  judgeRequest,
+  validBody,
+} from "./helpers.js";
+
+/** `limiter.calls` を "<name>/<op>" の配列にして順序を見やすくする。 */
+function trace(limiter) {
+  return limiter.calls.map((call) => call.name + "/" + call.op);
+}
 
 test("IP単位の上限を超えると 429(Retry-After と X-RateLimit-Scope: ip 付き)", async () => {
   var env = makeEnv({ vars: { RATE_LIMIT_PER_IP_MAX: 2, RATE_LIMIT_GLOBAL_MAX: 500 } });
@@ -33,14 +45,18 @@ test("IP単位の上限を超えると 429(Retry-After と X-RateLimit-Scope: ip
   assert.equal(env.aiCalls.length, 2, "429 なのに AI.run が呼ばれている");
 });
 
-test("別の IP は IP単位の上限に引っかからない", async () => {
-  var env = makeEnv({ vars: { RATE_LIMIT_PER_IP_MAX: 1 } });
+test("別の IP は IP単位の上限に引っかからない(インスタンスが分かれている)", async () => {
+  var limiter = makeRateLimiter();
+  var env = makeEnv({ limiter: limiter, vars: { RATE_LIMIT_PER_IP_MAX: 1 } });
   var first = await worker.fetch(judgeRequest(validBody(), "198.51.100.7"), env);
   assert.equal(first.status, 200);
   var blocked = await worker.fetch(judgeRequest(validBody(), "198.51.100.7"), env);
   assert.equal(blocked.status, 429);
   var other = await worker.fetch(judgeRequest(validBody(), "198.51.100.8"), env);
   assert.equal(other.status, 200);
+
+  assert.ok(limiter.state.has("ip:198.51.100.7"), "IP ごとのインスタンス名になっていない");
+  assert.ok(limiter.state.has("ip:198.51.100.8"));
 });
 
 test("全体の上限を超えると 429(X-RateLimit-Scope: global)", async () => {
@@ -61,66 +77,74 @@ test("全体の上限を超えると 429(X-RateLimit-Scope: global)", async () =
   assert.equal(env.aiCalls.length, 2);
 });
 
-test("全体超過時は KV に書き込まず、IP単位のキーを読みもしない", async () => {
-  var kv = makeKV({ "rl:global:*": 5 });
-  var env = makeEnv({ kv: kv, vars: { RATE_LIMIT_GLOBAL_MAX: 5, RATE_LIMIT_PER_IP_MAX: 30 } });
+test("全体超過時は全体を peek するだけで、IP 側のインスタンスを呼ばない", async () => {
+  var limiter = makeRateLimiter({ global: 5 });
+  var env = makeEnv({
+    limiter: limiter,
+    vars: { RATE_LIMIT_GLOBAL_MAX: 5, RATE_LIMIT_PER_IP_MAX: 30 },
+  });
 
   var res = await worker.fetch(judgeRequest(validBody(), "198.51.100.9"), env);
   assert.equal(res.status, 429);
   assert.equal(res.headers.get("X-RateLimit-Scope"), "global");
-  assert.equal(kv.puts.length, 0, "全体超過なのに KV に書き込んでいる");
-  assert.equal(kv.gets.length, 1, "全体超過なのに余計なキーを読んでいる: " + kv.gets.join(", "));
-  assert.ok(kv.gets[0].startsWith("rl:global:"), "最初に読むのは全体のキー");
+  assert.deepEqual(trace(limiter), ["global/peek"], "全体超過なのに余計な呼び出しをしている");
+  assert.equal(limiter.state.get("global").count, 5, "全体超過なのに加算されている");
   assert.equal(env.aiCalls.length, 0);
 });
 
-test("IP単位超過時も KV に書き込まない", async () => {
-  var kv = makeKV({ "rl:ip:*": 30 });
-  var env = makeEnv({ kv: kv });
+test("IP単位超過時は全体を +1 しない(全体は peek だけ)", async () => {
+  var limiter = makeRateLimiter({ "ip:*": 30 });
+  var env = makeEnv({ limiter: limiter });
 
   var res = await worker.fetch(judgeRequest(validBody(), "198.51.100.9"), env);
   assert.equal(res.status, 429);
   assert.equal(res.headers.get("X-RateLimit-Scope"), "ip");
-  assert.equal(kv.puts.length, 0);
   assert.deepEqual(
-    kv.gets.map((key) => key.split(":")[1]),
-    ["global", "ip"],
-    "全体 → IP の順で読んでいない"
+    trace(limiter),
+    ["global/peek", "ip:198.51.100.9/increment"],
+    "全体 peek → IP increment の順になっていない"
   );
+  assert.equal(limiter.state.get("global").count, 0, "IP 超過なのに全体が加算されている");
+  assert.equal(limiter.state.get("ip:198.51.100.9").count, 30, "拒否したのに加算されている");
 });
 
-test("両方下回っていれば2つのキーを +1 し、TTL は windowSeconds + 60", async () => {
-  var windowSeconds = 120;
-  var kv = makeKV();
-  var env = makeEnv({ kv: kv, vars: { RATE_LIMIT_WINDOW_SECONDS: windowSeconds } });
+test("両方下回っていれば 全体peek → IP+1 → 全体+1 の順で呼ぶ", async () => {
+  var limiter = makeRateLimiter();
+  var env = makeEnv({ limiter: limiter, vars: { RATE_LIMIT_WINDOW_SECONDS: 120 } });
 
   var res = await worker.fetch(judgeRequest(validBody(), "198.51.100.5"), env);
   assert.equal(res.status, 200);
 
-  assert.equal(kv.puts.length, 2);
-  // 書かれたキーからバケットを取り出し、2つのキーが同じバケットを指していることを見る
-  var bucket = bucketFromKey(kv.puts[0].key);
-  assert.ok(Number.isInteger(bucket), "バケット番号が取れない: " + kv.puts[0].key);
-  var keys = kv.puts.map((p) => p.key).sort();
-  assert.deepEqual(keys, ["rl:global:" + bucket, "rl:ip:198.51.100.5:" + bucket]);
-  for (var i = 0; i < kv.puts.length; i++) {
-    assert.equal(kv.puts[i].value, "1");
-    assert.equal(kv.puts[i].options.expirationTtl, windowSeconds + 60);
+  assert.deepEqual(trace(limiter), [
+    "global/peek",
+    "ip:198.51.100.5/increment",
+    "global/increment",
+  ]);
+  // 3回とも同じバケット番号(= 同じウィンドウ)を指している
+  var bucket = limiter.calls[0].bucket;
+  assert.ok(Number.isSafeInteger(bucket), "バケット番号が整数でない: " + bucket);
+  for (var i = 0; i < limiter.calls.length; i++) {
+    assert.equal(limiter.calls[i].bucket, bucket);
   }
+  // 上限は [vars] 由来の値がそのまま渡る
+  assert.equal(limiter.calls[0].max, 500);
+  assert.equal(limiter.calls[1].max, 30);
+  assert.equal(limiter.state.get("global").count, 1);
+  assert.equal(limiter.state.get("ip:198.51.100.5").count, 1);
 });
 
 test("Retry-After は現在のバケットが終わるまでの秒数", async () => {
   var windowSeconds = 600;
-  var kv = makeKV({ "rl:global:*": 999 });
+  var limiter = makeRateLimiter({ global: 999 });
   var env = makeEnv({
-    kv: kv,
+    limiter: limiter,
     vars: { RATE_LIMIT_GLOBAL_MAX: 10, RATE_LIMIT_WINDOW_SECONDS: windowSeconds },
   });
 
   var res = await worker.fetch(judgeRequest(validBody(), "198.51.100.6"), env);
   assert.equal(res.status, 429);
 
-  var bucket = bucketFromKey(kv.gets[0]);
+  var bucket = limiter.calls[0].bucket;
   var now = Math.floor(Date.now() / 1000);
   var expected = (bucket + 1) * windowSeconds - now;
   var actual = Number(res.headers.get("Retry-After"));
@@ -170,8 +194,8 @@ test("[vars] 未設定なら既定値(IP 30回 / 3600秒)が使われる", async
 
 /** 上限を使い切った状態を作り、429 の文面から「実際に使われた上限とウィンドウ」を読む。 */
 async function limitsInUse(vars) {
-  var kv = makeKV({ "rl:ip:*": 1000000 });
-  var env = makeEnv({ kv: kv, vars: vars });
+  var limiter = makeRateLimiter({ "ip:*": 1000000 });
+  var env = makeEnv({ limiter: limiter, vars: vars });
   var res = await worker.fetch(judgeRequest(validBody(), "192.0.2.77"), env);
   assert.equal(res.status, 429);
   assert.equal(res.headers.get("X-RateLimit-Scope"), "ip");
@@ -195,58 +219,45 @@ test("[vars] は10進整数の文字列だけ採用し、紛らわしい表記�
   assert.ok(good.includes("16回/120秒"), "正しい値が使われていない: " + good);
 });
 
-test("KV のカウンタが壊れていたら超過扱い(フェイルクローズ)", async () => {
-  var brokenGlobal = makeKV({ "rl:global:*": "abc" });
-  var env = makeEnv({ kv: brokenGlobal });
-  var res = await worker.fetch(judgeRequest(validBody(), "192.0.2.30"), env);
-  assert.equal(res.status, 429);
-  assert.equal(res.headers.get("X-RateLimit-Scope"), "global");
-  assert.equal(brokenGlobal.puts.length, 0);
-  assert.equal(env.aiCalls.length, 0);
-
-  var brokenIp = makeKV({ "rl:ip:*": "９９" });
-  var env2 = makeEnv({ kv: brokenIp });
-  var res2 = await worker.fetch(judgeRequest(validBody(), "192.0.2.31"), env2);
-  assert.equal(res2.status, 429);
-  assert.equal(res2.headers.get("X-RateLimit-Scope"), "ip");
-  assert.equal(env2.aiCalls.length, 0);
-});
-
-test("RATE_LIMIT_KV が無ければフェイルオープン(制限なしで通る)", async () => {
-  var env = makeEnv({ kv: null, vars: { RATE_LIMIT_PER_IP_MAX: 1 } });
-  assert.equal(env.RATE_LIMIT_KV, undefined);
+test("RATE_LIMITER が無ければフェイルオープン(制限なしで通る)", async () => {
+  var env = makeEnv({ limiter: null, vars: { RATE_LIMIT_PER_IP_MAX: 1 } });
+  assert.equal(env.RATE_LIMITER, undefined);
   for (var i = 0; i < 5; i++) {
     var res = await worker.fetch(judgeRequest(validBody(), "192.0.2.50"), env);
     assert.equal(res.status, 200);
     assert.equal(res.headers.get("X-RateLimit-Remaining-IP"), null);
+    assert.equal(res.headers.get("X-RateLimit-Remaining-Global"), null);
   }
   assert.equal(env.aiCalls.length, 5);
 });
 
-test("KV があるのに get が失敗したら 503(フェイルクローズ)", async () => {
-  var kv = makeKV(null, "get");
-  var env = makeEnv({ kv: kv });
+test("Durable Object の呼び出しが例外を投げたら 503(フェイルクローズ)", async () => {
+  var limiter = makeRateLimiter(null, "throw");
+  var env = makeEnv({ limiter: limiter });
   var res = await worker.fetch(judgeRequest(validBody(), "192.0.2.60"), env);
   assert.equal(res.status, 503);
   assert.equal(res.headers.get("content-type"), "application/json; charset=utf-8");
   assert.equal(res.headers.get("Retry-After"), "60");
+  assert.equal(res.headers.get("X-RateLimit-Scope"), null);
+  assert.equal(res.headers.get("X-RateLimit-Remaining-Global"), null);
   var body = await res.json();
   assert.equal(body.error, "レート制限の記録に失敗しました。しばらくしてから再試行してください");
-  assert.equal(env.aiCalls.length, 0, "KV 障害なのに AI.run が呼ばれている");
+  assert.equal(env.aiCalls.length, 0, "カウンタ障害なのに AI.run が呼ばれている");
 });
 
-test("KV があるのに put が失敗したら 503(フェイルクローズ)", async () => {
-  var kv = makeKV(null, "put");
-  var env = makeEnv({ kv: kv });
+test("Durable Object が 500 を返したら 503(フェイルクローズ)", async () => {
+  var limiter = makeRateLimiter(null, "500");
+  var env = makeEnv({ limiter: limiter });
   var res = await worker.fetch(judgeRequest(validBody(), "192.0.2.61"), env);
   assert.equal(res.status, 503);
   assert.equal(res.headers.get("Retry-After"), "60");
   assert.equal((await res.json()).error.includes("レート制限"), true);
-  assert.equal(env.aiCalls.length, 0, "KV 障害なのに AI.run が呼ばれている");
+  assert.equal(env.aiCalls.length, 0, "カウンタ障害なのに AI.run が呼ばれている");
 });
 
 test("CF-Connecting-IP が無いリクエストもまとめて数える", async () => {
-  var env = makeEnv({ vars: { RATE_LIMIT_PER_IP_MAX: 1 } });
+  var limiter = makeRateLimiter();
+  var env = makeEnv({ limiter: limiter, vars: { RATE_LIMIT_PER_IP_MAX: 1 } });
   var request = () =>
     new Request("https://example.com/api/judge", {
       method: "POST",
@@ -255,34 +266,106 @@ test("CF-Connecting-IP が無いリクエストもまとめて数える", async 
     });
   assert.equal((await worker.fetch(request(), env)).status, 200);
   assert.equal((await worker.fetch(request(), env)).status, 429);
+  assert.ok(limiter.state.has("ip:unknown"), "IP 不明ぶんが1つのインスタンスにまとまっていない");
 });
 
 test("400 や 502 もレート制限の回数に数える(415 と 503 は数えない)", async () => {
+  function increments(limiter) {
+    return limiter.calls.filter((call) => call.op === "increment").length;
+  }
+
   // 400
-  var kv400 = makeKV();
-  var env400 = makeEnv({ kv: kv400 });
+  var limiter400 = makeRateLimiter();
+  var env400 = makeEnv({ limiter: limiter400 });
   var bad = await worker.fetch(
     judgeRequest({ puzzle: "not an array", target: { row: 0, col: 2 } }, "192.0.2.70"),
     env400
   );
   assert.equal(bad.status, 400);
-  assert.equal(kv400.puts.length, 2, "400 が回数に数えられていない");
+  assert.equal(increments(limiter400), 2, "400 が回数に数えられていない");
+  assert.equal(bad.headers.get("X-RateLimit-Remaining-IP"), "29");
+  assert.equal(bad.headers.get("X-RateLimit-Remaining-Global"), "499");
 
   // 502
-  var kv502 = makeKV();
-  var env502 = makeEnv({ kv: kv502, aiError: new Error("boom") });
+  var limiter502 = makeRateLimiter();
+  var env502 = makeEnv({ limiter: limiter502, aiError: new Error("boom") });
   var failed = await worker.fetch(judgeRequest(validBody(), "192.0.2.71"), env502);
   assert.equal(failed.status, 502);
-  assert.equal(kv502.puts.length, 2, "502 が回数に数えられていない");
+  assert.equal(increments(limiter502), 2, "502 が回数に数えられていない");
+  assert.equal(failed.headers.get("X-RateLimit-Remaining-IP"), "29");
+  assert.equal(failed.headers.get("X-RateLimit-Remaining-Global"), "499");
 
   // 415(レート制限より前で止まる)
-  var kv415 = makeKV();
-  var env415 = makeEnv({ kv: kv415 });
+  var limiter415 = makeRateLimiter();
+  var env415 = makeEnv({ limiter: limiter415 });
   var unsupported = await worker.fetch(
     judgeRequest(validBody(), "192.0.2.72", "text/plain"),
     env415
   );
   assert.equal(unsupported.status, 415);
-  assert.equal(kv415.puts.length, 0, "415 が回数に数えられている");
-  assert.equal(kv415.gets.length, 0, "415 なのに KV を読んでいる");
+  assert.equal(limiter415.calls.length, 0, "415 なのにカウンタを呼んでいる");
+});
+
+// --- RateLimitCounter 単体(Durable Object の中身) ---------------------------
+
+var BUCKET_KEY = "bucket";
+var COUNT_KEY = "count:";
+
+async function callCounter(ctx, op, bucket, max) {
+  var counter = new RateLimitCounter(ctx, {});
+  var res = await counter.fetch(counterRequest(op, bucket, max));
+  assert.equal(res.status, 200);
+  return await res.json();
+}
+
+test("RateLimitCounter: increment は上限未満のときだけ +1 する", async () => {
+  // max-1 まで埋まっている → 通り、ちょうど max になる
+  var ctx = makeStorageCtx({ bucket: 7, "count:7": 4 });
+  assert.deepEqual(await callCounter(ctx, "increment", 7, 5), { allowed: true, count: 5 });
+  assert.equal(ctx.store.get("count:7"), 5);
+
+  // ちょうど max → 加算せずに拒否
+  assert.deepEqual(await callCounter(ctx, "increment", 7, 5), { allowed: false, count: 5 });
+  assert.equal(ctx.store.get("count:7"), 5, "拒否したのに加算されている");
+
+  // 未設定のバケットは 0 から
+  var fresh = makeStorageCtx();
+  assert.deepEqual(await callCounter(fresh, "increment", 1, 2), { allowed: true, count: 1 });
+  assert.equal(fresh.store.get(COUNT_KEY + 1), 1);
+  assert.equal(fresh.store.get(BUCKET_KEY), 1);
+});
+
+test("RateLimitCounter: peek は読むだけで加算しない", async () => {
+  var ctx = makeStorageCtx({ bucket: 3, "count:3": 2 });
+  assert.deepEqual(await callCounter(ctx, "peek", 3, 5), { allowed: true, count: 2 });
+  assert.deepEqual(await callCounter(ctx, "peek", 3, 2), { allowed: false, count: 2 });
+  assert.equal(ctx.store.get("count:3"), 2, "peek で加算されている");
+});
+
+test("RateLimitCounter: バケットが変われば数え直し、古いバケットのキーを消す", async () => {
+  var ctx = makeStorageCtx({ bucket: 10, "count:10": 5 });
+
+  // 別バケットは独立してゼロから
+  assert.deepEqual(await callCounter(ctx, "increment", 11, 5), { allowed: true, count: 1 });
+  assert.equal(ctx.store.has("count:10"), false, "古いバケットのキーが残っている");
+  assert.equal(ctx.store.get("count:11"), 1);
+  assert.equal(ctx.store.get(BUCKET_KEY), 11);
+
+  // さらに次のバケットへ。残るカウンタのキーは常に1つだけ。
+  assert.deepEqual(await callCounter(ctx, "increment", 12, 5), { allowed: true, count: 1 });
+  assert.equal(ctx.store.has("count:11"), false);
+  assert.deepEqual([...ctx.store.keys()].sort(), ["bucket", "count:12"]);
+});
+
+test("RateLimitCounter: カウンタが壊れていたら超過扱い(フェイルクローズ)", async () => {
+  var broken = ["abc", 1.5, -1, {}, Number.POSITIVE_INFINITY];
+  for (var i = 0; i < broken.length; i++) {
+    var ctx = makeStorageCtx({ bucket: 4, "count:4": broken[i] });
+    assert.deepEqual(
+      await callCounter(ctx, "increment", 4, 5),
+      { allowed: false, count: 5 },
+      String(broken[i]) + " が超過扱いになっていない"
+    );
+    assert.deepEqual(await callCounter(ctx, "peek", 4, 5), { allowed: false, count: 5 });
+  }
 });

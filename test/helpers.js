@@ -72,56 +72,117 @@ export function bareJevResponse() {
 }
 
 /**
- * Map ベースの KV スタブ。
+ * Map ベースの Durable Object(RateLimitCounter)スタブ。
  *
- * - `gets` に読んだキー、`puts` に書いたキー・値・options を順に記録する
- *   (「全体超過なら IP のキーを読まない」「超過なら書かない」の確認に使う)
- * - `initial` のキーは末尾に `*` を付けると前方一致のシードになる。
- *   レート制限のキーにはバケット番号(現在時刻依存)が入るため、テスト側で
- *   バケットを計算すると境界をまたいだ瞬間に落ちる。`{"rl:global:*": 5}` の形で
- *   シードしておけば、どのバケットになっても同じ値が読める。
- * - `failOn` に `"get"` / `"put"` を渡すと、その操作で例外を投げる(KV 障害の再現)
+ * 本物と同じ形で使えるようにしてある: `idFromName(name)` で ID を作り、`get(id)` で
+ * 返ってきたスタブの `fetch(request)` を呼ぶ。中身は `src/index.js` の
+ * `RateLimitCounter` と同じ意味論(`peek` は読むだけ、`increment` は上限未満のときだけ
+ * +1、バケットが変われば数え直し)を Map で再現する。
+ *
+ * - `calls` に `{ name, op, bucket, max }` を順に記録する
+ *   (「全体超過なら IP 側のインスタンスを呼ばない」の確認に使う)
+ * - `initial` はインスタンス名 → カウントのシード。名前の末尾に `*` を付けると
+ *   前方一致になる(`{"ip:*": 30}` で全 IP をシードできる)。シードは最初に来た
+ *   バケットに対して適用されるので、ウィンドウ境界をまたいでも落ちない
+ * - `failOn` に `"throw"` を渡すと fetch が例外を投げ、`"500"` を渡すと 500 を返す
+ *   (Durable Object 障害の再現)
  */
-export function makeKV(initial, failOn) {
-  var store = new Map();
+export function makeRateLimiter(initial, failOn) {
+  var exact = new Map();
   var prefixes = [];
   if (initial) {
     for (var key in initial) {
-      if (key.endsWith("*")) prefixes.push({ prefix: key.slice(0, -1), value: String(initial[key]) });
-      else store.set(key, String(initial[key]));
+      if (key.endsWith("*")) prefixes.push({ prefix: key.slice(0, -1), value: Number(initial[key]) });
+      else exact.set(key, Number(initial[key]));
     }
   }
-  var gets = [];
-  var puts = [];
+  function seedFor(name) {
+    if (exact.has(name)) return exact.get(name);
+    for (var i = 0; i < prefixes.length; i++) {
+      if (name.startsWith(prefixes[i].prefix)) return prefixes[i].value;
+    }
+    return 0;
+  }
+
+  // name -> { bucket, count }。本物の Durable Object インスタンスに相当する。
+  var state = new Map();
+  var calls = [];
+
+  function counterResponse(allowed, count) {
+    return new Response(JSON.stringify({ allowed: allowed, count: count }), {
+      status: 200,
+      headers: { "content-type": "application/json; charset=utf-8" },
+    });
+  }
+
   return {
-    store: store,
-    gets: gets,
-    puts: puts,
-    async get(key) {
-      gets.push(key);
-      if (failOn === "get") throw new Error("KV get failed");
-      if (store.has(key)) return store.get(key);
-      for (var i = 0; i < prefixes.length; i++) {
-        if (key.startsWith(prefixes[i].prefix)) return prefixes[i].value;
-      }
-      return null;
+    state: state,
+    calls: calls,
+    idFromName(name) {
+      return { name: name, toString: () => name };
     },
-    async put(key, value, options) {
-      puts.push({ key: key, value: value, options: options });
-      if (failOn === "put") throw new Error("KV put failed");
-      store.set(key, String(value));
+    get(id) {
+      var name = id.name;
+      return {
+        async fetch(request) {
+          var body = await request.json();
+          calls.push({ name: name, op: body.op, bucket: body.bucket, max: body.max });
+          if (failOn === "throw") throw new Error("durable object unavailable");
+          if (failOn === "500") return new Response("boom", { status: 500 });
+
+          var entry = state.get(name);
+          if (!entry || entry.bucket !== body.bucket) {
+            entry = { bucket: body.bucket, count: seedFor(name) };
+            state.set(name, entry);
+          }
+
+          if (body.op === "peek") return counterResponse(entry.count < body.max, entry.count);
+          if (entry.count >= body.max) return counterResponse(false, entry.count);
+          entry.count += 1;
+          return counterResponse(true, entry.count);
+        },
+      };
     },
   };
 }
 
-/** `rl:global:<bucket>` / `rl:ip:<ip>:<bucket>` からバケット番号を取り出す。 */
-export function bucketFromKey(key) {
-  return Number(key.slice(key.lastIndexOf(":") + 1));
+/**
+ * `RateLimitCounter` の単体テスト用の `ctx` モック。`ctx.storage` の
+ * `get` / `put` / `delete` を Map で提供する(本物は SQLite バックエンド)。
+ */
+export function makeStorageCtx(initial) {
+  var store = new Map();
+  if (initial) {
+    for (var key in initial) store.set(key, initial[key]);
+  }
+  return {
+    store: store,
+    storage: {
+      async get(key) {
+        return store.has(key) ? store.get(key) : undefined;
+      },
+      async put(key, value) {
+        store.set(key, value);
+      },
+      async delete(key) {
+        return store.delete(key);
+      },
+    },
+  };
+}
+
+/** `RateLimitCounter` に投げるリクエストを組み立てる。 */
+export function counterRequest(op, bucket, max) {
+  return new Request("https://rate-limiter.invalid/", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ op: op, bucket: bucket, max: max }),
+  });
 }
 
 /**
  * モック env を作る。
- * options: { kv, vars, aiResult, aiError }
+ * options: { limiter, vars, aiResult, aiError }(limiter に null を渡すとバインディング無し)
  * aiResult に関数を渡すと呼び出しごとに評価される。
  */
 export function makeEnv(options) {
@@ -139,7 +200,7 @@ export function makeEnv(options) {
     },
     aiCalls: calls,
   };
-  if (opts.kv !== null) env.RATE_LIMIT_KV = opts.kv || makeKV();
+  if (opts.limiter !== null) env.RATE_LIMITER = opts.limiter || makeRateLimiter();
   // [vars] は文字列として渡ってくる
   var vars = opts.vars || {};
   for (var name in vars) env[name] = String(vars[name]);
