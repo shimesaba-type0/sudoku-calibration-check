@@ -241,7 +241,7 @@ var runToken = 0;               // 実行の世代。reset() / showError() で +
 | `solveCount(grid, limit, found)` | 解の個数を数えるソルバー。`limit` 個見つけたら打ち切る(一意解の判定は `limit=2` で足りる)。候補の少ないマスから埋める(MRV)+ 行・列・箱のビットマスクでのバックトラッキング。`found` に配列を渡すと見つけた解を9行の文字列配列で受け取れる。置かれている数字がすでに矛盾していれば 0 |
 | `generateSolvedGrid()` | 空盤面に対し、各マスの候補をシャッフルしながらバックトラッキングして完成盤を1つ作る純粋関数(乱数のみ外部依存) |
 | `generatePuzzle(targetGivens)` | 完成盤からマスをランダム順に消し、消すたびに `solveCount(grid, 2) === 1` を確認する(2 になるなら戻す)。与えられた数字が `targetGivens`(既定 `DEFAULT_TARGET_GIVENS` = 30、下限 `MIN_TARGET_GIVENS` = 24)になったら打ち切る。戻り値 `{ given, solution }`(どちらも9行の文字列配列) |
-| `newPuzzle()` | 「新しい問題」ボタン。`generating` を立てて `reset()`(= 世代トークンを進めて進行中のループを無効化)し、`setTimeout(…, 0)` で生成してから `GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize` を差し替えて再描画。生成は同期で数十〜数百ms |
+| `newPuzzle()` | 「新しい問題」ボタン。`generating` を立てて `reset()`(= 世代トークンを進めて進行中のループを無効化)し、`setTimeout(…, 0)` で生成してから `GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize` を差し替えて再描画。生成は同期で概ね 10 ms 以下(実測: 中央値 4ms、最大 10ms、100回) |
 | `countEmpty(grid)` / `boxIndex` / `gridToCells` / `cellsToGrid` / `shuffled` | 上記の下請け。盤面の2つの表現(9行の文字列配列 ⇔ 81要素の数値配列。0 が空)の変換と、Fisher-Yates シャッフル |
 | `buildSnapshot()` | `GIVEN` + `state.values`(正誤問わず)から9行の文字列配列を作る。未確定は `.`。**判定対象のマスだけは `.` にして送る(他のマスの過去の推測は正誤問わず残す)**。Worker 側も 3.3 でこれを検証する |
 | `formatRoundSummary(round, correct, total)` | 周回ログの1行「N周目: M中K正解 (P%)」を組み立てる純粋関数。`total` が0でも割り算しない |

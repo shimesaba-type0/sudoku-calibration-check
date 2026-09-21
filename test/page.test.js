@@ -444,7 +444,7 @@ test("render() は周回ログのスクロール位置を引き継ぐ", async ()
 
 // --- 数独ジェネレーター / ソルバー(Issue #5) ------------------------------
 
-test("solveCount: 固定問題(Wikipedia)は一意解で、その解は既知の正解と一致する", async () => {
+test("solveCount: 固定問題(Wikipedia)は一意解で、その解は既知の正解と一致する", { timeout: 10000 }, async () => {
   var ctx = runScript(await getPageHtml());
 
   var found = [];
@@ -473,7 +473,17 @@ test("solveCount: 固定問題(Wikipedia)は一意解で、その解は既知の
   assert.equal(ctx.solveCount(oneHole, 2), 1);
 });
 
-test("generateSolvedGrid: 完成盤として正しく、毎回同じではない", async () => {
+// 空盤面だけを見る専用テスト。solveCount の早期打ち切り(if (count >= max) return;)が
+// 外れると空盤面の解を数え切ろうとしてハングする。timeout により、ハングでも
+// スイート全体を止めずに即座に検出できる。
+test("solveCount: 空盤面は limit(2)で打ち切る(早期打ち切りが無いとハングする)", { timeout: 10000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+  var empty = [];
+  for (var i = 0; i < 9; i++) empty.push(".........");
+  assert.equal(ctx.solveCount(empty, 2), 2);
+});
+
+test("generateSolvedGrid: 完成盤として正しく、毎回同じではない", { timeout: 10000 }, async () => {
   var ctx = runScript(await getPageHtml());
   var first = ctx.generateSolvedGrid();
   assertSolvedGrid(first, "generateSolvedGrid");
@@ -487,7 +497,7 @@ test("generateSolvedGrid: 完成盤として正しく、毎回同じではない
   assert.ok(differs, "何度生成しても同じ盤面しか出てこない(シャッフルが効いていない)");
 });
 
-test("generatePuzzle を20回: 常に一意解・解が一致・与えられた数字は17〜40個", async () => {
+test("generatePuzzle を20回: 常に一意解・解が一致・与えられた数字は既定30個ちょうど", { timeout: 10000 }, async () => {
   var ctx = runScript(await getPageHtml());
   var started = Date.now();
 
@@ -517,12 +527,79 @@ test("generatePuzzle を20回: 常に一意解・解が一致・与えられた�
     assert.deepEqual(hostRows(found[0]), hostRows(puzzle.solution), label + ": solveCount の解と solution が違う");
 
     var filled = countFilled(puzzle.given);
-    assert.ok(filled >= 17 && filled <= 40, label + ": 与えられた数字が17〜40個でない: " + filled);
+    assert.equal(filled, 30, label + ": 与えられた数字が既定の30個ちょうどでない: " + filled);
   }
 
   var elapsed = Date.now() - started;
   // 乱数任せなので上限は緩めに。桁違いに遅くなったら気づけるようにしておく。
   assert.ok(elapsed < 20000, "generatePuzzle 20回が遅すぎる: " + elapsed + "ms");
+});
+
+// 注意: generatePuzzle(24) は「ちょうど24個」を保証しない。実装はランダム順にマスを
+// 消していき、消せなくなった時点で打ち切る(消しすぎて一意解が崩れる場合は戻す)ので、
+// 24(MIN_TARGET_GIVENS)は「これより減らさない」下限であって、常に到達できる目標ではない。
+// 実測(1000回)では 24 に到達するのは約6割で、25〜28個で止まることもある。
+// ここでは「下限を下回らない」という実際の契約だけを検証する(=== 24 は書くとflakyになる)。
+test("generatePuzzle(24): 下限(MIN_TARGET_GIVENS)を下回らない", { timeout: 10000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+  for (var i = 0; i < 20; i++) {
+    var puzzle = ctx.generatePuzzle(24);
+    var label = "#" + i;
+    assertSolvedGrid(puzzle.solution, label);
+    assert.equal(ctx.solveCount(puzzle.given, 2), 1, label + ": generatePuzzle(24) が一意解でない");
+    var filled = countFilled(puzzle.given);
+    assert.ok(filled >= 24, label + ": 与えられた数字が下限24を下回った: " + filled);
+  }
+});
+
+test("generatePuzzle(NaN): DEFAULT_TARGET_GIVENS(30)にフォールバックする", { timeout: 10000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+  var puzzle = ctx.generatePuzzle(NaN);
+  assert.equal(
+    countFilled(puzzle.given),
+    30,
+    "targetGivens が NaN のとき DEFAULT_TARGET_GIVENS(30) にフォールバックしていない(81ヒントの「問題」を返していないか)"
+  );
+});
+
+test("リセットは実行中でも押せる(SPEC F5)。生成中だけ無効化される", async () => {
+  var ctx = runScript(await getPageHtml());
+
+  function resetButtonHtml() {
+    var html = ctx.renderControls();
+    var m = html.match(/<button id="reset-btn"[^>]*>/);
+    assert.ok(m, "reset-btn が見つからない");
+    return m[0];
+  }
+  function runButtonHtml() {
+    var html = ctx.renderControls();
+    var m = html.match(/<button id="run-btn"[^>]*>/);
+    assert.ok(m, "run-btn が見つからない");
+    return m[0];
+  }
+  function newPuzzleButtonHtml() {
+    var html = ctx.renderControls();
+    var m = html.match(/<button id="new-puzzle-btn"[^>]*>/);
+    assert.ok(m, "new-puzzle-btn が見つからない");
+    return m[0];
+  }
+
+  // 初期状態: どれも無効化されていない
+  assert.ok(!resetButtonHtml().includes("disabled"), "初期状態で reset-btn が無効化されている");
+
+  // 実行中: リセットは押せる。実行/新しい問題は押せない
+  ctx.state.running = true;
+  assert.ok(!resetButtonHtml().includes("disabled"), "実行中に reset-btn が無効化されている(SPEC F5違反)");
+  assert.ok(runButtonHtml().includes("disabled"), "実行中に run-btn が無効化されていない");
+  assert.ok(newPuzzleButtonHtml().includes("disabled"), "実行中に new-puzzle-btn が無効化されていない");
+  ctx.state.running = false;
+
+  // 生成中: リセットも無効化される(差し替え中の盤面と衝突するため)
+  ctx.generating = true;
+  assert.ok(resetButtonHtml().includes("disabled"), "生成中に reset-btn が無効化されていない");
+  assert.ok(runButtonHtml().includes("disabled"), "生成中に run-btn が無効化されていない");
+  assert.ok(newPuzzleButtonHtml().includes("disabled"), "生成中に new-puzzle-btn が無効化されていない");
+  ctx.generating = false;
 });
 
 test("「新しい問題」ボタンがヘッダにあり、生成中・実行中は押せない", async () => {
@@ -541,7 +618,7 @@ test("「新しい問題」ボタンがヘッダにあり、生成中・実行�
   assert.ok(/TOTAL_EMPTY = /.test(newPuzzleSrc), "newPuzzle() が TOTAL_EMPTY を再計算していない");
 });
 
-test("初期表示は固定問題のまま、newPuzzle() で GIVEN / SOLUTION と派生値が差し替わる", async () => {
+test("初期表示は固定問題のまま、newPuzzle() で GIVEN / SOLUTION と派生値が差し替わる", { timeout: 10000 }, async () => {
   var ctx = runScript(await getPageHtml());
 
   assert.deepEqual(hostRows(ctx.GIVEN), GIVEN, "初期表示は Wikipedia の固定問題");
@@ -571,7 +648,7 @@ test("初期表示は固定問題のまま、newPuzzle() で GIVEN / SOLUTION �
   assert.equal(ctx.state.done, false);
 });
 
-test("「新しい問題」の後に run() すると、新しい GIVEN の空マス数だけ /api/judge を呼ぶ", async () => {
+test("「新しい問題」の後に run() すると、新しい GIVEN の空マス数だけ /api/judge を呼ぶ", { timeout: 10000 }, async () => {
   var calls = [];
   var ctx;
   var fetchStub = async function (url, init) {

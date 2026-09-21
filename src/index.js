@@ -985,7 +985,7 @@ var PAGE_HTML = `<!doctype html>
       return false;
     }
 
-    fill(0);
+    if (!fill(0)) throw new Error("failed to generate a solved grid");
     return cellsToGrid(cells);
   }
 
@@ -995,7 +995,7 @@ var PAGE_HTML = `<!doctype html>
    * 戻り値 { given: 9行の文字列配列, solution: 9行の文字列配列 }。
    */
   function generatePuzzle(targetGivens) {
-    var goal = typeof targetGivens === "number" ? targetGivens : DEFAULT_TARGET_GIVENS;
+    var goal = Number.isFinite(targetGivens) ? targetGivens : DEFAULT_TARGET_GIVENS;
     if (goal < MIN_TARGET_GIVENS) goal = MIN_TARGET_GIVENS;
     if (goal > 81) goal = 81;
 
@@ -1281,7 +1281,7 @@ var PAGE_HTML = `<!doctype html>
   /**
    * 「新しい問題」。reset() で進行中のループを世代トークンごと無効化してから、
    * 生成した盤面で GIVEN / SOLUTION と派生値(TOTAL_EMPTY / roundSize)を差し替える。
-   * 生成は同期処理(数十〜数百ms)なので、いったん「生成中…」を描いてから
+   * 生成は同期処理(概ね10ms以下)なので、いったん「生成中…」を描いてから
    * setTimeout(0) で走らせ、画面が固まったように見えないようにする。
    */
   function newPuzzle() {
@@ -1380,12 +1380,15 @@ var PAGE_HTML = `<!doctype html>
     var runDisabled = state.running || state.done || state.errorMessage || generating ? "disabled" : "";
     // 生成中・実行中は問題を差し替えない(実行中の差し替えは盤面と周回ログの意味を壊す)
     var newDisabled = state.running || generating ? "disabled" : "";
+    // リセットは進行中の判定があっても安全に行える(SPEC F5、世代トークンが古い連鎖を無効化する)。
+    // 生成中だけは差し替え中の盤面と衝突するので無効化する。
+    var resetDisabled = generating ? "disabled" : "";
     var newLabel = generating ? "生成中…" : "新しい問題";
     var slowActive = state.speedMode === "slow" ? " active" : "";
     var fastActive = state.speedMode === "fast" ? " active" : "";
     return "<div class=\\"controls\\">" +
       "<button id=\\"run-btn\\" onclick=\\"run()\\" " + runDisabled + ">実行</button>" +
-      "<button id=\\"reset-btn\\" onclick=\\"reset()\\" " + newDisabled + ">リセット</button>" +
+      "<button id=\\"reset-btn\\" onclick=\\"reset()\\" " + resetDisabled + ">リセット</button>" +
       "<button id=\\"new-puzzle-btn\\" onclick=\\"newPuzzle()\\" " + newDisabled + ">" + newLabel + "</button>" +
       "<div id=\\"speed-toggle\\">" +
       "<button class=\\"speed-btn" + slowActive + "\\" onclick=\\"setSpeed('slow')\\">じっくり確認</button>" +
