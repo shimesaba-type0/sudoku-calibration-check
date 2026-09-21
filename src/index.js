@@ -589,7 +589,6 @@ var PAGE_HTML = `<!doctype html>
 </head>
 <body>
 <div id="app"></div>
-<!-- 実装中: この文字列は test/routing.test.js の既存アサーションとの後方互換のために残す -->
 <script>
   // -------------------------------------------------------------------
   // 純粋なロジック(テストから抽出しやすいよう、状態やDOM操作より先に置く)
@@ -628,6 +627,29 @@ var PAGE_HTML = `<!doctype html>
     return round + "周目: " + total + "中" + correct + "正解 (" + pct + "%)";
   }
 
+  // この周で不正解だったマスから次の周の queue を作る純粋関数(SPEC F3)。
+  // 元の配列は共有せず、必ず新しい配列・新しい要素を返す。
+  function nextQueue(roundWrong) {
+    return roundWrong.map(function (cell) {
+      return { r: cell.r, c: cell.c };
+    });
+  }
+
+  // 周の終わりにどうするかを決める純粋関数(SPEC F3)。
+  // "solved"(不正解0で完了)/ "limit"(15周の安全弁)/ "continue"(次の周へ)。
+  // MAX_ROUNDS は自由変数(テストからはクロージャで注入する)。
+  function shouldStop(round, incorrectCount) {
+    if (incorrectCount === 0) return "solved";
+    if (round >= MAX_ROUNDS) return "limit";
+    return "continue";
+  }
+
+  // 実行世代のチェック。reset() / showError() で runToken が進むので、
+  // 古い世代の fetch / setTimeout のコールバックはここで弾かれる(DESIGN 4.3)。
+  function isCurrent(token) {
+    return state.running && token === runToken;
+  }
+
   // -------------------------------------------------------------------
   // データ・状態(docs/DESIGN.md 4.1 / 5章)
   // -------------------------------------------------------------------
@@ -663,15 +685,19 @@ var PAGE_HTML = `<!doctype html>
     roundsToSolve: null,
     speedMode: "slow",
     errorMessage: null,
-    stoppedAtLimit: false
+    stoppedAtLimit: false,
+    lastJudgment: null // 直前に確定した1件(最速モードでも結果が見えるように残す)
   };
   // 描画に不要な進行管理はモジュール変数(docs/DESIGN.md 4.1)
   var queue = [];
   var roundWrong = [];
   var roundTally = { correct: 0, total: 0 };
-  var roundSize = 0;
+  var roundSize = TOTAL_EMPTY; // 開始前は「0 / 51」と見せる
   var started = false;
   var pendingCommit = null;
+  // 実行の世代。reset() / showError() のたびに進める。進行中の fetch や
+  // setTimeout のコールバックは、捕まえた世代と一致するときだけ続行する。
+  var runToken = 0;
 
   // -------------------------------------------------------------------
   // API呼び出し
@@ -717,18 +743,22 @@ var PAGE_HTML = `<!doctype html>
 
   function focusNext() {
     if (!state.running) return;
+    // この呼び出しが属する実行世代。以降のコールバックはすべてこれで判定する。
+    var token = runToken;
     if (queue.length === 0) {
       finalizeRound();
       return;
     }
     var cell = queue.shift();
+    // 先にフォーカスを立てる。buildSnapshot() は state.focusedKey のマスを "." に
+    // するので、この順序が「対象マスを空にして送る」不変条件そのもの(SPEC F3)。
     state.focusedKey = cell.r + "-" + cell.c;
     state.currentProbs = null;
     pendingCommit = null;
     render();
 
     judgeCell(cell.r, cell.c).then(function (result) {
-      if (!state.running) return;
+      if (!isCurrent(token)) return; // リセット後などの古い世代は捨てる
       var probs = DIGITS.map(function (d) {
         var p = result.probabilities ? result.probabilities[d] : 0;
         return { digit: d, pct: Math.round((typeof p === "number" ? p : 0) * 100), isPick: d === result.choice };
@@ -738,16 +768,22 @@ var PAGE_HTML = `<!doctype html>
       render();
       var beforeCommitMs = state.speedMode === "slow" ? SLOW_BEFORE_COMMIT_MS : FAST_BEFORE_COMMIT_MS;
       setTimeout(function () {
-        if (!state.running) return;
+        if (!isCurrent(token)) return;
         commitFocused();
         var afterCommitMs = state.speedMode === "slow" ? SLOW_AFTER_COMMIT_MS : FAST_AFTER_COMMIT_MS;
         setTimeout(function () {
-          if (!state.running) return;
+          if (!isCurrent(token)) return;
           focusNext();
         }, afterCommitMs);
       }, beforeCommitMs);
-    }).catch(function (err) {
+    }, function (err) {
+      // API 側の失敗だけをここで扱う(成功ハンドラ内の例外と混ぜない)
+      if (!isCurrent(token)) return;
       showError(err && err.message ? err.message : String(err));
+    }).catch(function (err) {
+      // 成功ハンドラ(render など)が投げた場合。API エラーとは区別して表示する。
+      if (!isCurrent(token)) return;
+      showError("画面の更新に失敗しました: " + (err && err.message ? err.message : String(err)));
     });
   }
 
@@ -756,6 +792,8 @@ var PAGE_HTML = `<!doctype html>
     var r = pendingCommit.r;
     var c = pendingCommit.c;
     var key = r + "-" + c;
+    // 確定待ちのマスが、いまフォーカスしているマスと違うなら何もしない
+    if (state.focusedKey !== key) return;
     var correct = pendingCommit.choice === SOLUTION[r][c];
     state.values[key] = { value: pendingCommit.choice, status: correct ? "correct" : "incorrect" };
     roundTally.total += 1;
@@ -764,6 +802,15 @@ var PAGE_HTML = `<!doctype html>
     } else {
       roundWrong.push({ r: r, c: c });
     }
+    // 次の結果が来るまで表示に残す(最速モードでも判定が見えるように)
+    state.lastJudgment = {
+      r: r,
+      c: c,
+      choice: pendingCommit.choice,
+      confidence: pendingCommit.confidence,
+      status: correct ? "correct" : "incorrect",
+      probs: state.currentProbs
+    };
     state.focusedKey = null;
     state.currentProbs = null;
     pendingCommit = null;
@@ -771,15 +818,17 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function finalizeRound() {
+    var token = runToken;
     state.roundLog.push(formatRoundSummary(state.round, roundTally.correct, roundTally.total));
-    if (roundWrong.length === 0) {
+    var decision = shouldStop(state.round, roundWrong.length);
+    if (decision === "solved") {
       state.done = true;
       state.running = false;
       state.roundsToSolve = state.round;
       render();
       return;
     }
-    if (state.round >= MAX_ROUNDS) {
+    if (decision === "limit") {
       state.done = true;
       state.running = false;
       state.stoppedAtLimit = true;
@@ -787,19 +836,21 @@ var PAGE_HTML = `<!doctype html>
       return;
     }
     state.round += 1;
-    queue = roundWrong;
+    queue = nextQueue(roundWrong);
     roundWrong = [];
     roundSize = queue.length;
     roundTally = { correct: 0, total: 0 };
     render();
     var betweenRoundsMs = state.speedMode === "slow" ? SLOW_BETWEEN_ROUNDS_MS : FAST_BETWEEN_ROUNDS_MS;
     setTimeout(function () {
-      if (!state.running) return;
+      if (!isCurrent(token)) return;
       focusNext();
     }, betweenRoundsMs);
   }
 
   function showError(message) {
+    // 世代を進めて、進行中の fetch / setTimeout のコールバックを無効化する
+    runToken += 1;
     state.errorMessage = message;
     state.running = false;
     state.focusedKey = null;
@@ -814,6 +865,8 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function reset() {
+    // 世代を進める。進行中の fetch / setTimeout はこれで続きを実行しなくなる
+    runToken += 1;
     var keepSpeed = state.speedMode;
     state = {
       round: 1,
@@ -826,12 +879,13 @@ var PAGE_HTML = `<!doctype html>
       roundsToSolve: null,
       speedMode: keepSpeed,
       errorMessage: null,
-      stoppedAtLimit: false
+      stoppedAtLimit: false,
+      lastJudgment: null
     };
     queue = [];
     roundWrong = [];
     roundTally = { correct: 0, total: 0 };
-    roundSize = 0;
+    roundSize = TOTAL_EMPTY;
     started = false;
     pendingCommit = null;
     render();
@@ -949,32 +1003,55 @@ var PAGE_HTML = `<!doctype html>
       "</div>";
   }
 
+  function coordLabel(r, c) {
+    return (r + 1) + "行目 " + (c + 1) + "列目";
+  }
+
+  // 1〜9の確率バー。並びは常に 1〜9 の昇順(不変条件3)。choice の棒だけアクセント色。
+  function renderBars(probs) {
+    return probs.map(function (p) {
+      var barColor = p.isPick ? "var(--accent)" : "var(--border)";
+      return "<div class=\\"bar-row\\"><span class=\\"bar-label\\">" + p.digit + "</span>" +
+        "<div class=\\"bar-track\\"><div class=\\"bar-fill\\" style=\\"width:" + p.pct + "%;background:" + barColor + ";\\"></div></div>" +
+        "<span class=\\"bar-pct\\">" + p.pct + "%</span></div>";
+    }).join("");
+  }
+
   function renderCurrentPanel() {
-    if (!state.focusedKey) {
-      return "<div id=\\"current-panel\\" class=\\"panel\\"><p class=\\"panel-title\\">現在の判定</p><p class=\\"muted\\">待機中</p></div>";
+    var head = "<div id=\\"current-panel\\" class=\\"panel\\"><p class=\\"panel-title\\">現在の判定</p>";
+    var tail = "</div>";
+
+    // 結果が届いている最中のマス: 座標とバーをそのまま出す
+    if (state.focusedKey && state.currentProbs) {
+      var parts = state.focusedKey.split("-");
+      var confidenceText = "";
+      if (pendingCommit && typeof pendingCommit.confidence === "number") {
+        confidenceText = "<span class=\\"confidence\\">Jev confidence " + Math.round(pendingCommit.confidence * 100) + "%</span>";
+      }
+      return head +
+        "<div class=\\"coords\\">" + coordLabel(Number(parts[0]), Number(parts[1])) + confidenceText + "</div>" +
+        "<div class=\\"bars\\">" + renderBars(state.currentProbs) + "</div>" + tail;
     }
-    var parts = state.focusedKey.split("-");
-    var r = Number(parts[0]);
-    var c = Number(parts[1]);
-    var coordText = (r + 1) + "行目 " + (c + 1) + "列目";
-    var confidenceText = "";
-    if (pendingCommit && typeof pendingCommit.confidence === "number") {
-      confidenceText = "<span class=\\"confidence\\">Jev confidence " + Math.round(pendingCommit.confidence * 100) + "%</span>";
+
+    // 待ち時間中は「いま聞いているマス」+「直前に確定した判定」を並べる。
+    // 最速モードでも結果が一瞬で消えないようにするため(DESIGN 4.4)。
+    var body = "";
+    if (state.focusedKey) {
+      var p2 = state.focusedKey.split("-");
+      body += "<div class=\\"coords\\">" + coordLabel(Number(p2[0]), Number(p2[1])) +
+        "<span class=\\"confidence\\">判定中…</span></div>";
     }
-    var bars;
-    if (state.currentProbs) {
-      bars = state.currentProbs.map(function (p) {
-        var barColor = p.isPick ? "var(--accent)" : "var(--border)";
-        return "<div class=\\"bar-row\\"><span class=\\"bar-label\\">" + p.digit + "</span>" +
-          "<div class=\\"bar-track\\"><div class=\\"bar-fill\\" style=\\"width:" + p.pct + "%;background:" + barColor + ";\\"></div></div>" +
-          "<span class=\\"bar-pct\\">" + p.pct + "%</span></div>";
-      }).join("");
-    } else {
-      bars = "<p class=\\"muted\\">判定中…</p>";
+    var last = state.lastJudgment;
+    if (last && last.probs) {
+      var statusText = last.status === "correct" ? "正解" : "不正解";
+      var lastConfidence = typeof last.confidence === "number" ? " / Jev confidence " + Math.round(last.confidence * 100) + "%" : "";
+      body += "<div class=\\"coords\\"><span class=\\"confidence\\">直前: " + coordLabel(last.r, last.c) +
+        " → " + escapeHtml(last.choice) + "(" + statusText + ")" + lastConfidence + "</span></div>" +
+        "<div class=\\"bars\\">" + renderBars(last.probs) + "</div>";
+      return head + body + tail;
     }
-    return "<div id=\\"current-panel\\" class=\\"panel\\"><p class=\\"panel-title\\">現在の判定</p>" +
-      "<div class=\\"coords\\">" + coordText + confidenceText + "</div>" +
-      "<div class=\\"bars\\">" + bars + "</div></div>";
+    if (state.focusedKey) return head + body + "<p class=\\"muted\\">判定中…</p>" + tail;
+    return head + "<p class=\\"muted\\">待機中</p>" + tail;
   }
 
   function renderRoundLog() {
@@ -999,6 +1076,11 @@ var PAGE_HTML = `<!doctype html>
 
   function render() {
     var app = document.getElementById("app");
+    // 周回ログのスクロール位置を引き継ぐ(innerHTML を作り直すと先頭に戻るため)。
+    // 末尾に居たときは末尾のままにする。
+    var oldLog = document.querySelector("#round-log ul");
+    var savedScroll = oldLog ? oldLog.scrollTop : 0;
+    var wasAtBottom = oldLog ? oldLog.scrollHeight - oldLog.scrollTop - oldLog.clientHeight < 4 : true;
     app.innerHTML =
       "<h1>数独キャリブレーションチェック</h1>" +
       "<p class=\\"subtitle\\">Jev (typesafe/jev) に1マスずつ数字を聞き、確率の較正を目で確かめる</p>" +
@@ -1013,6 +1095,9 @@ var PAGE_HTML = `<!doctype html>
       renderBanner() +
       "</div>" +
       "</div>";
+
+    var newLog = document.querySelector("#round-log ul");
+    if (newLog) newLog.scrollTop = wasAtBottom ? newLog.scrollHeight : savedScroll;
   }
 
   render();

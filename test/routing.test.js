@@ -21,7 +21,9 @@ test("GET / は HTML をセキュリティヘッダー付きで返す", async ()
 
   var html = await res.text();
   assert.ok(html.includes("数独キャリブレーションチェック"));
-  assert.ok(html.includes("実装中"));
+  // 実UIのマーカー(グリッドと実行ボタン)。判定ループが依存するDOMは page.test.js で検査する
+  assert.ok(html.includes('id=\\"grid\\"'), "グリッドの id が無い");
+  assert.ok(html.includes('id=\\"run-btn\\"'), "実行ボタンの id が無い");
   assert.ok(html.includes("var GIVEN ="));
   assert.equal(env.aiCalls.length, 0);
 });

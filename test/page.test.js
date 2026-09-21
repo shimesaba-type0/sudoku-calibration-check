@@ -47,6 +47,21 @@ function extractFunctionSource(scriptText, name) {
   throw new Error("関数の閉じ波括弧が見つからない: " + name);
 }
 
+/**
+ * 行コメントを落とす(ソース上の出現順を検査するとき、説明コメントに書いた
+ * 関数名を実際の呼び出しと取り違えないようにするため)。URL のような "//" を
+ * 含む文字列リテラルがある関数には使わない。
+ */
+function stripLineComments(text) {
+  return text
+    .split("\n")
+    .map(function (line) {
+      var i = line.indexOf("//");
+      return i >= 0 ? line.slice(0, i) : line;
+    })
+    .join("\n");
+}
+
 test("GET / は判定ループが依存するDOMフック一式と /api/judge を含む", async () => {
   var html = await getPageHtml();
 
@@ -64,9 +79,7 @@ test("GET / は判定ループが依存するDOMフック一式と /api/judge �
   // API呼び出し先
   assert.ok(html.includes("/api/judge"), "/api/judge への言及が無い");
 
-  // 既存の routing.test.js との後方互換(SPEC F1 のUIになっても壊さない)
   assert.ok(html.includes("数独キャリブレーションチェック"));
-  assert.ok(html.includes("実装中"));
   assert.ok(html.includes("var GIVEN ="));
 });
 
@@ -165,4 +178,153 @@ test("純粋関数 formatRoundSummary: 「N周目: M中K正解 (P%)」を組み�
   assert.equal(formatRoundSummary(3, 0, 5), "3周目: 5中0正解 (0%)");
   // 分母0(対象0件の周)を割り算エラーなく扱えること
   assert.equal(formatRoundSummary(5, 0, 0), "5周目: 0中0正解 (0%)");
+});
+
+test("純粋関数 nextQueue: 不正解マスをそのまま次の周の対象にし、元の配列と共有しない", async () => {
+  var html = await getPageHtml();
+  var script = extractScript(html);
+  var src = extractFunctionSource(script, "nextQueue");
+  var nextQueue = new Function("return (" + src + ");")();
+
+  var roundWrong = [{ r: 0, c: 2 }, { r: 4, c: 4 }];
+  var next = nextQueue(roundWrong);
+  assert.deepEqual(next, [{ r: 0, c: 2 }, { r: 4, c: 4 }]);
+  assert.notEqual(next, roundWrong, "同じ配列を使い回すと roundWrong = [] で次の周の対象が消える");
+  assert.notEqual(next[0], roundWrong[0], "要素も共有しない");
+  assert.deepEqual(nextQueue([]), []);
+
+  // 元の配列を空にしても、取り出した queue は影響を受けない(finalizeRound の順序に依存しない)
+  roundWrong.length = 0;
+  assert.equal(next.length, 2);
+});
+
+test("純粋関数 shouldStop: 不正解0なら solved、上限に達したら limit、それ以外は continue", async () => {
+  var html = await getPageHtml();
+  var script = extractScript(html);
+  var maxMatch = script.match(/var MAX_ROUNDS = (\d+);/);
+  assert.ok(maxMatch, "var MAX_ROUNDS = <数値>; が見つからない");
+  var maxRounds = Number(maxMatch[1]);
+  assert.equal(maxRounds, 15, "安全弁は15周(SPEC F3)");
+
+  var src = extractFunctionSource(script, "shouldStop");
+  // MAX_ROUNDS は自由変数なのでクロージャで注入する(buildSnapshot と同じやり方)
+  var shouldStop = new Function("MAX_ROUNDS", "var shouldStop = " + src + ";\nreturn shouldStop;")(maxRounds);
+
+  assert.equal(shouldStop(1, 0), "solved");
+  assert.equal(shouldStop(15, 0), "solved", "上限の周でも全問正解なら完了が優先される");
+  assert.equal(shouldStop(1, 6), "continue");
+  assert.equal(shouldStop(14, 1), "continue");
+  assert.equal(shouldStop(15, 1), "limit");
+  assert.equal(shouldStop(16, 1), "limit");
+});
+
+test("focusNext は判定を投げる前に state.focusedKey を立てる(対象マスを空にして送る)", async () => {
+  var html = await getPageHtml();
+  var script = extractScript(html);
+  var src = stripLineComments(extractFunctionSource(script, "focusNext"));
+
+  var focusAssign = src.indexOf("state.focusedKey =");
+  var judgeCall = src.indexOf("judgeCell(");
+  assert.ok(focusAssign >= 0, "state.focusedKey への代入が無い");
+  assert.ok(judgeCall >= 0, "judgeCell( の呼び出しが無い");
+  assert.ok(
+    focusAssign < judgeCall,
+    "state.focusedKey の代入が judgeCell( より後ろにあると、対象マスの前回の推測を送ってしまう"
+  );
+
+  // buildSnapshot() は judgeCell の中で呼ばれる(= フォーカス確定後)
+  assert.ok(!/buildSnapshot\(\)/.test(src.slice(0, focusAssign)), "フォーカス確定前に buildSnapshot() を呼んでいる");
+  var judgeSrc = extractFunctionSource(script, "judgeCell");
+  assert.ok(judgeSrc.includes("buildSnapshot()"), "judgeCell が buildSnapshot() を使っていない");
+});
+
+test("実行世代トークン: runToken を定義し、reset と showError が進める", async () => {
+  var html = await getPageHtml();
+  var script = extractScript(html);
+
+  assert.ok(/var runToken = 0;/.test(script), "var runToken = 0; が無い");
+
+  var resetSrc = extractFunctionSource(script, "reset");
+  assert.ok(/runToken \+= 1;|runToken\+\+/.test(resetSrc), "reset() が runToken を進めていない");
+
+  var showErrorSrc = extractFunctionSource(script, "showError");
+  assert.ok(/runToken \+= 1;|runToken\+\+/.test(showErrorSrc), "showError() が runToken を進めていない");
+});
+
+test("純粋関数 isCurrent: 実行中かつ同じ世代のときだけ true", async () => {
+  var html = await getPageHtml();
+  var script = extractScript(html);
+  var src = extractFunctionSource(script, "isCurrent");
+  function make(running, current) {
+    return new Function("state", "runToken", "var isCurrent = " + src + ";\nreturn isCurrent;")({ running: running }, current);
+  }
+  assert.equal(make(true, 3)(3), true);
+  assert.equal(make(true, 4)(3), false, "リセット後の古い世代は続行してはいけない");
+  assert.equal(make(false, 3)(3), false, "停止中は続行してはいけない");
+});
+
+test("focusNext と finalizeRound の非同期コールバックはすべて世代トークンで守られている", async () => {
+  var html = await getPageHtml();
+  var script = extractScript(html);
+
+  var focusSrc = extractFunctionSource(script, "focusNext");
+  assert.ok(/var token = runToken;/.test(focusSrc), "focusNext が世代を捕まえていない");
+  // then(成功)・then(失敗)・commit前 setTimeout・commit後 setTimeout の4か所
+  var guards = focusSrc.match(/if \(!isCurrent\(token\)\) return;/g) || [];
+  assert.ok(guards.length >= 4, "focusNext の世代ガードが足りない: " + guards.length);
+  assert.ok(!/if \(!state\.running\) return;\s*\n\s*var probs/.test(focusSrc), "state.running だけのチェックが残っている");
+  // setTimeout のコールバックは必ず先頭でガードする
+  var timeoutBodies = focusSrc.match(/setTimeout\(function \(\) \{\s*([^\n]*)/g) || [];
+  assert.ok(timeoutBodies.length >= 2, "setTimeout が2か所ない");
+  timeoutBodies.forEach(function (body) {
+    assert.ok(body.includes("if (!isCurrent(token)) return;"), "setTimeout の先頭に世代ガードが無い: " + body);
+  });
+
+  var finalizeSrc = extractFunctionSource(script, "finalizeRound");
+  assert.ok(/var token = runToken;/.test(finalizeSrc), "finalizeRound が世代を捕まえていない");
+  assert.ok(/if \(!isCurrent\(token\)\) return;/.test(finalizeSrc), "周と周の間の setTimeout に世代ガードが無い");
+});
+
+test("commitFocused はフォーカス中のマスと一致しなければ何もしない", async () => {
+  var html = await getPageHtml();
+  var script = extractScript(html);
+  var src = stripLineComments(extractFunctionSource(script, "commitFocused"));
+
+  assert.ok(/if \(!pendingCommit\) return;/.test(src), "pendingCommit が無いときの early return が無い");
+  var guard = src.indexOf('if (state.focusedKey !== key) return;');
+  var mutate = src.indexOf("state.values[key] =");
+  assert.ok(guard >= 0, "フォーカスとのずれを見る early return が無い");
+  assert.ok(guard < mutate, "ガードは state.values を書き換える前に置く");
+});
+
+test("開始前の「この周の進捗」は 0 / 51 と読める(roundSize の初期値が TOTAL_EMPTY)", async () => {
+  var html = await getPageHtml();
+  var script = extractScript(html);
+  assert.ok(/var roundSize = TOTAL_EMPTY;/.test(script), "roundSize の初期値が TOTAL_EMPTY でない(0 / 0 と表示されてしまう)");
+  assert.ok(/roundSize = TOTAL_EMPTY;[\s\S]*function reset\(\)/.test(script) || /function reset\(\)[\s\S]*roundSize = TOTAL_EMPTY;/.test(script), "reset() 後も TOTAL_EMPTY に戻していない");
+  var resetSrc = extractFunctionSource(script, "reset");
+  assert.ok(/roundSize = TOTAL_EMPTY;/.test(resetSrc), "reset() が roundSize を TOTAL_EMPTY に戻していない");
+});
+
+test("直前の判定を state.lastJudgment に残す(最速モードでも結果が見える)", async () => {
+  var html = await getPageHtml();
+  var script = extractScript(html);
+  assert.ok(/lastJudgment: null/.test(script), "state に lastJudgment が無い");
+  var commitSrc = extractFunctionSource(script, "commitFocused");
+  assert.ok(/state\.lastJudgment = \{/.test(commitSrc), "commitFocused が lastJudgment を更新していない");
+  var panelSrc = extractFunctionSource(script, "renderCurrentPanel");
+  assert.ok(/state\.lastJudgment/.test(panelSrc), "現在の判定パネルが lastJudgment を表示していない");
+  var resetSrc = extractFunctionSource(script, "reset");
+  assert.ok(/lastJudgment: null/.test(resetSrc), "reset() が lastJudgment を消していない");
+});
+
+test("render() は周回ログのスクロール位置を引き継ぐ", async () => {
+  var html = await getPageHtml();
+  var script = extractScript(html);
+  var src = extractFunctionSource(script, "render");
+  assert.ok(/scrollTop/.test(src), "render() がスクロール位置を扱っていない");
+  var save = src.indexOf("savedScroll");
+  var replace = src.indexOf("app.innerHTML");
+  assert.ok(save >= 0 && save < replace, "innerHTML を置き換える前にスクロール位置を保存していない");
+  assert.ok(src.lastIndexOf("scrollTop") > replace, "innerHTML 置き換え後にスクロール位置を復元していない");
 });

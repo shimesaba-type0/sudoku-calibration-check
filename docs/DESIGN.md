@@ -192,14 +192,20 @@ var state = {
   running: false,
   done: false,
   roundsToSolve: null, // 完了時の周数
-  speedMode: "slow"    // "slow" | "fast"
+  speedMode: "slow",   // "slow" | "fast"
+  errorMessage: null,  // エラーボックスに出す文言。null なら非表示
+  stoppedAtLimit: false, // 15周の安全弁で止まったか(完了バナーの出し分け)
+  lastJudgment: null   // 直前に確定した1件 { r, c, choice, confidence, status, probs }。
+                       // 次の結果が来るまで表示に残す(最速モードでも判定が見えるように)
 };
 // 描画に不要な進行管理はモジュール変数
 var queue = [];                 // この周でまだ判定していないマス [{r,c}]
 var roundWrong = [];            // この周で不正解だったマス。次の周の queue になる
 var roundTally = { correct:0, total:0 };
+var roundSize = TOTAL_EMPTY;    // この周の対象マス数(「この周の進捗」の分母)。開始前は空マス数の51
 var started = false;
 var pendingCommit = null;       // API結果を受けて確定待ちの1件
+var runToken = 0;               // 実行の世代。reset() / showError() で +1 する(4.3)
 ````
 
 ### 4.2 関数と責務
@@ -207,19 +213,28 @@ var pendingCommit = null;       // API結果を受けて確定待ちの1件
 | 関数 | 責務 |
 |---|---|
 | `buildSnapshot()` | `GIVEN` + `state.values`(正誤問わず)から9行の文字列配列を作る。未確定は `.`。**判定対象のマスだけは `.` にして送る(他のマスの過去の推測は正誤問わず残す)**。Worker 側も 3.3 でこれを検証する |
-| `judgeCell(r,c)` | `/api/judge` を `fetch`。非2xxは `Error` にして投げる |
-| `focusNext()` | `queue` から1つ取り出しフォーカス→`judgeCell`→バー表示→(待ち)→`commitFocused`→(待ち)→再帰。`queue` が空なら `finalizeRound` |
-| `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong` を更新 |
-| `finalizeRound()` | ログ追記。不正解0なら完了、そうでなければ `queue = roundWrong` で次の周へ |
+| `formatRoundSummary(round, correct, total)` | 周回ログの1行「N周目: M中K正解 (P%)」を組み立てる純粋関数。`total` が0でも割り算しない |
+| `nextQueue(roundWrong)` | 次の周の `queue` を作る純粋関数。配列も要素も複製して返す(`roundWrong = []` の影響を受けないため) |
+| `shouldStop(round, incorrectCount)` | 周の終わりの判断を返す純粋関数。`"solved"`(不正解0)/ `"limit"`(`MAX_ROUNDS` に到達)/ `"continue"` |
+| `isCurrent(token)` | `state.running && token === runToken`。古い世代のコールバックを弾く(4.3) |
+| `judgeCell(r,c)` | `buildSnapshot()` を作って `/api/judge` を `fetch`。非2xxは `Error` にして投げる |
+| `focusNext()` | 先頭で `runToken` を捕まえ、`queue` から1つ取り出しフォーカス→`judgeCell`→バー表示→(待ち)→`commitFocused`→(待ち)→再帰。`queue` が空なら `finalizeRound` |
+| `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong`/`state.lastJudgment` を更新。`pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない |
+| `finalizeRound()` | ログ追記→`shouldStop` の結果で完了 / 強制終了 / 次の周(`queue = nextQueue(roundWrong)`) |
 | `run()` | 初回のみ queue を全空マスで初期化し `focusNext` を開始 |
-| `reset()` | 進行管理と `state` を初期化(`speedMode` は維持) |
-| `render()` | `state` から DOM(グリッド・統計・バー・ログ・バナー・ボタン)を **全部 innerHTML で再生成** |
+| `reset()` | `runToken` を進め、進行管理と `state` を初期化(`speedMode` は維持) |
+| `showError(message)` | `runToken` を進めて `state.errorMessage` を立て、`running=false` で止める(不変条件4) |
+| `setSpeed(mode)` | `state.speedMode` を切り替えて再描画。実行中でも切り替えられる(4.4) |
+| `render()` | `state` から DOM(グリッド・統計・バー・ログ・バナー・ボタン)を **全部 innerHTML で再生成**。周回ログのスクロール位置だけは引き継ぐ |
+| `render*()` | `renderGrid` / `renderLegend` / `renderControls` / `renderErrorBox` / `renderStats`(+`statCard`)/ `renderCurrentPanel`(+`coordLabel` / `renderBars`)/ `renderRoundLog` / `renderBanner`。それぞれHTML文字列を返すだけで、DOMには触らない |
 | `buildCellStyle()` | マスの状態(given/pending/correct/incorrect + focused)からインラインstyle文字列を返す |
+| `escapeHtml(text)` | `innerHTML` に入れる前に `& < > " '` を実体参照にする |
 
 ### 4.3 状態遷移(1マス)
 
 ````text
 idle ──run()──▶ focusNext()
+                 │ token = runToken(この呼び出しの世代を捕まえる)
                  │ focusedKey=key, currentProbs=null, render()
                  ▼
               judgeCell()  ── 失敗 ──▶ showError(), running=false, 停止
@@ -228,16 +243,43 @@ idle ──run()──▶ focusNext()
             currentProbs=probs, pendingCommit={...}, render()
                  │ (slow: 700ms)
                  ▼
-            commitFocused(): values[key]=…, focusedKey=null, render()
+            commitFocused(): values[key]=…, lastJudgment=…, focusedKey=null, render()
                  │ (slow:150ms / fast:20ms)
                  ▼
             queue 残あり → focusNext() / 空 → finalizeRound()
 ````
 
+**実行世代(`runToken`)のルール。** `reset()` と `showError()` は `runToken` を1つ進める。
+`focusNext()` / `finalizeRound()` は入口で `var token = runToken;` と世代を捕まえ、その後の
+`then` / 失敗ハンドラ / `setTimeout` のコールバックは **すべて先頭で `isCurrent(token)`
+(= `state.running && token === runToken`)を確認し、偽なら何もせずに return する**。
+
+`state` はオブジェクトごと差し替えられるが、飛んでいる `fetch` の Promise や予約済みの
+`setTimeout` は生き続けてモジュール変数を読むため、`state.running` を見るだけでは足りない。
+「リセット → すぐ実行」で古い連鎖が生き返ると、同じマスを二度判定して二重に課金され、
+`roundTally` が `state.values` とずれ、`pendingCommit`(モジュール変数は1つしかない)が
+上書きされて `queue` から取り出したマスがどこにも確定されないまま周が終わらなくなる。
+世代トークンはこれを一箇所で断ち切るための仕組みなので、非同期のコールバックを足すときは
+必ず同じガードを付ける。
+
+なお API 失敗は `then(onOk, onErr)` の第2引数で受け、成功ハンドラ側で投げた例外は後ろの
+`catch` で別の文言(「画面の更新に失敗しました」)にする。描画のバグを API エラーとして
+報告しないため。
+
 ### 4.4 描画方針
 
 - 状態が変わるたびに `render()` で該当領域を丸ごと再生成する。81マス+9本のバー程度なので差分更新は不要
 - 色や枠線は `buildCellStyle` が返すインラインstyleで指定(クラス切り替えではなく、状態から毎回組み立てる)
+- 「現在の判定」パネルは、結果が届いているマスについては座標とバーを出し、結果待ち・確定直後は
+  「いま聞いているマス」と **直前に確定した判定**(`state.lastJudgment`: 座標・選んだ数字・正誤・
+  `confidence`・バー)を並べる。最速モードだと結果が一瞬で消えてしまうため
+- `innerHTML` を作り直すと周回ログのスクロールが先頭に戻るので、`render()` は置き換えの前に
+  `#round-log ul` の `scrollTop` を保存し、置き換えの後に戻す。末尾に居たときは末尾のままにする
+- 速度モード(`setSpeed`)は実行中でも切り替えられる。**予約済みの `setTimeout` の残り時間は
+  変わらず、新しい待ち時間は次にタイマーを張るところから効く**(切り替えた瞬間に待ち時間を
+  張り直す必要はない、という割り切り)
+- 「この周の進捗」の分母 `roundSize` は開始前・リセット後も空マス数(51)にしておく。
+  `0 / 0` と出すと「対象が無い」ように見えるため
 
 ## 5. データ
 
