@@ -818,6 +818,24 @@ var PAGE_HTML = `<!doctype html>
     return state.running && token === runToken;
   }
 
+  // 32bit FNV-1a。集計ビュー(SPEC F1 拡張2)の問題IDに使う簡易ハッシュ。
+  // 衝突を厳密に避ける必要はない(あくまで「同じ問題をまとめる」ための目印)。
+  function fnv1a32(text) {
+    var hash = 0x811c9dc5;
+    for (var i = 0; i < text.length; i++) {
+      hash ^= text.charCodeAt(i);
+      hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+    }
+    var hex = hash.toString(16);
+    while (hex.length < 8) hex = "0" + hex;
+    return hex;
+  }
+
+  // 現在の問題(GIVEN)のID。GIVEN の9行を結合した文字列のハッシュ。
+  function puzzleId() {
+    return fnv1a32(GIVEN.join(""));
+  }
+
   // -------------------------------------------------------------------
   // 数独ジェネレーター / ソルバー(SPEC 7章 拡張1、docs/DESIGN.md 4.2)
   // 盤面は 9行の文字列配列と、81要素の数値配列(0 が空)の2つの表現を行き来する。
@@ -1059,6 +1077,11 @@ var PAGE_HTML = `<!doctype html>
   var FAST_BETWEEN_ROUNDS_MS = 80;
   var MAX_ROUNDS = 15;
 
+  // 集計ビュー(SPEC F1 拡張2、docs/DESIGN.md 4.2)。判定ごとの記録は state ではなく
+  // localStorage 由来。state に持たせず、render() のたびに loadRecords() で読み直す。
+  var RECORDS_STORAGE_KEY = "scc.records.v1";
+  var RECORDS_MAX = 5000;
+
   var state = {
     round: 1,
     values: {}, // "r-c" -> { value: "4", status: "correct" | "incorrect" }
@@ -1108,6 +1131,43 @@ var PAGE_HTML = `<!doctype html>
   }
 
   // -------------------------------------------------------------------
+  // 集計ビュー: 記録の読み書き(SPEC F1 拡張2、docs/DESIGN.md 4.1 / 4.2)。
+  // localStorage が無い・例外を投げる・壊れた JSON が入っている、いずれの場合も
+  // 例外を外に出さない(呼び出し側の commitFocused / run() を止めないため)。
+  // -------------------------------------------------------------------
+  function loadRecords() {
+    try {
+      if (typeof localStorage === "undefined" || !localStorage) return [];
+      var raw = localStorage.getItem(RECORDS_STORAGE_KEY);
+      if (!raw) return [];
+      var parsed = JSON.parse(raw);
+      return Array.isArray(parsed) ? parsed : [];
+    } catch (e) {
+      return [];
+    }
+  }
+
+  function saveRecords(records) {
+    try {
+      if (typeof localStorage === "undefined" || !localStorage) return;
+      localStorage.setItem(RECORDS_STORAGE_KEY, JSON.stringify(records));
+    } catch (e) {
+      // 保存失敗(容量超過・プライベートモード等)は無視する。記録は補助情報であり、
+      // 判定ループそのものを止める理由にはしない。
+    }
+  }
+
+  // 1件追記する。上限 RECORDS_MAX を超えたら古いものから捨てる。
+  function appendRecord(rec) {
+    var records = loadRecords();
+    records.push(rec);
+    if (records.length > RECORDS_MAX) {
+      records = records.slice(records.length - RECORDS_MAX);
+    }
+    saveRecords(records);
+  }
+
+  // -------------------------------------------------------------------
   // 進行ロジック(docs/DESIGN.md 4.3 状態遷移)
   // -------------------------------------------------------------------
   function run() {
@@ -1151,7 +1211,7 @@ var PAGE_HTML = `<!doctype html>
         return { digit: d, pct: Math.round((typeof p === "number" ? p : 0) * 100), isPick: d === result.choice };
       });
       state.currentProbs = probs;
-      pendingCommit = { r: cell.r, c: cell.c, choice: result.choice, confidence: result.confidence };
+      pendingCommit = { r: cell.r, c: cell.c, choice: result.choice, confidence: result.confidence, probabilities: result.probabilities };
       render();
       var beforeCommitMs = state.speedMode === "slow" ? SLOW_BEFORE_COMMIT_MS : FAST_BEFORE_COMMIT_MS;
       setTimeout(function () {
@@ -1189,6 +1249,21 @@ var PAGE_HTML = `<!doctype html>
     } else {
       roundWrong.push({ r: r, c: c });
     }
+    // 集計ビュー用の記録(SPEC F1 拡張2)。正誤が確定したこの時点で1件追記する。
+    var probs = pendingCommit.probabilities;
+    var pc = probs && typeof probs[pendingCommit.choice] === "number" ? probs[pendingCommit.choice] : null;
+    var conf = typeof pendingCommit.confidence === "number" ? pendingCommit.confidence : null;
+    appendRecord({
+      t: Date.now(),
+      p: puzzleId(),
+      r: r,
+      c: c,
+      round: state.round,
+      choice: pendingCommit.choice,
+      pc: pc,
+      conf: conf,
+      ok: correct
+    });
     // 次の結果が来るまで表示に残す(最速モードでも判定が見えるように)
     state.lastJudgment = {
       r: r,

@@ -63,19 +63,59 @@ function stripLineComments(text) {
     .join("\n");
 }
 
+/** Map ベースの localStorage モック(集計ビューのテスト用)。 */
+function makeLocalStorage() {
+  var store = new Map();
+  return {
+    getItem: function (key) {
+      return store.has(key) ? store.get(key) : null;
+    },
+    setItem: function (key, value) {
+      store.set(key, String(value));
+    },
+    removeItem: function (key) {
+      store.delete(key);
+    },
+    clear: function () {
+      store.clear();
+    },
+  };
+}
+
+/** getItem / setItem のたびに必ず例外を投げる localStorage モック。 */
+function makeThrowingLocalStorage() {
+  return {
+    getItem: function () {
+      throw new Error("localStorage が使えない環境を模す");
+    },
+    setItem: function () {
+      throw new Error("localStorage が使えない環境を模す");
+    },
+    removeItem: function () {
+      throw new Error("localStorage が使えない環境を模す");
+    },
+  };
+}
+
 /**
  * <script> の中身を node:vm で丸ごと評価し、そのコンテキスト(= ブラウザで言う
  * グローバル)を返す。スクリプト直下の `var` / 関数宣言はコンテキストのプロパティに
  * なるので、`ctx.generatePuzzle` / `ctx.GIVEN` のように取り出して呼べる。
  *
  * ブラウザの代わりに与えるのは最低限:
- * - document: render() が触る #app と、周回ログの querySelector(常に null)だけ
+ * - document: render() が触る #app、周回ログの querySelector(常に null)、
+ *   エクスポート(`<a download>`)用の createElement / body.appendChild / removeChild
  * - setTimeout: 待ち時間を無視して即座に実行する(テストを速く・決定的にする)
  * - fetch: 呼び出しを記録するスタブ(既定では呼ばれたら失敗させる)
+ * - localStorage: 既定では makeLocalStorage()(Map ベース)。opts.localStorage で
+ *   差し替えられる(未指定 = undefined を渡すテストは「localStorage が無い環境」)
+ * - confirm / Blob / URL: 「記録を消す」「JSONエクスポート」用の最小スタブ
  */
 function runScript(html, options) {
   var opts = options || {};
   var app = { innerHTML: "" };
+  var bodyChildren = [];
+  var createdBlobs = [];
   var context = {
     console: console,
     document: {
@@ -84,6 +124,18 @@ function runScript(html, options) {
       },
       querySelector: function () {
         return null;
+      },
+      createElement: function (tag) {
+        return { tagName: tag, href: "", download: "", click: function () {} };
+      },
+      body: {
+        appendChild: function (el) {
+          bodyChildren.push(el);
+        },
+        removeChild: function (el) {
+          var idx = bodyChildren.indexOf(el);
+          if (idx >= 0) bodyChildren.splice(idx, 1);
+        },
       },
     },
     setTimeout: function (fn) {
@@ -94,10 +146,27 @@ function runScript(html, options) {
       function () {
         throw new Error("fetch を呼ばない想定のテストで fetch が呼ばれた");
       },
+    localStorage: Object.prototype.hasOwnProperty.call(opts, "localStorage") ? opts.localStorage : makeLocalStorage(),
+    confirm: opts.confirm || function () { return true; },
+    Blob:
+      opts.Blob ||
+      function (parts, blobOptions) {
+        var blob = { parts: parts, options: blobOptions };
+        createdBlobs.push(blob);
+        return blob;
+      },
+    URL: opts.URL || {
+      createObjectURL: function (blob) {
+        return "blob:mock/" + createdBlobs.indexOf(blob);
+      },
+      revokeObjectURL: function () {},
+    },
   };
   vm.createContext(context);
   vm.runInContext(extractScript(html), context);
   context.appElement = app;
+  context.bodyChildren = bodyChildren;
+  context.createdBlobs = createdBlobs;
   return context;
 }
 
@@ -712,3 +781,104 @@ test("「新しい問題」の後に run() すると、新しい GIVEN の空マ
     assert.deepEqual(Object.keys(calls[j].body.target).sort(), ["col", "row"]);
   }
 });
+
+// -------------------------------------------------------------------
+// 集計ビュー: 記録の localStorage 蓄積(SPEC F1 拡張2、Issue #6)
+// -------------------------------------------------------------------
+var RECORDS_STORAGE_KEY = "scc.records.v1";
+
+/**
+ * loadRecords() は vm コンテキストの Array(別レルム)を返すので、
+ * deepStrictEqual(=deepEqual) はプロトタイプ違いで空配列同士でも落ちる。
+ * 長さだけを見る。
+ */
+function assertEmptyRecords(ctx, message) {
+  assert.equal(ctx.loadRecords().length, 0, message);
+}
+
+test("loadRecords/saveRecords/appendRecord: 素朴な往復", async () => {
+  var ctx = runScript(await getPageHtml());
+  assertEmptyRecords(ctx);
+
+  ctx.appendRecord({ t: 1, p: "abc", r: 0, c: 0, round: 1, choice: "4", pc: 0.6, conf: 0.3, ok: true });
+  var records = ctx.loadRecords();
+  assert.equal(records.length, 1);
+  assert.equal(records[0].choice, "4");
+  assert.equal(records[0].ok, true);
+});
+
+test("appendRecord: 5001件目で最古が捨てられ5000件のまま", { timeout: 30000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+  for (var i = 0; i < 5001; i++) {
+    ctx.appendRecord({ t: i, p: "p", r: 0, c: 0, round: 1, choice: "1", pc: 0.5, conf: 0.5, ok: true });
+  }
+  var records = ctx.loadRecords();
+  assert.equal(records.length, 5000, "上限5000件を超えている");
+  assert.equal(records[0].t, 1, "最古(t=0)が捨てられていない");
+  assert.equal(records[records.length - 1].t, 5000);
+});
+
+test("loadRecords: localStorage が無い環境でも空配列を返す", async () => {
+  var ctx = runScript(await getPageHtml(), { localStorage: undefined });
+  assertEmptyRecords(ctx);
+  // appendRecord / saveRecords も例外を出さない
+  assert.doesNotThrow(function () {
+    ctx.appendRecord({ t: 1, p: "x", r: 0, c: 0, round: 1, choice: "1", pc: 0.1, conf: 0.1, ok: false });
+  });
+  assertEmptyRecords(ctx);
+});
+
+test("loadRecords: localStorage が例外を投げても空配列を返す", async () => {
+  var ctx = runScript(await getPageHtml(), { localStorage: makeThrowingLocalStorage() });
+  assertEmptyRecords(ctx);
+  assert.doesNotThrow(function () {
+    ctx.appendRecord({ t: 1, p: "x", r: 0, c: 0, round: 1, choice: "1", pc: 0.1, conf: 0.1, ok: false });
+  });
+});
+
+test("loadRecords: 壊れたJSONが入っていても空配列を返す", async () => {
+  var storage = makeLocalStorage();
+  storage.setItem(RECORDS_STORAGE_KEY, "{not valid json");
+  var ctx = runScript(await getPageHtml(), { localStorage: storage });
+  assertEmptyRecords(ctx);
+});
+
+test(
+  "run()(常に正解のfetch)で判定ごとに記録が1件増え、51件になる",
+  { timeout: 10000 },
+  async () => {
+    var fetchStub = async function (url, init) {
+      var body = JSON.parse(init.body);
+      var digit = ANSWER_KEY[body.target.row][body.target.col];
+      var probabilities = {};
+      for (var d = 1; d <= 9; d++) probabilities[String(d)] = String(d) === digit ? 0.61 : 0.0125;
+      return {
+        ok: true,
+        json: async function () {
+          return { probabilities: probabilities, choice: digit, confidence: 0.31 };
+        },
+      };
+    };
+    var ctx = runScript(await getPageHtml(), { fetch: fetchStub });
+
+    assertEmptyRecords(ctx);
+    ctx.run();
+    await waitFor(function () {
+      return ctx.state.done === true;
+    }, "1周での完了(全問正解)");
+
+    var records = ctx.loadRecords();
+    assert.equal(records.length, 51, "判定した51マス分の記録がない");
+
+    var expectedId = ctx.puzzleId();
+    for (var i = 0; i < records.length; i++) {
+      var rec = records[i];
+      assert.equal(rec.p, expectedId, "問題IDがGIVENのハッシュと一致しない");
+      assert.equal(typeof rec.pc, "number", "pc(probabilities[choice])が数値でない");
+      assert.ok(rec.pc > 0.6 && rec.pc <= 1, "pcの値がおかしい: " + rec.pc);
+      assert.equal(rec.conf, 0.31, "conf(Jevのconfidence)が渡っていない");
+      assert.equal(rec.ok, true, "常に正解を返すfetchなのにok=trueでない");
+      assert.equal(rec.choice, ANSWER_KEY[rec.r][rec.c], "choiceが採点対象と食い違う");
+    }
+  }
+);
