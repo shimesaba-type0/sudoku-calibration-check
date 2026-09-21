@@ -89,7 +89,8 @@ npm run deploy
 
 | パス | メソッド | 説明 |
 | --- | --- | --- |
-| `/` | GET | フロントエンド一式(HTML)。**現時点では「実装中」と表示するだけの仮ページ**で、本格的なUIは別 Issue で入ります |
+| `/` | GET | フロントエンド一式(HTML)。数独グリッド、判定パネル、周回ログ、「新しい問題」ボタン(ブラウザ側で唯一解の問題を生成) |
+| `/api/status` | GET | レート制限の残数を読むだけで返す(カウンタは加算しない。`Cache-Control: no-store`) |
 | `/api/judge` | POST | 盤面と対象マスを受け取り、`{ probabilities, choice, confidence }` を返す |
 
 `confidence` は **Jev が返す独自の確信度** で、`probabilities[choice]` とは一致しません
