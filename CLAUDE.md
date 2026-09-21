@@ -79,7 +79,8 @@ npm run dev                 # ローカル起動。AIバインディングはリ
 ## 現在の状態(2026-09-21)
 
 - v0.1 を Issue 単位で実装中。進捗は GitHub の Issues / PR を参照(`docs/HANDOFF.md` の「現在地」も併せて更新する)
-- デプロイ済み: https://sudoku-calibration-check.takashi-kono-rb.workers.dev (`GET /` はフロントエンドの Issue が入るまで「実装中」の仮ページ)
+- デプロイ済み: https://sudoku-calibration-check.takashi-kono-rb.workers.dev 。フロントエンド(Issue #3)もマージ済みで、v0.1 の機能はすべて実装済み。実環境での UI 確認(SPEC 6章の「デプロイ後」の項目)はマージ後のデプロイで行う
 - **Jev は 2026-09-21 に Worker 経由で実環境検証済み**。レスポンスは AI Gateway のラッパー付きだった(`docs/DESIGN.md` 3.4)。`confidence` は `probabilities[choice]` と一致せず、同じ入力でも `choice` が揺れる
 - `wrangler.toml` の `RATE_LIMIT_KV` の `id` は実際のネームスペース ID に置き換え済み(手作業は完了)
-- 既知の未実装: 数独ジェネレーター/ソルバー、集計ビュー(信頼度較正図)
+- 既知の未実装: 数独ジェネレーター/ソルバー(#5)、集計ビュー(信頼度較正図)(#6)。レート制限の強化(#10)は設計判断待ち
+- 要判断(オーナー): IP 単位の上限 30 回/時では 1 問(約 78 判定)を 1 時間で完走できない。上限を緩める変更は作業ルール4によりオーナーの判断が必要
