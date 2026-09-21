@@ -281,7 +281,7 @@ function extractAnswer(response) {
   }
 
   // ゲートウェイが完了以外の状態を返したら、中身を見ずに止める。
-  if ("state" in response && response.state !== "Completed") {
+  if (Object.prototype.hasOwnProperty.call(response, "state") && response.state !== "Completed") {
     return { error: "AIの応答が完了していません" };
   }
 
@@ -381,7 +381,7 @@ async function handleJudge(request, env) {
   var extracted = extractAnswer(result);
   var badAnswer =
     extracted.error !== undefined ? extracted.error : validateAnswer(extracted.answer);
-  if (badAnswer !== null && badAnswer !== undefined) {
+  if (badAnswer !== null) {
     // AI.run が undefined を解決したとき、そのままだと raw のキーごと JSON から消える。
     // デバッグ用に「何が返ってきたか」を必ず残したいので null に寄せる。
     return jsonResponse(

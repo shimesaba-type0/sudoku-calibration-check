@@ -123,11 +123,11 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 {
   "probabilities": { "1": 0.03, "2": 0.05, "3": 0.02, "4": 0.61, "5": 0.08, "6": 0.07, "7": 0.04, "8": 0.06, "9": 0.04 },
   "choice": "4",
-  "confidence": 0.61
+  "confidence": 0.31
 }
 ````
 
-- `probabilities`: キーは `"1"`〜`"9"` の文字列、値は 0〜1
+- `probabilities`: キーは `"1"`〜`"9"` の文字列、値は 0〜1(Jev の契約。Worker は有限の数値であることだけを検証し、範囲は検証しない)
 - `choice`: Jev が選んだキー(文字列)
 - `confidence`: Jev が返す独自の確信度。`probabilities[choice]` とは一致しない(実測: 0.20 に対して 0.10 など)。較正の検証には `probabilities` を使う
 

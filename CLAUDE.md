@@ -55,7 +55,7 @@ npm run dev                 # ローカル起動。AIバインディングはリ
 
 クラウドセッションの環境設定から注入されるもの:
 
-- `CLOUDFLARE_API_TOKEN` — wrangler の非対話認証用。**未設定なら deploy は行わず、`npm run check` までで止めて報告する**
+- `CLOUDFLARE_API_TOKEN` — wrangler の非対話認証用。**未設定なら deploy は行わず、`npm run check` までで止めて報告する**。クラウド環境では値は `placeholder` のダミーでよく、実際の認証は環境設定の「API 認証情報」経由でプロキシが付与する(`docs/HANDOFF.md` 1.3)
 - `CLOUDFLARE_ACCOUNT_ID` — 対象アカウント
 - `WRANGLER_SEND_METRICS=false` — テレメトリ送信を止める
 
