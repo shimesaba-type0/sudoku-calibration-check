@@ -109,8 +109,9 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 }
 ````
 
-- `puzzle`: 9要素の文字列配列。各要素は9文字。`.` が未確定
-- `target.row` / `target.col`: 0〜8
+- `puzzle`: 9要素の文字列配列。各要素は9文字。文字は `1`〜`9` と `.`(未確定)のみ
+- `target.row` / `target.col`: 0〜8 の整数
+- 次のいずれかに当てはまる場合は 400: JSON でない / 上記の形式でない / 与えられたマス(固定問題の初期配置)が書き換えられている / `target` が与えられたマスを指している
 
 レスポンス(200):
 
@@ -138,11 +139,11 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 { "error": "アクセス元(IP)ごとのレート制限(30回/3600秒)を超えました" }
 ````
 
-レスポンスヘッダーには `Retry-After`(秒)と、成功時は `X-RateLimit-Remaining-IP` / `X-RateLimit-Remaining-Global` を付ける。
+429 のレスポンスヘッダーには `Retry-After`(秒)と `X-RateLimit-Scope`(`ip` または `global`)を、成功時は `X-RateLimit-Remaining-IP` / `X-RateLimit-Remaining-Global` を付ける。
 
 ### `GET /`
 
-フロントエンド一式(HTML)を `text/html; charset=utf-8` で返す。それ以外のパスは 404。
+フロントエンド一式(HTML)を `text/html; charset=utf-8` で返す。それ以外のパスは 404。CORS ヘッダーは付けない(他サイトから `/api/judge` を呼ばせない)。
 
 ## 5. 非機能要件
 
@@ -151,6 +152,7 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 - **コスト**: Jev は入力$0.042/100万トークン・出力無料。1問51マス×数周で誤差程度
 - **レイテンシ**: Jev 公称 100ms 前後。最速モードでそれが体感できること
 - **認証なし・レート制限あり**: 公開デモとして誰でもアクセス可。ログイン等は無いが、F6のレート制限でコストの上限を確保する
+- **テスト可能**: `npm test`(Node 標準の `node:test`)で、Cloudflare の認証なしに Worker のロジックを検証できる。CI(GitHub Actions)で自動実行する
 - **コスト**(参考試算、入力トークン数はおおよその見積り。1ドル=150円換算):
   - 1回の判定(約400入力トークン): 約$0.0000168(0.0025円)
   - 数独1問フル実行(51マス×平均3周≈78回): 約$0.0013(0.2円)
@@ -158,6 +160,7 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 
 ## 6. 受け入れ基準
 
+- [ ] `npm test` が通る(`SOLUTION` が Jev に渡らないことのテストを含む)
 - [ ] `npm run check`(`wrangler deploy --dry-run`)が通る
 - [ ] デプロイ後、`GET /` でUIが表示される
 - [ ] `curl` で `/api/judge` を叩き、上記形式の JSON が返る。`probabilities` が9キー揃っている
