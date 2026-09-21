@@ -48,6 +48,9 @@ npm run e2e -- --mode correct        # 完了バナーの確認など
 npm run e2e -- --url https://sudoku-calibration-check.takashi-kono-rb.workers.dev
 ```
 
+プロキシ経由でしか外に出られない環境(クラウドセッションなど)では、`E2E_PROXY=http://127.0.0.1:PORT`
+でブラウザにプロキシを渡し、プロキシが TLS を差し替える場合は `E2E_IGNORE_HTTPS_ERRORS=1` も付けます。
+
 ## レート制限のカウンタ(Durable Object)
 
 レート制限のカウンタは Durable Object(クラス `RateLimitCounter`、バインディング

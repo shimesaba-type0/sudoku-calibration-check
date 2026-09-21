@@ -218,10 +218,25 @@ async function runCheck(num, name, fn) {
 // ---------------------------------------------------------------------------
 // モックモード本体
 // ---------------------------------------------------------------------------
+/**
+ * ブラウザ起動オプション。E2E_PROXY(例: http://127.0.0.1:8080)が指定されていれば
+ * そのプロキシを経由する(クラウドセッションのように egress がプロキシ経由の環境向け)。
+ */
+function launchOptions(executablePath) {
+  var options = { executablePath: executablePath, headless: true };
+  if (process.env.E2E_PROXY) options.proxy = { server: process.env.E2E_PROXY };
+  return options;
+}
+
 async function runMockMode(chromium, executablePath, mode) {
   var mockServer = await startMockServer(mode);
-  var browser = await chromium.launch({ executablePath: executablePath, headless: true });
-  var page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+  var browser = await chromium.launch(launchOptions(executablePath));
+  var page = await browser.newPage({
+    viewport: { width: 1280, height: 900 },
+    // TLS を差し替えるプロキシ経由(クラウドセッション等)では証明書エラーになるため、
+    // 明示的に E2E_IGNORE_HTTPS_ERRORS=1 を指定したときだけ無視する。
+    ignoreHTTPSErrors: process.env.E2E_IGNORE_HTTPS_ERRORS === "1",
+  });
 
   try {
     await page.goto(mockServer.baseUrl + "/", { waitUntil: "load" });
@@ -344,8 +359,13 @@ async function runMockMode(chromium, executablePath, mode) {
 // 本番モード(最大3判定。私(オーナー)が別途実行する)
 // ---------------------------------------------------------------------------
 async function runProductionMode(chromium, executablePath, targetUrl) {
-  var browser = await chromium.launch({ executablePath: executablePath, headless: true });
-  var page = await browser.newPage({ viewport: { width: 1280, height: 900 } });
+  var browser = await chromium.launch(launchOptions(executablePath));
+  var page = await browser.newPage({
+    viewport: { width: 1280, height: 900 },
+    // TLS を差し替えるプロキシ経由(クラウドセッション等)では証明書エラーになるため、
+    // 明示的に E2E_IGNORE_HTTPS_ERRORS=1 を指定したときだけ無視する。
+    ignoreHTTPSErrors: process.env.E2E_IGNORE_HTTPS_ERRORS === "1",
+  });
   var judgeRequests = [];
   page.on("request", function (req) {
     if (req.url().indexOf("/api/judge") !== -1) judgeRequests.push(req.url());
