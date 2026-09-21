@@ -234,6 +234,13 @@ var pendingCommit = null;       // API結果を受けて確定待ちの1件
 var runToken = 0;               // 実行の世代。reset() / showError() で +1 する(4.3)
 ````
 
+**集計ビューの記録は `state` に持たない。** 判定結果の記録(SPEC F1 拡張2、Issue #6)は
+`state.values` のような「今の実行」の状態ではなく、複数の問題・複数回の実行をまたいで
+残る `localStorage`(キー `scc.records.v1`)が正本。`reset()` / `newPuzzle()` でも消えない
+(記録を消すのは「記録を消す」ボタン、すなわち `clearRecords()` のときだけ)。
+`render()` のたびに `loadRecords()` で読み直して集計するので(上限5,000件なので
+毎回集計してよい)、記録用に別の state フィールドは増やしていない。
+
 ### 4.2 関数と責務
 
 | 関数 | 責務 |
@@ -250,16 +257,22 @@ var runToken = 0;               // 実行の世代。reset() / showError() で +
 | `isCurrent(token)` | `state.running && token === runToken`。古い世代のコールバックを弾く(4.3) |
 | `judgeCell(r,c)` | `buildSnapshot()` を作って `/api/judge` を `fetch`。非2xxは `Error` にして投げる |
 | `focusNext()` | 先頭で `runToken` を捕まえ、`queue` から1つ取り出しフォーカス→`judgeCell`→バー表示→(待ち)→`commitFocused`→(待ち)→再帰。`queue` が空なら `finalizeRound` |
-| `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong`/`state.lastJudgment` を更新。`pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない |
+| `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong`/`state.lastJudgment` を更新。`pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない。正誤が確定するこの時点で `appendRecord()` を呼び、集計ビュー用の1件を記録する |
 | `finalizeRound()` | ログ追記→`shouldStop` の結果で完了 / 強制終了 / 次の周(`queue = nextQueue(roundWrong)`) |
 | `run()` | 初回のみ queue を全空マスで初期化し `focusNext` を開始 |
 | `reset()` | `runToken` を進め、進行管理と `state` を初期化(`speedMode` は維持) |
 | `showError(message)` | `runToken` を進めて `state.errorMessage` を立て、`running=false` で止める(不変条件4) |
 | `setSpeed(mode)` | `state.speedMode` を切り替えて再描画。実行中でも切り替えられる(4.4) |
-| `render()` | `state` から DOM(グリッド・統計・バー・ログ・バナー・ボタン)を **全部 innerHTML で再生成**。周回ログのスクロール位置だけは引き継ぐ |
-| `render*()` | `renderGrid` / `renderLegend` / `renderControls` / `renderErrorBox` / `renderStats`(+`statCard`)/ `renderCurrentPanel`(+`coordLabel` / `renderBars`)/ `renderRoundLog` / `renderBanner`。それぞれHTML文字列を返すだけで、DOMには触らない |
+| `render()` | `state` から DOM(グリッド・統計・バー・ログ・集計パネル・バナー・ボタン)を **全部 innerHTML で再生成**。周回ログのスクロール位置だけは引き継ぐ |
+| `render*()` | `renderGrid` / `renderLegend` / `renderControls` / `renderErrorBox` / `renderStats`(+`statCard`)/ `renderCurrentPanel`(+`coordLabel` / `renderBars`)/ `renderRoundLog` / `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`。それぞれHTML文字列を返すだけで、DOMには触らない |
 | `buildCellStyle()` | マスの状態(given/pending/correct/incorrect + focused)からインラインstyle文字列を返す |
 | `escapeHtml(text)` | `innerHTML` に入れる前に `& < > " '` を実体参照にする |
+| `fnv1a32(text)` / `puzzleId()` | 集計ビュー(SPEC F1 拡張2)の問題ID用の簡易ハッシュ。32bit FNV-1a を8桁16進で返す。`puzzleId()` は `GIVEN` の9行を結合した文字列をハッシュ化する |
+| `loadRecords()` / `saveRecords(records)` / `appendRecord(rec)` | 判定記録の読み書き。`localStorage`(キー `scc.records.v1`)が無い・例外を投げる・壊れた JSON が入っている、いずれの場合も例外を外に出さず空配列扱いにする(判定ループを止めないため)。`appendRecord` は上限 `RECORDS_MAX`(5,000)を超えたら古いものから捨てる |
+| `binRecords(records, key)` | `records` を `key`(`"pc"` または `"conf"`)の値で10%刻み10帯に分ける純粋関数。帯は `Math.min(9, Math.floor(v * 10))`(`v=1.0` は最後の帯)。数値でない/有限でない値は除外。戻り値は長さ10の配列 `{ lo, hi, n, correct, rate }`(`rate` は `n===0` なら `null`) |
+| `renderCalibration()` / `renderCalibrationChart(bins, title)` | 集計パネル(見出し「較正図」)。`loadRecords()` を読み、合計件数・全体正解率・記録している問題数(`p` のユニーク数)を出したあと、`binRecords` で作った `pc` / `conf` 各10帯をインラインSVGの棒グラフ(対角線は理想の較正線)として横並びで描く。件数0の帯は棒を描かない。色は CSS 変数(`--accent` / `--muted` / `--border`)をそのまま使う |
+| `exportRecords()` | `loadRecords()` の内容を `{ version:1, exported_at, records }` として `Blob` + `<a download>` でダウンロードさせる。ファイル名 `sudoku-calibration-YYYYMMDD-HHMMSS.json`(ローカル時刻) |
+| `clearRecords()` | `confirm()` で確認したうえで `saveRecords([])` し、再描画する |
 
 ### 4.3 状態遷移(1マス)
 
@@ -413,4 +426,12 @@ new_sqlite_classes = ["RateLimitCounter"]
     - `newPuzzle()` で `GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize` が差し替わり、周回・統計が初期化されること。初期表示は固定問題のままであること
     - 「新しい問題」の後に `run()` すると、**新しい `GIVEN` の空マスだけを行優先の順で** `/api/judge` に問い合わせること(回数と座標の両方を見る。空マスの「数」は固定問題と同じ51になりうるため)
     - vm のコンテキストで作った配列は host とは別レルムなので、`deepStrictEqual` の前に host 側の配列へ移し替える(`hostRows`)
+  - **集計ビュー**(`test/page.test.js`、Issue #6)。`runScript` の harness に `localStorage` / `confirm` / `Blob` / `URL` / `document.createElement` / `document.body` のモックを足してある(`makeLocalStorage()` は `Map` ベース、`makeThrowingLocalStorage()` は必ず例外を投げる)
+    - `binRecords`: 境界(`0.0`→帯0、`0.1`→帯1、`0.95`・`1.0`→帯9。`1.0` は最後の帯に入る)、帯ごとの `n`/`correct`/`rate`(`n===0` なら `rate=null`)の計算、数値でない/`NaN`の値の除外、`"pc"` と `"conf"` を独立に集計すること
+    - `appendRecord`: 5,001件追記すると最古(1件目)が捨てられ、5,000件のまま保たれること
+    - `loadRecords`: `localStorage` が無い・例外を投げる・壊れた JSON が入っている、いずれでも空配列を返し、その後の `appendRecord` / `run()` が例外を出さずに続くこと
+    - `run()`(常に正解を返す `fetch` スタブ)で固定問題(51マス)を解かせ、記録が51件になること。各件が `p`(`puzzleId()` と一致)/ `pc`(`probabilities[choice]`)/ `conf`(Jevの`confidence`)/ `ok`(採点と一致)を持つこと
+    - `renderCalibration`: 記録が無ければ0件/0%/0問と表示され、記録があれば合計件数・SVG(`<svg`)・エクスポート/消去ボタンが描画されること
+    - `exportRecords`: `Blob` に渡した JSON(`version`/`exported_at`/`records`)が `loadRecords()` の内容と一致し、`exported_at` が ISO 文字列であること。`<a>` が `appendChild` → `removeChild` で対になっていること(モックの `Blob` / `URL.createObjectURL` / `document.createElement`)
+    - `clearRecords`: `confirm()` が `true` を返すモックなら記録が0件になり、`false` を返すモックなら消えないこと
 - CI(`.github/workflows/ci.yml`)は push と PR で `npm ci` → `npm test` → `npm run check` を実行する。`check` は `wrangler deploy --dry-run` で、認証なしで動く
