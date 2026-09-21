@@ -447,13 +447,15 @@ export default {
 
 // ---------------------------------------------------------------------------
 // ブラウザ用の一式。このテンプレートリテラルの中だけが正解表を知っている。
-// テンプレート内で ${} を書く必要が出たら \${} とエスケープすること。
+// テンプレート内で ${} を書く必要が出たら \${} とエスケープすること(実際には
+// 使っていない。すべて文字列連結で組み立てる)。
 //
 // PAGE_HTML はこのファイルの最後の宣言のままにすること。閉じバッククォートが
 // ファイル末尾にあることを前提に、不変条件7のテストが「テンプレートリテラルの外」を
 // 機械的に切り出している(docs/DESIGN.md 3.5・10章)。この下には何も足さない。
 //
-// 本格的なUIは別 Issue。ここでは隔離の構造だけ先に用意しておく。
+// UI本体(グリッド・判定パネル・周回ロジック・速度モード)は Issue #3 で実装。
+// 構成は docs/DESIGN.md 4章に対応する。
 // ---------------------------------------------------------------------------
 var PAGE_HTML = `<!doctype html>
 <html lang="ja">
@@ -461,30 +463,644 @@ var PAGE_HTML = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>数独キャリブレーションチェック</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&amp;family=IBM+Plex+Sans:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
 <style>
-  :root { color-scheme: dark; }
+  :root {
+    color-scheme: dark;
+    --bg: #12141a;
+    --panel-bg: #1a1d27;
+    --panel-border: #262a36;
+    --border: #2a2e3a;
+    --thick-border: #545b70;
+    --text: #e6e8ee;
+    --muted: #9aa1b1;
+    --accent: #7dd3fc;
+    --correct: #4ade80;
+    --correct-bg: rgba(74, 222, 128, 0.14);
+    --incorrect: #f87171;
+    --incorrect-bg: rgba(248, 113, 113, 0.14);
+    --given: #ffffff;
+    --error-bg: rgba(248, 113, 113, 0.12);
+    --error-border: #f87171;
+  }
+  * { box-sizing: border-box; }
   body {
     margin: 0;
     min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+    padding: 24px 16px 48px;
+  }
+  #app { max-width: 960px; margin: 0 auto; }
+  h1 { margin: 0 0 4px; font-size: 20px; font-weight: 600; letter-spacing: 0.02em; }
+  .subtitle { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
+  .layout { display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start; }
+  .grid-panel { flex: 0 0 auto; }
+  .side-panel { flex: 1 1 320px; min-width: 280px; display: flex; flex-direction: column; gap: 16px; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(9, 40px);
+    grid-template-rows: repeat(9, 40px);
+    width: max-content;
+  }
+  .cell {
     display: flex;
-    flex-direction: column;
     align-items: center;
     justify-content: center;
-    gap: 12px;
-    background: #12141a;
-    color: #e6e8ee;
-    font-family: "IBM Plex Sans", "Helvetica Neue", Arial, sans-serif;
+    font-family: "IBM Plex Mono", "Courier New", monospace;
+    font-size: 18px;
   }
-  h1 { margin: 0; font-size: 20px; font-weight: 600; letter-spacing: 0.02em; }
-  p  { margin: 0; color: #9aa1b1; font-size: 14px; }
+
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 12px; font-size: 12px; color: var(--muted); }
+  .legend-item { display: inline-flex; align-items: center; gap: 6px; }
+  .swatch { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
+  .swatch-correct { background: var(--correct-bg); box-shadow: inset 0 0 0 2px var(--correct); }
+  .swatch-incorrect { background: var(--incorrect-bg); box-shadow: inset 0 0 0 2px var(--incorrect); }
+  .swatch-focus { background: transparent; box-shadow: inset 0 0 0 2px var(--accent); }
+
+  .panel {
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .panel-title { font-size: 12px; color: var(--muted); margin: 0 0 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+  button {
+    font-family: inherit;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 8px 14px;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  #run-btn { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600; }
+  #speed-toggle { display: inline-flex; border: 1px solid var(--panel-border); border-radius: 6px; overflow: hidden; }
+  .speed-btn { border: none; border-radius: 0; background: var(--panel-bg); }
+  .speed-btn.active { background: var(--accent); color: #0b1220; }
+
+  #error-box.error {
+    background: var(--error-bg);
+    border: 1px solid var(--error-border);
+    color: #ffd9d9;
+    border-radius: 8px;
+    padding: 10px 14px;
+    margin: 12px 0;
+    font-size: 13px;
+  }
+
+  .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .stat-card { background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: 8px; padding: 10px 12px; }
+  .stat-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .stat-value { font-size: 16px; font-weight: 600; font-family: "IBM Plex Mono", monospace; }
+
+  .coords { font-size: 14px; margin-bottom: 10px; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+  .confidence { font-size: 11px; color: var(--muted); }
+  .bars { display: flex; flex-direction: column; gap: 6px; }
+  .bar-row { display: grid; grid-template-columns: 16px 1fr 40px; align-items: center; gap: 8px; font-size: 12px; }
+  .bar-label { font-family: "IBM Plex Mono", monospace; color: var(--muted); }
+  .bar-track { background: var(--border); border-radius: 4px; height: 10px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 4px; }
+  .bar-pct { text-align: right; font-family: "IBM Plex Mono", monospace; color: var(--muted); }
+  .muted { color: var(--muted); font-size: 13px; margin: 0; }
+
+  #round-log ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
+  #round-log li { font-size: 12px; font-family: "IBM Plex Mono", monospace; color: var(--muted); }
+
+  .banner { border-radius: 8px; padding: 12px 14px; font-size: 14px; font-weight: 600; }
+  .banner.success { background: var(--correct-bg); color: var(--correct); border: 1px solid var(--correct); }
+  .banner.warning { background: var(--incorrect-bg); color: var(--incorrect); border: 1px solid var(--incorrect); }
+
+  @media (max-width: 640px) {
+    .grid { grid-template-columns: repeat(9, 32px); grid-template-rows: repeat(9, 32px); }
+    .cell { font-size: 15px; }
+    .stats { grid-template-columns: 1fr 1fr; }
+  }
 </style>
 </head>
 <body>
-<h1>数独キャリブレーションチェック</h1>
-<p>実装中</p>
+<div id="app"></div>
 <script>
+  // -------------------------------------------------------------------
+  // 純粋なロジック(テストから抽出しやすいよう、状態やDOM操作より先に置く)
+  // -------------------------------------------------------------------
+
+  // GIVEN + state.values(正誤問わず)から9行のスナップショットを作る。
+  // 判定対象のマス(state.focusedKey)だけは "." にして送る(アンカリング回避。
+  // docs/DESIGN.md 4.2 / SPEC F3)。
+  function buildSnapshot() {
+    var targetKey = state.focusedKey;
+    var rows = [];
+    for (var r = 0; r < 9; r++) {
+      var line = "";
+      for (var c = 0; c < 9; c++) {
+        var key = r + "-" + c;
+        if (key === targetKey) {
+          line += ".";
+          continue;
+        }
+        var given = GIVEN[r][c];
+        if (given !== ".") {
+          line += given;
+          continue;
+        }
+        var cell = state.values[key];
+        line += cell ? cell.value : ".";
+      }
+      rows.push(line);
+    }
+    return rows;
+  }
+
+  // 周回ログの1行(「N周目: M中K正解 (P%)」)を組み立てる純粋関数。
+  function formatRoundSummary(round, correct, total) {
+    var pct = total === 0 ? 0 : Math.round((correct / total) * 100);
+    return round + "周目: " + total + "中" + correct + "正解 (" + pct + "%)";
+  }
+
+  // この周で不正解だったマスから次の周の queue を作る純粋関数(SPEC F3)。
+  // 元の配列は共有せず、必ず新しい配列・新しい要素を返す。
+  function nextQueue(roundWrong) {
+    return roundWrong.map(function (cell) {
+      return { r: cell.r, c: cell.c };
+    });
+  }
+
+  // 周の終わりにどうするかを決める純粋関数(SPEC F3)。
+  // "solved"(不正解0で完了)/ "limit"(15周の安全弁)/ "continue"(次の周へ)。
+  // MAX_ROUNDS は自由変数(テストからはクロージャで注入する)。
+  function shouldStop(round, incorrectCount) {
+    if (incorrectCount === 0) return "solved";
+    if (round >= MAX_ROUNDS) return "limit";
+    return "continue";
+  }
+
+  // 実行世代のチェック。reset() / showError() で runToken が進むので、
+  // 古い世代の fetch / setTimeout のコールバックはここで弾かれる(DESIGN 4.3)。
+  function isCurrent(token) {
+    return state.running && token === runToken;
+  }
+
+  // -------------------------------------------------------------------
+  // データ・状態(docs/DESIGN.md 4.1 / 5章)
+  // -------------------------------------------------------------------
+  var DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
   var GIVEN = ["53..7....", "6..195...", ".98....6.", "8...6...3", "4..8.3..1", "7...2...6", ".6....28.", "...419..5", "....8..79"];
   var SOLUTION = ["534678912", "672195348", "198342567", "859761423", "426853791", "713924856", "961537284", "287419635", "345286179"];
+
+  var TOTAL_EMPTY = 0;
+  for (var gr = 0; gr < 9; gr++) {
+    for (var gc = 0; gc < 9; gc++) {
+      if (GIVEN[gr][gc] === ".") TOTAL_EMPTY++;
+    }
+  }
+
+  // 速度モード(SPEC F4)
+  var SLOW_BEFORE_COMMIT_MS = 700;
+  var SLOW_AFTER_COMMIT_MS = 150;
+  var SLOW_BETWEEN_ROUNDS_MS = 250;
+  var FAST_BEFORE_COMMIT_MS = 0;
+  var FAST_AFTER_COMMIT_MS = 20;
+  var FAST_BETWEEN_ROUNDS_MS = 80;
+  var MAX_ROUNDS = 15;
+
+  var state = {
+    round: 1,
+    values: {}, // "r-c" -> { value: "4", status: "correct" | "incorrect" }
+    focusedKey: null,
+    currentProbs: null, // [{ digit, pct, isPick }, ...] 1〜9順
+    roundLog: [],
+    running: false,
+    done: false,
+    roundsToSolve: null,
+    speedMode: "slow",
+    errorMessage: null,
+    stoppedAtLimit: false,
+    lastJudgment: null // 直前に確定した1件(最速モードでも結果が見えるように残す)
+  };
+  // 描画に不要な進行管理はモジュール変数(docs/DESIGN.md 4.1)
+  var queue = [];
+  var roundWrong = [];
+  var roundTally = { correct: 0, total: 0 };
+  var roundSize = TOTAL_EMPTY; // 開始前は「0 / 51」と見せる
+  var started = false;
+  var pendingCommit = null;
+  // 実行の世代。reset() / showError() のたびに進める。進行中の fetch や
+  // setTimeout のコールバックは、捕まえた世代と一致するときだけ続行する。
+  var runToken = 0;
+
+  // -------------------------------------------------------------------
+  // API呼び出し
+  // -------------------------------------------------------------------
+  async function judgeCell(r, c) {
+    var puzzle = buildSnapshot();
+    var res = await fetch("/api/judge", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ puzzle: puzzle, target: { row: r, col: c } })
+    });
+    if (res.ok) return res.json();
+    var message = "HTTP " + res.status;
+    try {
+      var data = await res.json();
+      if (data && typeof data.error === "string") message = data.error;
+    } catch (e) {
+      // JSONでないボディはそのまま HTTP <status> にフォールバック
+    }
+    throw new Error(message);
+  }
+
+  // -------------------------------------------------------------------
+  // 進行ロジック(docs/DESIGN.md 4.3 状態遷移)
+  // -------------------------------------------------------------------
+  function run() {
+    if (state.running || state.done || state.errorMessage) return;
+    state.running = true;
+    if (!started) {
+      started = true;
+      queue = [];
+      for (var r = 0; r < 9; r++) {
+        for (var c = 0; c < 9; c++) {
+          if (GIVEN[r][c] === ".") queue.push({ r: r, c: c });
+        }
+      }
+      roundSize = queue.length;
+      roundTally = { correct: 0, total: 0 };
+    }
+    render();
+    focusNext();
+  }
+
+  function focusNext() {
+    if (!state.running) return;
+    // この呼び出しが属する実行世代。以降のコールバックはすべてこれで判定する。
+    var token = runToken;
+    if (queue.length === 0) {
+      finalizeRound();
+      return;
+    }
+    var cell = queue.shift();
+    // 先にフォーカスを立てる。buildSnapshot() は state.focusedKey のマスを "." に
+    // するので、この順序が「対象マスを空にして送る」不変条件そのもの(SPEC F3)。
+    state.focusedKey = cell.r + "-" + cell.c;
+    state.currentProbs = null;
+    pendingCommit = null;
+    render();
+
+    judgeCell(cell.r, cell.c).then(function (result) {
+      if (!isCurrent(token)) return; // リセット後などの古い世代は捨てる
+      var probs = DIGITS.map(function (d) {
+        var p = result.probabilities ? result.probabilities[d] : 0;
+        return { digit: d, pct: Math.round((typeof p === "number" ? p : 0) * 100), isPick: d === result.choice };
+      });
+      state.currentProbs = probs;
+      pendingCommit = { r: cell.r, c: cell.c, choice: result.choice, confidence: result.confidence };
+      render();
+      var beforeCommitMs = state.speedMode === "slow" ? SLOW_BEFORE_COMMIT_MS : FAST_BEFORE_COMMIT_MS;
+      setTimeout(function () {
+        if (!isCurrent(token)) return;
+        commitFocused();
+        var afterCommitMs = state.speedMode === "slow" ? SLOW_AFTER_COMMIT_MS : FAST_AFTER_COMMIT_MS;
+        setTimeout(function () {
+          if (!isCurrent(token)) return;
+          focusNext();
+        }, afterCommitMs);
+      }, beforeCommitMs);
+    }, function (err) {
+      // API 側の失敗だけをここで扱う(成功ハンドラ内の例外と混ぜない)
+      if (!isCurrent(token)) return;
+      showError(err && err.message ? err.message : String(err));
+    }).catch(function (err) {
+      // 成功ハンドラ(render など)が投げた場合。API エラーとは区別して表示する。
+      if (!isCurrent(token)) return;
+      showError("画面の更新に失敗しました: " + (err && err.message ? err.message : String(err)));
+    });
+  }
+
+  function commitFocused() {
+    if (!pendingCommit) return;
+    var r = pendingCommit.r;
+    var c = pendingCommit.c;
+    var key = r + "-" + c;
+    // 確定待ちのマスが、いまフォーカスしているマスと違うなら何もしない
+    if (state.focusedKey !== key) return;
+    var correct = pendingCommit.choice === SOLUTION[r][c];
+    state.values[key] = { value: pendingCommit.choice, status: correct ? "correct" : "incorrect" };
+    roundTally.total += 1;
+    if (correct) {
+      roundTally.correct += 1;
+    } else {
+      roundWrong.push({ r: r, c: c });
+    }
+    // 次の結果が来るまで表示に残す(最速モードでも判定が見えるように)
+    state.lastJudgment = {
+      r: r,
+      c: c,
+      choice: pendingCommit.choice,
+      confidence: pendingCommit.confidence,
+      status: correct ? "correct" : "incorrect",
+      probs: state.currentProbs
+    };
+    state.focusedKey = null;
+    state.currentProbs = null;
+    pendingCommit = null;
+    render();
+  }
+
+  function finalizeRound() {
+    var token = runToken;
+    state.roundLog.push(formatRoundSummary(state.round, roundTally.correct, roundTally.total));
+    var decision = shouldStop(state.round, roundWrong.length);
+    if (decision === "solved") {
+      state.done = true;
+      state.running = false;
+      state.roundsToSolve = state.round;
+      render();
+      return;
+    }
+    if (decision === "limit") {
+      state.done = true;
+      state.running = false;
+      state.stoppedAtLimit = true;
+      render();
+      return;
+    }
+    state.round += 1;
+    queue = nextQueue(roundWrong);
+    roundWrong = [];
+    roundSize = queue.length;
+    roundTally = { correct: 0, total: 0 };
+    render();
+    var betweenRoundsMs = state.speedMode === "slow" ? SLOW_BETWEEN_ROUNDS_MS : FAST_BETWEEN_ROUNDS_MS;
+    setTimeout(function () {
+      if (!isCurrent(token)) return;
+      focusNext();
+    }, betweenRoundsMs);
+  }
+
+  function showError(message) {
+    // 世代を進めて、進行中の fetch / setTimeout のコールバックを無効化する
+    runToken += 1;
+    state.errorMessage = message;
+    state.running = false;
+    state.focusedKey = null;
+    state.currentProbs = null;
+    pendingCommit = null;
+    render();
+  }
+
+  function setSpeed(mode) {
+    state.speedMode = mode;
+    render();
+  }
+
+  function reset() {
+    // 世代を進める。進行中の fetch / setTimeout はこれで続きを実行しなくなる
+    runToken += 1;
+    var keepSpeed = state.speedMode;
+    state = {
+      round: 1,
+      values: {},
+      focusedKey: null,
+      currentProbs: null,
+      roundLog: [],
+      running: false,
+      done: false,
+      roundsToSolve: null,
+      speedMode: keepSpeed,
+      errorMessage: null,
+      stoppedAtLimit: false,
+      lastJudgment: null
+    };
+    queue = [];
+    roundWrong = [];
+    roundTally = { correct: 0, total: 0 };
+    roundSize = TOTAL_EMPTY;
+    started = false;
+    pendingCommit = null;
+    render();
+  }
+
+  // -------------------------------------------------------------------
+  // 描画(docs/DESIGN.md 4.4)。state から毎回 innerHTML で作り直す。
+  // -------------------------------------------------------------------
+  function escapeHtml(text) {
+    return String(text).replace(/[&<>"']/g, function (ch) {
+      if (ch === "&") return "&amp;";
+      if (ch === "<") return "&lt;";
+      if (ch === ">") return "&gt;";
+      if (ch === "\\"") return "&quot;";
+      return "&#39;";
+    });
+  }
+
+  function buildCellStyle(r, c) {
+    var key = r + "-" + c;
+    var given = GIVEN[r][c] !== ".";
+    var isFocused = state.focusedKey === key;
+    var cell = isFocused ? null : state.values[key];
+
+    var color = "var(--text)";
+    var bg = "transparent";
+    var fontWeight = "400";
+    if (given) {
+      color = "var(--given)";
+      fontWeight = "700";
+    } else if (cell) {
+      if (cell.status === "correct") {
+        color = "var(--correct)";
+        bg = "var(--correct-bg)";
+      } else {
+        color = "var(--incorrect)";
+        bg = "var(--incorrect-bg)";
+      }
+    }
+
+    var borderTop = r % 3 === 0 ? "3px solid var(--thick-border)" : "1px solid var(--border)";
+    var borderLeft = c % 3 === 0 ? "3px solid var(--thick-border)" : "1px solid var(--border)";
+    var borderRight = c === 8 ? "3px solid var(--thick-border)" : "1px solid var(--border)";
+    var borderBottom = r === 8 ? "3px solid var(--thick-border)" : "1px solid var(--border)";
+
+    var style = "border-top:" + borderTop + ";border-left:" + borderLeft +
+      ";border-right:" + borderRight + ";border-bottom:" + borderBottom +
+      ";color:" + color + ";background:" + bg + ";font-weight:" + fontWeight + ";";
+    if (isFocused) style += "box-shadow: inset 0 0 0 3px var(--accent);";
+    return style;
+  }
+
+  function renderGrid() {
+    var cells = "";
+    for (var r = 0; r < 9; r++) {
+      for (var c = 0; c < 9; c++) {
+        var key = r + "-" + c;
+        var given = GIVEN[r][c];
+        var display = "";
+        if (given !== ".") {
+          display = given;
+        } else if (key !== state.focusedKey) {
+          var cell = state.values[key];
+          if (cell) display = cell.value;
+        }
+        cells += "<div class=\\"cell\\" style=\\"" + buildCellStyle(r, c) + "\\">" + escapeHtml(display) + "</div>";
+      }
+    }
+    return "<div id=\\"grid\\" class=\\"grid\\">" + cells + "</div>";
+  }
+
+  function renderLegend() {
+    return "<div id=\\"legend\\" class=\\"legend\\">" +
+      "<span class=\\"legend-item\\"><span class=\\"swatch swatch-correct\\"></span>正解</span>" +
+      "<span class=\\"legend-item\\"><span class=\\"swatch swatch-incorrect\\"></span>不正解</span>" +
+      "<span class=\\"legend-item\\"><span class=\\"swatch swatch-focus\\"></span>判定中</span>" +
+      "</div>";
+  }
+
+  function renderControls() {
+    var runDisabled = state.running || state.done || state.errorMessage ? "disabled" : "";
+    var slowActive = state.speedMode === "slow" ? " active" : "";
+    var fastActive = state.speedMode === "fast" ? " active" : "";
+    return "<div class=\\"controls\\">" +
+      "<button id=\\"run-btn\\" onclick=\\"run()\\" " + runDisabled + ">実行</button>" +
+      "<button id=\\"reset-btn\\" onclick=\\"reset()\\">リセット</button>" +
+      "<div id=\\"speed-toggle\\">" +
+      "<button class=\\"speed-btn" + slowActive + "\\" onclick=\\"setSpeed('slow')\\">じっくり確認</button>" +
+      "<button class=\\"speed-btn" + fastActive + "\\" onclick=\\"setSpeed('fast')\\">最速</button>" +
+      "</div>" +
+      "</div>";
+  }
+
+  function renderErrorBox() {
+    if (!state.errorMessage) return "<div id=\\"error-box\\"></div>";
+    return "<div id=\\"error-box\\" class=\\"error\\">" + escapeHtml(state.errorMessage) + "</div>";
+  }
+
+  function statCard(label, value) {
+    return "<div class=\\"stat-card\\"><div class=\\"stat-label\\">" + escapeHtml(label) + "</div><div class=\\"stat-value\\">" + escapeHtml(value) + "</div></div>";
+  }
+
+  function renderStats() {
+    var correctCount = 0;
+    for (var key in state.values) {
+      if (Object.prototype.hasOwnProperty.call(state.values, key) && state.values[key].status === "correct") correctCount++;
+    }
+    var remaining = TOTAL_EMPTY - correctCount;
+    var roundPct = roundSize === 0 ? 0 : Math.round((roundTally.total / roundSize) * 100);
+    return "<div id=\\"stats\\" class=\\"stats\\">" +
+      statCard("現在の周", state.round + "周目") +
+      statCard("残りマス", remaining + " / " + TOTAL_EMPTY) +
+      statCard("累計正解", correctCount + "問") +
+      statCard("この周の進捗", roundTally.total + " / " + roundSize + " (" + roundPct + "%)") +
+      "</div>";
+  }
+
+  function coordLabel(r, c) {
+    return (r + 1) + "行目 " + (c + 1) + "列目";
+  }
+
+  // 1〜9の確率バー。並びは常に 1〜9 の昇順(不変条件3)。choice の棒だけアクセント色。
+  function renderBars(probs) {
+    return probs.map(function (p) {
+      var barColor = p.isPick ? "var(--accent)" : "var(--border)";
+      return "<div class=\\"bar-row\\"><span class=\\"bar-label\\">" + p.digit + "</span>" +
+        "<div class=\\"bar-track\\"><div class=\\"bar-fill\\" style=\\"width:" + p.pct + "%;background:" + barColor + ";\\"></div></div>" +
+        "<span class=\\"bar-pct\\">" + p.pct + "%</span></div>";
+    }).join("");
+  }
+
+  function renderCurrentPanel() {
+    var head = "<div id=\\"current-panel\\" class=\\"panel\\"><p class=\\"panel-title\\">現在の判定</p>";
+    var tail = "</div>";
+
+    // 結果が届いている最中のマス: 座標とバーをそのまま出す
+    if (state.focusedKey && state.currentProbs) {
+      var parts = state.focusedKey.split("-");
+      var confidenceText = "";
+      if (pendingCommit && typeof pendingCommit.confidence === "number") {
+        confidenceText = "<span class=\\"confidence\\">Jev confidence " + Math.round(pendingCommit.confidence * 100) + "%</span>";
+      }
+      return head +
+        "<div class=\\"coords\\">" + coordLabel(Number(parts[0]), Number(parts[1])) + confidenceText + "</div>" +
+        "<div class=\\"bars\\">" + renderBars(state.currentProbs) + "</div>" + tail;
+    }
+
+    // 待ち時間中は「いま聞いているマス」+「直前に確定した判定」を並べる。
+    // 最速モードでも結果が一瞬で消えないようにするため(DESIGN 4.4)。
+    var body = "";
+    if (state.focusedKey) {
+      var p2 = state.focusedKey.split("-");
+      body += "<div class=\\"coords\\">" + coordLabel(Number(p2[0]), Number(p2[1])) +
+        "<span class=\\"confidence\\">判定中…</span></div>";
+    }
+    var last = state.lastJudgment;
+    if (last && last.probs) {
+      var statusText = last.status === "correct" ? "正解" : "不正解";
+      var lastConfidence = typeof last.confidence === "number" ? " / Jev confidence " + Math.round(last.confidence * 100) + "%" : "";
+      body += "<div class=\\"coords\\"><span class=\\"confidence\\">直前: " + coordLabel(last.r, last.c) +
+        " → " + escapeHtml(last.choice) + "(" + statusText + ")" + lastConfidence + "</span></div>" +
+        "<div class=\\"bars\\">" + renderBars(last.probs) + "</div>";
+      return head + body + tail;
+    }
+    if (state.focusedKey) return head + body + "<p class=\\"muted\\">判定中…</p>" + tail;
+    return head + "<p class=\\"muted\\">待機中</p>" + tail;
+  }
+
+  function renderRoundLog() {
+    if (state.roundLog.length === 0) {
+      return "<div id=\\"round-log\\" class=\\"panel\\"><p class=\\"panel-title\\">周回ログ</p><p class=\\"muted\\">まだ記録はありません</p></div>";
+    }
+    var items = state.roundLog.map(function (line) {
+      return "<li>" + escapeHtml(line) + "</li>";
+    }).join("");
+    return "<div id=\\"round-log\\" class=\\"panel\\"><p class=\\"panel-title\\">周回ログ</p><ul>" + items + "</ul></div>";
+  }
+
+  function renderBanner() {
+    if (state.done && state.roundsToSolve) {
+      return "<div id=\\"completion-banner\\" class=\\"banner success\\">" + state.roundsToSolve + "周ですべて正解しました</div>";
+    }
+    if (state.done && state.stoppedAtLimit) {
+      return "<div id=\\"completion-banner\\" class=\\"banner warning\\">" + MAX_ROUNDS + "周で強制終了しました(全マス正解には至りませんでした)</div>";
+    }
+    return "<div id=\\"completion-banner\\"></div>";
+  }
+
+  function render() {
+    var app = document.getElementById("app");
+    // 周回ログのスクロール位置を引き継ぐ(innerHTML を作り直すと先頭に戻るため)。
+    // 末尾に居たときは末尾のままにする。
+    var oldLog = document.querySelector("#round-log ul");
+    var savedScroll = oldLog ? oldLog.scrollTop : 0;
+    var wasAtBottom = oldLog ? oldLog.scrollHeight - oldLog.scrollTop - oldLog.clientHeight < 4 : true;
+    app.innerHTML =
+      "<h1>数独キャリブレーションチェック</h1>" +
+      "<p class=\\"subtitle\\">Jev (typesafe/jev) に1マスずつ数字を聞き、確率の較正を目で確かめる</p>" +
+      renderErrorBox() +
+      "<div class=\\"layout\\">" +
+      "<div class=\\"grid-panel\\">" + renderGrid() + renderLegend() + "</div>" +
+      "<div class=\\"side-panel\\">" +
+      renderControls() +
+      renderStats() +
+      renderCurrentPanel() +
+      renderRoundLog() +
+      renderBanner() +
+      "</div>" +
+      "</div>";
+
+    var newLog = document.querySelector("#round-log ul");
+    if (newLog) newLog.scrollTop = wasAtBottom ? newLog.scrollHeight : savedScroll;
+  }
+
+  render();
 </script>
 </body>
 </html>
