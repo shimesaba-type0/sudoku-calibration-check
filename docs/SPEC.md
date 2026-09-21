@@ -143,7 +143,7 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 { "error": "アクセス元(IP)ごとのレート制限(30回/3600秒)を超えました" }
 ````
 
-429 のレスポンスヘッダーには `Retry-After`(秒)と `X-RateLimit-Scope`(`ip` または `global`)を、503 には `Retry-After: 60` を付ける。`X-RateLimit-Remaining-IP` / `X-RateLimit-Remaining-Global` は **レート制限を通過したレスポンスすべて**(200 のほか 400 や 502 も。いずれも1回として数えているため)に付く。レート制限より手前で止まる 415 と、制限に引っかかった 429 / 503 には付かない。
+429 のレスポンスヘッダーには `Retry-After`(秒)と `X-RateLimit-Scope`(`ip` または `global`)を、503 には `Retry-After: 60` を付ける。`X-RateLimit-Remaining-IP` / `X-RateLimit-Remaining-Global` は **レート制限を通過したレスポンスすべて**(200 のほか 400 や 502 も。いずれも1回として数えているため)に付く。レート制限より手前で止まる 415 と、制限に引っかかった 429 / 503 には付かない。`RATE_LIMIT_KV` バインディングが無いフェイルオープン時も、残数が存在しないので付かない。
 
 200 を返すのは Jev の回答が期待どおりの形だったときだけ。`answers.digit` が無い、AI Gateway の `state` が `"Completed"` でない、`probabilities` のキーが `"1"`〜`"9"` の9個でない、値が数値でない、`choice` がそのいずれでもない、`confidence` が数値でない、のいずれかなら 502 とし、`raw` に受け取った生レスポンスを添える。`answers` は実環境ではラッパーの中(`result.answers`)に入っている(`docs/DESIGN.md` 3.4)。
 

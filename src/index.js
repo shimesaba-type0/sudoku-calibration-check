@@ -108,7 +108,9 @@ async function checkRateLimit(request, env) {
   // 今のバケットが終わるまでの秒数
   var retryAfter = (bucket + 1) * windowSeconds - nowSeconds;
 
-  var ip = request.headers.get("CF-Connecting-IP") || "unknown";
+  // CF-Connecting-IP はエッジが付けるので偽装はできないが、KV のキー長上限(512バイト)を
+  // 超えて put が投げる想定外を避けるため念のため長さを抑える。
+  var ip = (request.headers.get("CF-Connecting-IP") || "unknown").slice(0, 64);
   var globalKey = "rl:global:" + bucket;
   var ipKey = "rl:ip:" + ip + ":" + bucket;
 
@@ -142,6 +144,8 @@ async function checkRateLimit(request, env) {
     }
 
     // ウィンドウ幅より60秒長い TTL。次のバケットと多少重なっても古いキーは自然に消える。
+    // 片方だけ成功して片方が失敗した場合(全体だけ +1 されて 503)は、数え過ぎ=安全側に倒れる
+    // ので許容する。数え漏れは起きない。
     var options = { expirationTtl: windowSeconds + 60 };
     await Promise.all([
       kv.put(globalKey, String(globalCount + 1), options),
@@ -170,7 +174,7 @@ async function checkRateLimit(request, env) {
 var CELL_PATTERN = /^[1-9.]{9}$/;
 
 /**
- * 入力検証(docs/DESIGN.md 3.3 step 2)。
+ * 入力検証(docs/DESIGN.md 3.3 手順3)。
  * 問題なければ null、不備があれば日本語の理由を返す。
  */
 function validateInput(body) {
@@ -221,7 +225,7 @@ function validateInput(body) {
 }
 
 /**
- * Jev の回答が期待した形かを検証する(docs/DESIGN.md 3.3 step 5)。
+ * Jev の回答が期待した形かを検証する(docs/DESIGN.md 3.3 手順6)。
  * 形が違うものをそのまま 200 で返すとフロントが黙って壊れるので、502 にして raw を見せる。
  * 問題なければ null、不備があれば日本語の理由を返す。
  */
@@ -306,6 +310,19 @@ function truncate(text) {
 }
 
 /**
+ * 502 の raw に添える値。AI.run の戻り値は JSON 由来のはずだが、万一 JSON にできない値
+ * (循環参照・BigInt など)が来ても 500 に化けないよう、文字列化にフォールバックする。
+ */
+function rawForResponse(value) {
+  try {
+    JSON.stringify(value);
+    return value;
+  } catch (err) {
+    return truncate(String(value));
+  }
+}
+
+/**
  * POST /api/judge(docs/DESIGN.md 3.3)。
  * 受け取った盤面だけを見て Jev に1マス分の確率を聞く。盤面も結果も保存しない。
  */
@@ -385,7 +402,7 @@ async function handleJudge(request, env) {
     // AI.run が undefined を解決したとき、そのままだと raw のキーごと JSON から消える。
     // デバッグ用に「何が返ってきたか」を必ず残したいので null に寄せる。
     return jsonResponse(
-      { error: badAnswer, raw: result === undefined ? null : result },
+      { error: badAnswer, raw: rawForResponse(result === undefined ? null : result) },
       502,
       rate.headers
     );
