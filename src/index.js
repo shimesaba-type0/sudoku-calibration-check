@@ -284,8 +284,13 @@ function extractAnswer(response) {
     return { error: "AIの応答が予期しない形式です" };
   }
 
-  // ゲートウェイが完了以外の状態を返したら、中身を見ずに止める。
-  if (Object.prototype.hasOwnProperty.call(response, "state") && response.state !== "Completed") {
+  // ゲートウェイのラッパー(result 付き)で、完了以外の状態なら中身を見ずに止める。
+  // ラッパーが無い素の応答は state を見ない(Jev のリクエスト側の最上位フィールド名も
+  // state なので、将来それがエコーされても誤って 502 にしないため)。
+  if (
+    Object.prototype.hasOwnProperty.call(response, "result") &&
+    response.state !== "Completed"
+  ) {
     return { error: "AIの応答が完了していません" };
   }
 

@@ -207,6 +207,20 @@ test("502: AI.run が例外を投げる", async () => {
   assert.ok(String(body.raw).includes("upstream exploded"));
 });
 
+test("400 と 502 にも X-RateLimit-Remaining-* が付く(どちらも1回として数えるため)", async () => {
+  var env = makeEnv();
+  var res400 = await worker.fetch(judgeRequest({ puzzle: validBody().puzzle }), env);
+  assert.equal(res400.status, 400);
+  assert.equal(res400.headers.get("X-RateLimit-Remaining-IP"), "29");
+  assert.equal(res400.headers.get("X-RateLimit-Remaining-Global"), "499");
+
+  var env2 = makeEnv({ aiError: new Error("boom") });
+  var res502 = await worker.fetch(judgeRequest(validBody()), env2);
+  assert.equal(res502.status, 502);
+  assert.equal(res502.headers.get("X-RateLimit-Remaining-IP"), "29");
+  assert.equal(res502.headers.get("X-RateLimit-Remaining-Global"), "499");
+});
+
 test("502: raw は200文字で切り詰める", async () => {
   var env = makeEnv({ aiError: new Error("x".repeat(1000)) });
   var res = await worker.fetch(judgeRequest(validBody()), env);
