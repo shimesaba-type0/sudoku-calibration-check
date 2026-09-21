@@ -21,6 +21,29 @@ async function judge(body, envOptions) {
   return { res: res, body: payload, env: env };
 }
 
+/**
+ * 「埋まっているマスがちょうど count 個」の盤面を作る。行・列・箱の矛盾は気にしない
+ * (Worker は矛盾を検証しない)。skip のマスだけは必ず空にする(target 用)。
+ */
+function filledPuzzle(count, skip) {
+  var rows = [];
+  var placed = 0;
+  for (var r = 0; r < 9; r++) {
+    var line = "";
+    for (var c = 0; c < 9; c++) {
+      var isSkip = skip && skip.row === r && skip.col === c;
+      if (!isSkip && placed < count) {
+        line += String((c % 9) + 1);
+        placed++;
+      } else {
+        line += ".";
+      }
+    }
+    rows.push(line);
+  }
+  return rows;
+}
+
 test("正常入力で 200 と9キーの probabilities が返る", async () => {
   var out = await judge(validBody());
   assert.equal(out.res.status, 200);
@@ -161,22 +184,51 @@ test("400: target が無い / 型が違う / 範囲外 / 整数でない", async
   await expect400("col が null", { puzzle: GIVEN.slice(), target: { row: 0, col: null } });
 });
 
-test("400: 与えられたマスが書き換えられている", async () => {
-  var overwritten = GIVEN.slice();
-  overwritten[0] = "13..7...."; // 先頭の 5 を 1 に
-  await expect400("与えられた数字の変更", { puzzle: overwritten, target: { row: 0, col: 2 } });
-
-  var erased = GIVEN.slice();
-  erased[0] = ".3..7...."; // 先頭の 5 を消した
-  await expect400("与えられた数字の消去", { puzzle: erased, target: { row: 0, col: 2 } });
+test("400: 埋まっているマスが16個以下", async () => {
+  // 一意解を持つ数独の最小ヒント数は17。これ未満は数独として成立しない。
+  await expect400("16個", { puzzle: filledPuzzle(16, { row: 8, col: 8 }), target: { row: 8, col: 8 } });
+  await expect400("1個", { puzzle: filledPuzzle(1, { row: 8, col: 8 }), target: { row: 8, col: 8 } });
+  await expect400("0個(全部空)", {
+    puzzle: filledPuzzle(0, { row: 8, col: 8 }),
+    target: { row: 8, col: 8 },
+  });
 });
 
-test("400: target が与えられたマスを指している", async () => {
-  await expect400("(0,0) は given", { puzzle: GIVEN.slice(), target: { row: 0, col: 0 } });
-  await expect400("(8,8) は given", { puzzle: GIVEN.slice(), target: { row: 8, col: 8 } });
+test("200: 埋まっているマスが17個ちょうど", async () => {
+  var out = await judge({ puzzle: filledPuzzle(17, { row: 8, col: 8 }), target: { row: 8, col: 8 } });
+  assert.equal(out.res.status, 200, "17個は受け付ける");
+  assert.equal(out.env.aiCalls.length, 1);
+});
+
+test("200: 固定問題と無関係な別の盤面でも target が空なら通る(ジェネレーター対応)", async () => {
+  // 固定問題(GIVEN)とは初期配置がまったく違う盤面。Worker はもう特定の問題を知らない。
+  var other = [
+    "....9..5.",
+    "..24..1..",
+    ".9.....42",
+    "...8.7...",
+    "6.......3",
+    "...2.4...",
+    "37.....8.",
+    "..5..69..",
+    ".2..3....",
+  ];
+  var out = await judge({ puzzle: other, target: { row: 0, col: 0 } });
+  assert.equal(out.res.status, 200);
+  assert.deepEqual(out.env.aiCalls[0].payload.state.puzzle, other);
+
+  // 固定問題の given のマスを空にした盤面でも通る(「改変された」とは見なさない)
+  var erased = GIVEN.slice();
+  erased[0] = ".3..7....";
+  var out2 = await judge({ puzzle: erased, target: { row: 0, col: 0 } });
+  assert.equal(out2.res.status, 200, "GIVEN の数字を消してあっても 400 にはしない");
 });
 
 test("400: target のマスが空(.)でない", async () => {
+  // 固定問題の given を指す場合も、空でない以上はこの理由で 400 になる
+  await expect400("(0,0) には 5 が入っている", { puzzle: GIVEN.slice(), target: { row: 0, col: 0 } });
+  await expect400("(8,8) には 9 が入っている", { puzzle: GIVEN.slice(), target: { row: 8, col: 8 } });
+
   // 再判定のとき、そのマスの前回の推測を消さずに送ってきたケース
   var filled = GIVEN.slice();
   filled[0] = "531.7...."; // (0,2) に前回の推測 1 が残っている
