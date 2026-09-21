@@ -13,7 +13,7 @@ binding = "AI"
 # deploy は失敗する。id は秘密情報ではないのでコミットしてよい。
 [[kv_namespaces]]
 binding = "RATE_LIMIT_KV"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "b0f9a6d4a03347d48671f039395a5274"
 
 # レート制限の唯一の調整つまみ。ここの値を書き換えて再デプロイするだけで
 # 上限が変わる(src/index.js は触らない)。数値は文字列として Worker に渡り、
