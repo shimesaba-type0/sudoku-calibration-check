@@ -11,7 +11,8 @@
     "dev": "wrangler dev",
     "check": "wrangler deploy --dry-run",
     "deploy": "wrangler deploy",
-    "test": "node --test \"test/**/*.test.js\""
+    "test": "node --test \"test/**/*.test.js\"",
+    "e2e": "node scripts/e2e/smoke.mjs"
   },
   "devDependencies": {
     "wrangler": "^4.0.0"

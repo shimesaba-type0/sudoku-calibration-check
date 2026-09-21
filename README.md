@@ -34,6 +34,20 @@ npm test
 npm run check
 ```
 
+## E2E スモークテスト
+
+Playwright でブラウザを実際に操作し、画面が一通り動くことを確認します。`playwright` は
+`devDependencies` に含めていないので、初回は `npm install --no-save playwright` で入れてください。
+既定はモックモード(`/api/judge` をこのスクリプト自身がモックするので認証不要)で、
+`npm run e2e -- --url <デプロイ先URL>` を付けると実際にデプロイした Worker を最大3判定だけ叩きます
+(詳細は `scripts/e2e/smoke.mjs` の冒頭コメント)。
+
+```sh
+npm run e2e                          # モックモード(--mode mixed が既定)
+npm run e2e -- --mode correct        # 完了バナーの確認など
+npm run e2e -- --url https://sudoku-calibration-check.takashi-kono-rb.workers.dev
+```
+
 ## レート制限のカウンタ(Durable Object)
 
 レート制限のカウンタは Durable Object(クラス `RateLimitCounter`、バインディング
