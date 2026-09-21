@@ -68,7 +68,7 @@ npm run dev                 # ローカル起動。AIバインディングはリ
 
 1. **秘密情報をコミットしない**。トークン・アカウントIDをファイルに書かない。`wrangler.toml` に `account_id` を追記しない
 2. **`SOLUTION`(数独の正解)は絶対に Jev に送らない**。送ってよいのは「現時点で埋まっているマス(過去の周の推測込み、正誤問わず)」だけ。これが崩れると実験として無意味になる(`docs/DESIGN.md` の不変条件を参照)
-3. Jev のレスポンス形式(`answers.<key>.choice / confidence / probabilities`)は2026年9月時点の Cloudflare 公式ドキュメント準拠。**実際に叩いて形が違ったら `handleJudge` を直し、`docs/DESIGN.md` の該当節も同時に更新する**
+3. Jev のレスポンス形式(`answers.<key>.choice / confidence / probabilities`)は2026-09-21 に実環境で確認した形式(`docs/DESIGN.md` 3.4)。**実際に叩いて形が違ったら `handleJudge` を直し、`docs/DESIGN.md` の該当節も同時に更新する**
 4. **レート制限の上限を理由なく緩めない**(`RATE_LIMIT_PER_IP_MAX` / `RATE_LIMIT_GLOBAL_MAX` を上げる、または `RATE_LIMIT_KV` を外すなど)。コストの青天井を防ぐための唯一の砦なので、緩める変更を求められたら、なぜ必要かを報告に明記する
 5. 変更後は必ず `npm test` と `npm run check` を通す。デプロイできる環境なら `npm run deploy` → `curl` で `/api/judge` を叩いて動作確認し、結果(レイテンシ・実際のレスポンスJSON)を報告に含める
 6. UIの見た目(ダーク基調、IBM Plex、緑=正解/赤=不正解/アクセント色=フォーカス)は維持する。大きなデザイン変更は指示があるときだけ
@@ -79,6 +79,7 @@ npm run dev                 # ローカル起動。AIバインディングはリ
 ## 現在の状態(2026-09-21)
 
 - v0.1 を Issue 単位で実装中。進捗は GitHub の Issues / PR を参照(`docs/HANDOFF.md` の「現在地」も併せて更新する)
-- **まだ一度も実環境で Jev を叩いていない**。実装が揃ったら最初のタスクは「本当に動くかの検証」
-- **デプロイ前に必須の手作業**: `wrangler.toml` の `RATE_LIMIT_KV` の `id` がプレースホルダー(`REPLACE_WITH_KV_NAMESPACE_ID`)のまま。`npx wrangler kv namespace create RATE_LIMIT_KV` を実行し、出力された id に置き換えてからでないと deploy が失敗する
+- デプロイ済み: https://sudoku-calibration-check.takashi-kono-rb.workers.dev (`GET /` はフロントエンドの Issue が入るまで「実装中」の仮ページ)
+- **Jev は 2026-09-21 に Worker 経由で実環境検証済み**。レスポンスは AI Gateway のラッパー付きだった(`docs/DESIGN.md` 3.4)。`confidence` は `probabilities[choice]` と一致せず、同じ入力でも `choice` が揺れる
+- `wrangler.toml` の `RATE_LIMIT_KV` の `id` は実際のネームスペース ID に置き換え済み(手作業は完了)
 - 既知の未実装: 数独ジェネレーター/ソルバー、集計ビュー(信頼度較正図)

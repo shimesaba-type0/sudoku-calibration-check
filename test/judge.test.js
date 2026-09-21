@@ -3,7 +3,16 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import worker from "../src/index.js";
-import { GIVEN, makeEnv, makeKV, judgeRequest, validBody, jevResponse } from "./helpers.js";
+import {
+  GIVEN,
+  makeEnv,
+  makeKV,
+  judgeRequest,
+  validBody,
+  jevResponse,
+  bareJevResponse,
+  jevAnswer,
+} from "./helpers.js";
 
 async function judge(body, envOptions) {
   var env = makeEnv(envOptions);
@@ -19,7 +28,29 @@ test("正常入力で 200 と9キーの probabilities が返る", async () => {
   assert.deepEqual(Object.keys(out.body).sort(), ["choice", "confidence", "probabilities"]);
   assert.deepEqual(Object.keys(out.body.probabilities), ["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
   assert.equal(out.body.choice, "4");
-  assert.equal(out.body.confidence, 0.61);
+  assert.equal(out.body.confidence, 0.31);
+});
+
+test("confidence は Jev の値をそのまま通す(probabilities[choice] に置き換えない)", async () => {
+  var out = await judge(validBody());
+  assert.equal(out.res.status, 200);
+  assert.equal(out.body.confidence, jevAnswer().confidence);
+  assert.notEqual(
+    out.body.confidence,
+    out.body.probabilities[out.body.choice],
+    "confidence が probabilities[choice] に差し替えられている"
+  );
+});
+
+test("ラッパーの無い素のレスポンスでも 200(ゲートウェイが外れた場合の保険)", async () => {
+  var env = makeEnv({ aiResult: bareJevResponse() });
+  var res = await worker.fetch(judgeRequest(validBody()), env);
+  assert.equal(res.status, 200);
+  var body = await res.json();
+  assert.deepEqual(Object.keys(body).sort(), ["choice", "confidence", "probabilities"]);
+  assert.equal(body.choice, "4");
+  assert.equal(body.confidence, 0.31);
+  assert.deepEqual(Object.keys(body.probabilities), ["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
 });
 
 test("CORS ヘッダーは付けない", async () => {
@@ -190,7 +221,17 @@ test("502: answers.digit が無い", async () => {
     { model: "jev-1.13.0", answers: {} },
     { model: "jev-1.13.0", answers: { other: { choice: "4" } } },
     null,
+    undefined,
     "まさかの文字列",
+    [1, 2, 3],
+    // ラッパーはあるが result.answers が無い / 形が違う
+    { state: "Completed", result: { model: "jev-1.13.0", usage: {} } },
+    { state: "Completed", result: { model: "jev-1.13.0", answers: {} } },
+    { state: "Completed", result: { model: "jev-1.13.0", answers: null } },
+    { state: "Completed", result: { model: "jev-1.13.0", answers: [] } },
+    { state: "Completed", result: {} },
+    // result が非オブジェクトならトップレベルの answers を見るが、そこにも無い
+    { state: "Completed", result: "こわれた" },
   ];
   for (var i = 0; i < shapes.length; i++) {
     var env = makeEnv({ aiResult: shapes[i] });
@@ -202,10 +243,25 @@ test("502: answers.digit が無い", async () => {
   }
 });
 
+test("502: state が Completed でない", async () => {
+  var states = ["Queued", "Running", "Failed", "completed", "", null, 0];
+  for (var i = 0; i < states.length; i++) {
+    // 中身(result.answers.digit)は完全に正常。state だけで止まることを確かめる。
+    var response = jevResponse();
+    response.state = states[i];
+    var env = makeEnv({ aiResult: response });
+    var res = await worker.fetch(judgeRequest(validBody()), env);
+    assert.equal(res.status, 502, "state=" + String(states[i]) + ": 502 を期待したが " + res.status);
+    var body = await res.json();
+    assert.equal(body.error, "AIの応答が完了していません");
+    assert.ok("raw" in body, "state=" + String(states[i]) + ": raw が無い");
+  }
+});
+
 /** 既定の正常レスポンスの answers.digit を差し替えたものを返す。 */
 function withDigit(digit) {
   var response = jevResponse();
-  response.answers.digit = digit;
+  response.result.answers.digit = digit;
   return response;
 }
 

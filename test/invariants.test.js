@@ -100,9 +100,22 @@ test("不変条件7: 正解表の識別子は PAGE_HTML の中にしか現れな
   var source = readFileSync(SOURCE_PATH, "utf8");
   var needle = "SOLUTION";
 
-  var declaration = source.indexOf("var PAGE_HTML = `");
-  assert.ok(declaration >= 0, "PAGE_HTML のテンプレートリテラルが見つからない");
-  var open = source.indexOf("`", declaration);
+  // 開きは「行頭の宣言」に固定する。単に indexOf で拾うと、前にあるコメントの中の
+  // 同じ文字列にぶつかって切り出し範囲がずれ、検査そのものが無効になりかねない。
+  var marker = "var PAGE_HTML = `";
+  var match = /^var PAGE_HTML = `/m.exec(source);
+  assert.ok(match, "PAGE_HTML のテンプレートリテラルが行頭の宣言として見つからない");
+  assert.equal(
+    source.indexOf(marker),
+    match.index,
+    marker + " が行頭の宣言より前にも現れている(切り出し範囲がずれる)"
+  );
+  assert.equal(
+    source.indexOf(marker, match.index + 1),
+    -1,
+    marker + " が複数ある(どれが本物の宣言か決められない)"
+  );
+  var open = source.indexOf("`", match.index);
 
   // 閉じバッククォートはファイル最後のバッククォート。PAGE_HTML が最後の宣言である
   // ことを前提にしているので、その前提自体も検査する(後ろに続くのは ; と空白だけ)。

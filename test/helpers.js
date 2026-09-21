@@ -27,29 +27,47 @@ export var ANSWER_KEY = [
   "345286179",
 ];
 
-// docs/DESIGN.md 3.4 の形の固定レスポンス
+// docs/DESIGN.md 3.4 の `answers.digit`。
+// `confidence` は Jev 独自の確信度で、`probabilities[choice]`(0.61)とは **わざと** 別の値に
+// してある。2026-09-21 の実測でも両者は一致しなかった(0.10 対 0.20 など)。
+export function jevAnswer() {
+  return {
+    type: "choice",
+    choice: "4",
+    probabilities: {
+      1: 0.03,
+      2: 0.05,
+      3: 0.02,
+      4: 0.61,
+      5: 0.08,
+      6: 0.07,
+      7: 0.04,
+      8: 0.06,
+      9: 0.04,
+    },
+    confidence: 0.31,
+  };
+}
+
+// 実環境(AI Gateway 経由)で返ってくるラッパー形式。docs/DESIGN.md 3.4。
 export function jevResponse() {
   return {
-    model: "jev-1.13.0",
-    answers: {
-      digit: {
-        type: "choice",
-        choice: "4",
-        confidence: 0.61,
-        probabilities: {
-          1: 0.03,
-          2: 0.05,
-          3: 0.02,
-          4: 0.61,
-          5: 0.08,
-          6: 0.07,
-          7: 0.04,
-          8: 0.06,
-          9: 0.04,
-        },
-      },
+    state: "Completed",
+    result: {
+      model: "jev-1.13.0",
+      answers: { digit: jevAnswer() },
+      usage: { input_tokens: 665, output_tokens: 80 },
     },
-    usage: { input_tokens: 380, output_tokens: 45 },
+    gatewayMetadata: { keySource: "Unified" },
+  };
+}
+
+// ラッパーの無い素の形式。Cloudflare が将来ゲートウェイを外しても動くことの確認に使う。
+export function bareJevResponse() {
+  return {
+    model: "jev-1.13.0",
+    answers: { digit: jevAnswer() },
+    usage: { input_tokens: 665, output_tokens: 80 },
   };
 }
 

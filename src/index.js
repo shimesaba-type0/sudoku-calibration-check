@@ -264,6 +264,43 @@ function validateAnswer(answer) {
   return null;
 }
 
+/**
+ * Jev のレスポンスから `answers.digit` を取り出す(docs/DESIGN.md 3.4)。
+ *
+ * 実環境の `typesafe/jev` は AI Gateway 経由で提供されており、`env.AI.run` は
+ * `{ state, result: { model, answers, usage }, gatewayMetadata }` というラッパーを返す。
+ * 将来 Cloudflare が素の `{ model, answers, usage }` を返すようになっても動くよう、
+ * `result.answers` を優先し、`result` がオブジェクトでなければトップレベルの
+ * `answers` に落とす。
+ *
+ * 取り出せたら `{ answer }`、駄目なら `{ error }`(日本語の理由)を返す。
+ */
+function extractAnswer(response) {
+  if (response === null || typeof response !== "object" || Array.isArray(response)) {
+    return { error: "AIの応答が予期しない形式です" };
+  }
+
+  // ゲートウェイが完了以外の状態を返したら、中身を見ずに止める。
+  if ("state" in response && response.state !== "Completed") {
+    return { error: "AIの応答が完了していません" };
+  }
+
+  var inner = response.result;
+  var container =
+    inner !== null && typeof inner === "object" && !Array.isArray(inner) ? inner : response;
+
+  var answers = container.answers;
+  if (answers === null || typeof answers !== "object" || Array.isArray(answers)) {
+    return { error: "AIの応答が予期しない形式です" };
+  }
+
+  if (answers.digit === undefined) {
+    return { error: "AIの応答が予期しない形式です" };
+  }
+
+  return { answer: answers.digit };
+}
+
 function truncate(text) {
   return text.length > RAW_MAX_LENGTH ? text.slice(0, RAW_MAX_LENGTH) + "…" : text;
 }
@@ -341,16 +378,25 @@ async function handleJudge(request, env) {
     );
   }
 
-  var answer = result && result.answers && result.answers.digit;
-  var badAnswer = answer === undefined ? "AIの応答が予期しない形式です" : validateAnswer(answer);
-  if (badAnswer !== null) {
-    return jsonResponse({ error: badAnswer, raw: result }, 502, rate.headers);
+  var extracted = extractAnswer(result);
+  var badAnswer =
+    extracted.error !== undefined ? extracted.error : validateAnswer(extracted.answer);
+  if (badAnswer !== null && badAnswer !== undefined) {
+    // AI.run が undefined を解決したとき、そのままだと raw のキーごと JSON から消える。
+    // デバッグ用に「何が返ってきたか」を必ず残したいので null に寄せる。
+    return jsonResponse(
+      { error: badAnswer, raw: result === undefined ? null : result },
+      502,
+      rate.headers
+    );
   }
 
+  var answer = extracted.answer;
   return jsonResponse(
     {
       probabilities: answer.probabilities,
       choice: answer.choice,
+      // Jev 独自の確信度。probabilities[choice] とは一致しない(docs/SPEC.md 4章)。
       confidence: answer.confidence,
     },
     200,
