@@ -45,7 +45,7 @@ TypeSafe AI の決定モデル **Jev**(`typesafe/jev`、Cloudflare Workers AI �
 
 ````bash
 npm install                 # wrangler を入れる
-npm test                    # node --test test/(認証不要。ロジックと不変条件の検証)
+npm test                    # node --test "test/**/*.test.js"(認証不要。ロジックと不変条件の検証)
 npm run check               # wrangler deploy --dry-run(認証不要。設定とビルドの検証だけ)
 npm run deploy              # 本番デプロイ(CLOUDFLARE_API_TOKEN が必要)
 npm run dev                 # ローカル起動。AIバインディングはリモート実行なので、これもトークンが必要

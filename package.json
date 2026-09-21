@@ -4,15 +4,16 @@
   "private": true,
   "license": "MIT",
   "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
   "scripts": {
     "dev": "wrangler dev",
+    "check": "wrangler deploy --dry-run",
     "deploy": "wrangler deploy",
-    "typecheck": "tsc --noEmit",
-    "cf-typegen": "wrangler types"
+    "test": "node --test \"test/**/*.test.js\""
   },
   "devDependencies": {
-    "@types/node": "^26.6.2",
-    "typescript": "^5.6.0",
     "wrangler": "^4.0.0"
   }
 }

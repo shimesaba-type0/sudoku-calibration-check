@@ -254,7 +254,7 @@ var SOLUTION = [ "534678912", "672195348", "198342567", "859761423", "426853791"
 
 ## 10. テスト
 
-`test/` 配下に Node 標準の `node:test` で書く。`npm test` で実行(`node --test test/`)。Cloudflare の認証やネットワークは不要。
+`test/` 配下に Node 標準の `node:test` で書く。`npm test` で実行(`node --test "test/**/*.test.js"`。Node 22 の test runner は位置引数のディレクトリを走査しないため、グロブで渡す)。Cloudflare の認証やネットワークは不要。
 
 - `src/index.js` を ES Module として import し、`default.fetch(request, env)` をモックの `env` で直接呼ぶ。Node 22 のグローバル `Request` / `Response` をそのまま使う
 - モック `env`
