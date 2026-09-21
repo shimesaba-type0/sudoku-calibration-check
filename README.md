@@ -34,11 +34,12 @@ npm test
 npm run check
 ```
 
-## 初回だけ必要な手作業: KV ネームスペースの作成
+## KV ネームスペース
 
 レート制限のカウンタに Workers KV を使います。`wrangler.toml` の `RATE_LIMIT_KV` の `id` は
-プレースホルダー(`REPLACE_WITH_KV_NAMESPACE_ID`)のままなので、**初回デプロイ前に一度だけ**
-ネームスペースを作り、その id を貼り付けてください。
+**作成済みのものが入っている**ので、このリポジトリをそのまま使う場合の手作業はありません。
+フォークして自分のアカウントにデプロイする場合は、一度だけネームスペースを作り直して
+`id` を差し替えてください。
 
 ```sh
 npx wrangler kv namespace create RATE_LIMIT_KV
@@ -50,7 +51,7 @@ npx wrangler kv namespace create RATE_LIMIT_KV
 ```toml
 [[kv_namespaces]]
 binding = "RATE_LIMIT_KV"
-id = "REPLACE_WITH_KV_NAMESPACE_ID"  # ← ここを差し替える
+id = "..."  # ← ここを差し替える
 ```
 
 ## デプロイ
@@ -71,6 +72,10 @@ npm run deploy
 | --- | --- | --- |
 | `/` | GET | フロントエンド一式(HTML)。**現時点では「実装中」と表示するだけの仮ページ**で、本格的なUIは別 Issue で入ります |
 | `/api/judge` | POST | 盤面と対象マスを受け取り、`{ probabilities, choice, confidence }` を返す |
+
+`confidence` は **Jev が返す独自の確信度** で、`probabilities[choice]` とは一致しません
+(実測では 0.20 に対して 0.10 など)。較正が本当かを確かめるのに使うのは `probabilities` の
+ほうです(`docs/SPEC.md` 4章 / `docs/DESIGN.md` 3.4)。
 
 それ以外のパスは 404 です。`/api/judge` は `content-type: application/json` 以外を 415 で
 弾き、CORS ヘッダーも付けていないため、他サイトのページからは呼べません。

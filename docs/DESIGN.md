@@ -80,12 +80,16 @@ IP単位・全体、の2段構えの固定ウィンドウ・レート制限。`h
    - `GIVEN` は秘密ではないので Worker 側にも持つ。`SOLUTION` は持たない(1 章・10 章)
 4. `criteria` を `{ "1": "the digit 1", ..., "9": "the digit 9" }` として生成
 5. `env.AI.run("typesafe/jev", { state, questions })` を呼ぶ。例外は 502(`raw` に例外メッセージを200文字まで入れ、`console.error` でログを残す)
-6. 返ってきた `result.answers.digit` を検証し、次のどれかを満たさなければ 502(`raw` に生レスポンスを添えて返す。デバッグ用)
-   - `answers.digit` が存在し、オブジェクトである
+6. 返ってきたレスポンスから `answers.digit` を取り出して検証し(`extractAnswer` → `validateAnswer`)、次のどれかを満たさなければ 502(`raw` に生レスポンスを添えて返す。デバッグ用)
+   - レスポンスがオブジェクトである
+   - `state` フィールドがある場合、その値が `"Completed"` である(AI Gateway のラッパー。3.4)。違えば中身を見ずに 502
+   - `answers` の取り出しは **`result` がオブジェクトなら `result.answers`、そうでなければトップレベルの `answers`**。ゲートウェイのラッパーが将来外れても動くようにするための2段構え(3.4)
+   - `answers` がオブジェクトで、`answers.digit` が存在し、オブジェクトである
    - `probabilities` がオブジェクトで、キーがちょうど `"1"`〜`"9"` の9個。値はすべて有限の数値
    - `choice` が文字列で、`"1"`〜`"9"` のいずれか
-   - `confidence` が有限の数値
-7. `{ probabilities, choice, confidence }` に絞って 200 で返す。レスポンスヘッダーに `X-RateLimit-Remaining-IP` / `X-RateLimit-Remaining-Global`(その時点の残り回数)を付ける
+   - `confidence` が有限の数値。**値の妥当性は見ない**(Jev 独自の確信度で `probabilities[choice]` とは一致しないため。3.4 / SPEC 4章)
+7. `{ probabilities, choice, confidence }` に絞って 200 で返す。`confidence` は Jev の値をそのまま通す(`probabilities[choice]` に差し替えない)
+8. `X-RateLimit-Remaining-IP` / `X-RateLimit-Remaining-Global`(その時点の残り回数)は、**レート制限を通過したすべてのレスポンス** に付く。200 だけでなく、その後の 400(入力不正)や 502(AI 失敗・形式不正)にも付く(どれも1回として数えているため)。レート制限より手前で止まる 415 と、制限に引っかかった 429 / 503 には付かない
 
 `state` はオブジェクトで渡す(Jev は string / object / array を受け付ける):
 
@@ -99,9 +103,14 @@ state: {
 
 `note` は Jev にルールを伝えるための固定文。ルール自体を推論させたいわけではなく、「何を聞かれているか」を誤解させないための最低限の説明。
 
-### 3.4 Jev のリクエスト/レスポンス形式(2026-09 時点、Cloudflare公式ドキュメント準拠)
+### 3.4 Jev のリクエスト/レスポンス形式(2026-09-21 実測)
 
-リクエスト:
+`typesafe/jev` は **Cloudflare AI Gateway 経由** で提供されている。Workers AI の他モデルと違い、
+REST の `ai/run` ルートやモデルカタログには出てこず、Worker の `env.AI` バインディングからしか
+到達できない。課金も Workers AI のニューロンではなく **AI Gateway のクレジット** で行われるため、
+アカウントで AI Gateway の課金を有効にしていないと呼び出しが失敗する(`docs/HANDOFF.md` 1.3)。
+
+リクエスト(ここは公開ドキュメントどおりで、実測でも変わらなかった):
 
 ````javascript
 await env.AI.run("typesafe/jev", {
@@ -118,35 +127,56 @@ await env.AI.run("typesafe/jev", {
 })
 ````
 
-レスポンス(`choice` の場合):
+レスポンス(`choice` の場合)。2026-09-21 に実環境で `env.AI.run` が返した値そのまま:
 
 ````json
 {
-  "model": "jev-1.13.0",
-  "answers": {
-    "digit": {
-      "type": "choice",
-      "choice": "4",
-      "confidence": 0.61,
-      "probabilities": { "1": 0.03, "2": 0.05, "3": 0.02, "4": 0.61, "5": 0.08, "6": 0.07, "7": 0.04, "8": 0.06, "9": 0.04 }
-    }
+  "state": "Completed",
+  "result": {
+    "model": "jev-1.13.0",
+    "answers": {
+      "digit": {
+        "type": "choice",
+        "choice": "1",
+        "probabilities": { "1": 0.2, "2": 0.2, "3": 0.09, "4": 0.2, "5": 0.02, "6": 0.08, "7": 0.07, "8": 0.07, "9": 0.07 },
+        "confidence": 0.1
+      }
+    },
+    "usage": { "input_tokens": 665, "output_tokens": 80 }
   },
-  "usage": { "input_tokens": 380, "output_tokens": 45 }
+  "gatewayMetadata": { "keySource": "Unified" }
 }
 ````
+
+- `state` と `gatewayMetadata` は **AI Gateway が付けるフィールド**で、Jev 自身の回答ではない。
+  `state` が `"Completed"` 以外なら中身を見ずに 502 にする
+- Jev の回答本体は `result` の中の `answers` / `model` / `usage`。公開ドキュメントが載せている
+  「素の `{ model, answers, usage }`」はこのラッパーの `result` に相当する
+- そのため `handleJudge`(`extractAnswer`)は **`result` がオブジェクトなら `result.answers`、
+  そうでなければトップレベルの `answers`** を読む。将来ゲートウェイが外れて素の形に戻っても
+  コードを触らずに動く
+- **`confidence` は `probabilities[choice]` と一致しない。** 実測で 0.10 対 0.20 / 0.13 対 0.22 /
+  0.11 対 0.20 だった。Jev 独自の確信度指標なのでそのまま通し、較正の検証には `probabilities`
+  を使う(SPEC 4章)
+- `usage.input_tokens` は 1 判定あたり約 665。SPEC 5章の見積り(約400)より多かったので、
+  SPEC 5章のコスト試算は実測値に更新した
+- 同じ入力を3回投げて `choice` が `1` / `4` / `2` と割れた(正解は `4`)。確率もほぼ平坦
+  (最大 0.22)だった。**決定的ではない**。これは不具合ではなく、このアプリが観測したい対象そのもの
 
 参考(将来の転用用):
 
 - `noul` のレスポンスは `{ "type": "noul", "noul": 0.98 }`(確率のみ。閾値判断はアプリ側)
 - `score` は順序付きの段階から1つを選び、同様に確率を返す
 
-**この形式は変わり得る。** Jev は公開直後で頻繁に更新されているため、初回の実環境テストで必ず生レスポンスを確認し、違っていればこの節と `handleJudge` を同時に直す。
+**この形式は変わり得る。** Jev は公開直後で頻繁に更新されており、ゲートウェイのラッパーも
+Cloudflare 側の都合で変わる。形が違っていたらこの節と `handleJudge` を同時に直す
+(9 章 不変条件5 / `CLAUDE.md` 作業ルール3)。
 
 ### 3.5 `PAGE_HTML`
 
 バッククォート付きテンプレートリテラルにHTML全体を格納。中で `${...}` は使っていない(素のHTMLを埋めているだけ)ので、テンプレート内のJSで `${}` を書く必要が出たら `\${}` とエスケープすること。
 
-`PAGE_HTML` は **`src/index.js` の最後の宣言に固定する**。不変条件7のテスト(10 章)は「ファイル最後のバッククォート = テンプレートの閉じ」と見なして外側のソースを切り出し、その後ろに `;` と空白しか無いことも併せて検査する。ここに何かを足すと検査が無効になるので、新しいコードは `PAGE_HTML` より前に書く。
+`PAGE_HTML` は **`src/index.js` の最後の宣言に固定する**。不変条件7のテスト(10 章)は「行頭の `var PAGE_HTML = \`` = テンプレートの開き」「ファイル最後のバッククォート = テンプレートの閉じ」と見なして外側のソースを切り出し、その後ろに `;` と空白しか無いことも併せて検査する。ここに何かを足すと検査が無効になるので、新しいコードは `PAGE_HTML` より前に書く。`var PAGE_HTML = \`` という文字列はコメントを含めてファイル中に1つだけにする(テストで確認している)。
 
 ## 4. フロントエンド設計(`PAGE_HTML` 内の `<script>`)
 
@@ -223,8 +253,9 @@ var SOLUTION = [ "534678912", "672195348", "198342567", "859761423", "426853791"
 ## 6. 設定・デプロイ
 
 - `wrangler.toml`: `name`, `main = "src/index.js"`, `compatibility_date`, `[ai] binding = "AI"`, `[[kv_namespaces]] binding = "RATE_LIMIT_KV"`, `[vars]`(レート制限の上限値)。`account_id` は書かない(環境変数 `CLOUDFLARE_ACCOUNT_ID` で渡す)
-- **初回デプロイ前に1回だけ**、KVネームスペースを作る必要がある: `npx wrangler kv namespace create RATE_LIMIT_KV`。出力される `id` を `wrangler.toml` の `RATE_LIMIT_KV` の `id` に貼り付ける(このリポジトリでは `REPLACE_WITH_KV_NAMESPACE_ID` がプレースホルダー)
-- `package.json`: `"wrangler": "^4"`、scripts は `check`(`--dry-run`)/`deploy`/`dev`
+- KVネームスペースは **初回デプロイ前に1回だけ** 作る必要がある: `npx wrangler kv namespace create RATE_LIMIT_KV`。出力される `id` を `wrangler.toml` の `RATE_LIMIT_KV` の `id` に貼り付ける(このリポジトリでは 2026-09-21 に作成済みで、実際の `id` が入っている。フォークして別アカウントにデプロイする場合だけやり直す)
+- `typesafe/jev` は AI Gateway 経由で提供されており、課金も AI Gateway のクレジットで行われる(3.4)。アカウント側で AI Gateway の課金を有効にしていないと、デプロイは通るのに `/api/judge` だけが失敗する(`docs/HANDOFF.md` 1.3)
+- `package.json`: `"wrangler": "^4"`、scripts は `test`(`node --test`)/`check`(`--dry-run`)/`deploy`/`dev`
 - 認証: `CLOUDFLARE_API_TOKEN`(非対話)。`wrangler login` はブラウザが要るのでクラウドセッションでは使えない
 - `wrangler dev` は AI バインディングをリモート実行するため、これもトークンが要る
 
@@ -277,10 +308,11 @@ var SOLUTION = [ "534678912", "672195348", "198342567", "859761423", "426853791"
   - `RATE_LIMIT_*`: 文字列で与える(`wrangler.toml` の `[vars]` は文字列として渡ってくるため)
 - 必ず含めるテスト
   - **不変条件1**: `AI.run` に渡された `payload` が期待どおりのオブジェクトと **完全に一致する**(`deepStrictEqual`)。期待値の `note` / `instructions` / `criteria` は実装から import せず、テスト側に意図的に複製して持つ(`state` に何かが足されたら落ちるようにするため)。加えて `JSON.stringify` した文字列に `SOLUTION` の9行のどれも含まれていないこと
-  - **不変条件7**: `src/index.js` のソースを読み、`PAGE_HTML` のテンプレートリテラルの外に `SOLUTION` という文字列が現れない。閉じバッククォートは「ファイル最後のバッククォート」とし、その後ろが `;` と空白だけであること(= `PAGE_HTML` が最後の宣言であること。3.5)も併せて検査する
+  - **不変条件7**: `src/index.js` のソースを読み、`PAGE_HTML` のテンプレートリテラルの外に `SOLUTION` という文字列が現れない。開きバッククォートは「**行頭の** `var PAGE_HTML = \`` の宣言」とし、その文字列がファイル中に1つしか無いことも確認する(コメント中の同じ文字列を拾って切り出し範囲がずれると検査が無効になるため)。閉じバッククォートは「ファイル最後のバッククォート」とし、その後ろが `;` と空白だけであること(= `PAGE_HTML` が最後の宣言であること。3.5)も併せて検査する
   - content-type: `text/plain` や content-type 無しのリクエストが 415 になり、`AI.run` もKVも触られないこと
   - 入力検証: 3.3 の各項目について 400 になること(対象マスが空でない場合を含む)。正常入力で 200 と9キーの `probabilities` が返ること
   - レート制限: IP上限・全体上限それぞれの超過で 429 と `Retry-After` / `X-RateLimit-Scope` が返ること。全体超過時にKVへ書き込まず、IP単位のキーを読みもしないこと。`Retry-After` が `(bucket+1)*window - now` であること。KVのカウンタが壊れていれば超過扱いになること。KV が無ければ通ること(フェイルオープン)。KVの `get` / `put` が例外を投げれば 503 になり `AI.run` が呼ばれないこと(フェイルクローズ)。`[vars]` の値が反映され、紛らわしい表記が既定値に落ちること
-  - `AI.run` が例外を投げる / `answers.digit` が無い / `answers.digit` の形が 3.3 の条件を満たさない場合に 502 になること
+  - `AI.run` が例外を投げる / `answers.digit` が無い(ラッパーの有無どちらでも)/ `state` が `"Completed"` でない / `answers.digit` の形が 3.3 の条件を満たさない場合に 502 になること
+  - ラッパー付き(3.4 の実測形式)とラッパー無し(素の `{ model, answers, usage }`)の **どちらでも** 200 になること。`confidence` は Jev の値がそのまま返り、`probabilities[choice]` に差し替えられていないこと
   - `GET /` が `text/html; charset=utf-8` と 7 章のセキュリティヘッダーを返し、それ以外のパスが 404 であること
 - CI(`.github/workflows/ci.yml`)は push と PR で `npm ci` → `npm test` → `npm run check` を実行する。`check` は `wrangler deploy --dry-run` で、認証なしで動く

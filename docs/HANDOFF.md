@@ -6,14 +6,14 @@
 
 ## 1. 人間にしかできない作業(未完了なら最初に依頼する)
 
-Worker アプリ自体は `wrangler deploy` が自動で作るので、Cloudflare のダッシュボードで「アプリを作る」操作は不要。GUI が必要なのは次の3つ(1.1〜1.3)。KV ネームスペース(1.4)はトークンが揃えば Claude Code 側で作れる。
+Worker アプリ自体は `wrangler deploy` が自動で作るので、Cloudflare のダッシュボードで「アプリを作る」操作は不要。GUI が必要なのは 1.1〜1.3(Cloudflare ダッシュボードと Claude Code の環境設定)と 1.5(GitHub の設定)。KV ネームスペース(1.4)だけはトークンが揃えば Claude Code 側で作れる。
 
 | 作業 | 状態 |
 |---|---|
-| 1.1 API トークンと Account ID を取得 | 未 |
-| 1.2 workers.dev サブドメインを登録 | 未 |
-| 1.3 Claude Code のクラウド環境に環境変数を設定 | 未 |
-| 1.4 KV ネームスペース `RATE_LIMIT_KV` を作成し `wrangler.toml` の `id` を置換 | 未 |
+| 1.1 API トークンと Account ID を取得 | 済(2026-09-21) |
+| 1.2 workers.dev サブドメインを登録 | 済(2026-09-21) |
+| 1.3 Claude Code のクラウド環境にトークンと環境変数を設定 | 済(2026-09-21) |
+| 1.4 KV ネームスペース `RATE_LIMIT_KV` を作成し `wrangler.toml` の `id` を置換 | 済(2026-09-21) |
 | 1.5 デフォルトブランチを `main` にする | 未 |
 
 ### 1.1 API トークンと Account ID(Cloudflare ダッシュボード)
@@ -31,19 +31,28 @@ Workers & Pages → Overview の右側に「Your subdomain」が無ければ「S
 
 ### 1.3 Claude Code のクラウド環境(claude.ai/code → Settings → Environments)
 
-このリポジトリ用の環境に次を追加する。
+2026-09-21 に次の形で設定し、これで通ることを実環境で確認した。**環境変数にトークンの実物を入れない**のがポイント。
+
+1. **トークンは「API 認証情報」として登録する**。環境設定の API 認証情報(API credentials)に、ホスト `*.cloudflare.com` 宛ての Bearer トークンとして 1.1 のトークンを登録する。こうするとセッションのプロキシがリクエストに注入してくれるので、セッション自身(= Claude Code)はトークンの値を一度も見ない
+2. **環境変数** は次の3つだけ:
 
 ````text
-CLOUDFLARE_API_TOKEN=<1.1 のトークン>
+CLOUDFLARE_API_TOKEN=placeholder
 CLOUDFLARE_ACCOUNT_ID=<1.1 の Account ID>
 WRANGLER_SEND_METRICS=false
 ````
 
-ネットワークポリシーが制限付きなら `api.cloudflare.com` と `*.cloudflare.com` を許可する(遮断されていると `wrangler deploy` / `wrangler kv` が動かない)。
+`CLOUDFLARE_API_TOKEN` はダミーの文字列でよい。wrangler は「トークンが設定されていない」と非対話実行を拒否するので、その判定を通すためだけに置く。実際の認証は 1 のプロキシ注入で行われる。
+
+3. **ネットワーク(egress)の許可リスト** に次を入れる。
+   - `api.cloudflare.com` / `*.cloudflare.com` — 無いと `wrangler deploy` / `wrangler kv` が動かない
+   - `*.workers.dev` — デプロイした Worker を `curl` で動作確認するのに要る(`CLAUDE.md` 作業ルール5)
+
+4. **AI Gateway の課金を有効にする**。`typesafe/jev` は Workers AI のニューロンではなく **AI Gateway のクレジット** で課金される(`docs/DESIGN.md` 3.4)。ダッシュボード → AI → AI Gateway で課金を有効にしていないと、デプロイは通るのに `/api/judge` だけが失敗する。
 
 ### 1.4 KV ネームスペース
 
-1.3 が済んだ新しいセッションで Claude Code が `npx wrangler kv namespace create RATE_LIMIT_KV` を実行し、出力された `id` を `wrangler.toml` の `RATE_LIMIT_KV` の `id`(プレースホルダー `REPLACE_WITH_KV_NAMESPACE_ID`)に書いてコミットする。`id` は秘密ではない。GUI でやる場合は Workers & Pages → KV → 「Create a namespace」で `RATE_LIMIT_KV` を作り、表示された ID を Claude Code に伝える。
+2026-09-21 に `npx wrangler kv namespace create RATE_LIMIT_KV` を実行し、出力された `id` を `wrangler.toml` の `RATE_LIMIT_KV` の `id` に書き込み済み(`id` は秘密ではないのでコミットしてよい)。作り直す場合は GUI なら Workers & Pages → KV → 「Create a namespace」で `RATE_LIMIT_KV` を作り、表示された ID を `wrangler.toml` に反映する。
 
 注意: Workers **Free** プランの KV は書き込み 1,000 回/日。1 判定で 2 回書くので 1 日約 500 判定(数独 1 問 ≈ 78 判定なので約 6 回分)が上限になる。足りなければ Workers Paid にする。
 
@@ -101,7 +110,9 @@ GitHub → Settings → General → Default branch → 鉛筆アイコン → `m
 ## 6. 現在地
 
 - 2026-09-21: ドキュメント(SPEC / DESIGN / CLAUDE / HANDOFF)を整備。v0.1 の実装を Issue に分割して着手
-- 未着手の人間作業: 1 章の3つすべて
+- 2026-09-21: 人間作業 1.1〜1.4 が完了。KV ネームスペースを作成して `wrangler.toml` に反映し、初回デプロイを実施(https://sudoku-calibration-check.takashi-kono-rb.workers.dev)。`GET /` はフロントエンドの Issue が入るまで「実装中」の仮ページ
+- 2026-09-21: **Jev を実環境で初めて検証**。レスポンスが AI Gateway のラッパー(`{ state, result, gatewayMetadata }`)で返ってくることが判明し、`handleJudge` と `docs/DESIGN.md` 3.4 / `docs/SPEC.md` 4・5章を実測に合わせて修正。併せて分かったこと: `confidence` は `probabilities[choice]` と一致しない / 1 判定あたり約 670 入力トークン / Worker 経由のレイテンシは 1.0〜1.7 秒 / 同じ入力でも `choice` が揺れる(決定的でない)
+- 残っている人間作業: 1.5(デフォルトブランチを `main` にする)のみ
 
 ## 7. 次のセッションで貼るプロンプト
 
