@@ -150,6 +150,30 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 
 200 を返すのは Jev の回答が期待どおりの形だったときだけ。`answers.digit` が無い、AI Gateway の `state` が `"Completed"` でない、`probabilities` のキーが `"1"`〜`"9"` の9個でない、値が数値でない、`choice` がそのいずれでもない、`confidence` が数値でない、のいずれかなら 502 とし、`raw` に受け取った生レスポンスを添える。`answers` は実環境ではラッパーの中(`result.answers`)に入っている(`docs/DESIGN.md` 3.4)。
 
+### `GET /api/status`
+
+レート制限の残り回数を **読むだけ** で返す(7章の拡張5の最小版)。カウンタは `peek` でしか触らないので、この呼び出し自体は回数に数えられず、残数も減らない。
+
+レスポンス(200):
+
+````json
+{
+  "window_seconds": 3600,
+  "resets_in": 1847,
+  "global": { "max": 500, "used": 34, "remaining": 466 },
+  "ip": { "max": 30, "used": 6, "remaining": 24 }
+}
+````
+
+- `window_seconds` / `global.max` / `ip.max`: `wrangler.toml` の `[vars]` の値(`/api/judge` と同じ読み方)
+- `resets_in`: 現在の固定ウィンドウが終わるまでの秒数(429 の `Retry-After` と同じ式)
+- `ip`: 呼び出し元の `CF-Connecting-IP`(無ければ `unknown`)の分
+- `remaining` は `max(0, max - used)`
+- `Cache-Control: no-store` を付ける(残数は数秒で変わる)。CORS ヘッダーは付けない
+- `RATE_LIMITER` バインディングが無い(フェイルオープン中)ときは、数えていないので残数も無い。200 で `{ "rate_limit": "disabled" }` を返す
+- カウンタの呼び出しが失敗したときは 503 と `Retry-After: 60`(`/api/judge` のフェイルクローズと同じ扱い): `{ "error": "レート制限の状態を取得できません" }`
+- `GET` のみ。`POST /api/status` は 404
+
 ### `GET /`
 
 フロントエンド一式(HTML)を `text/html; charset=utf-8` で返す。それ以外のパスは 404。CORS ヘッダーは付けない(他サイトから `/api/judge` を呼ばせない)。
@@ -188,4 +212,4 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 2. **集計ビュー**: 複数回の実行結果を集め、確信度の帯ごとの実際の正解率(信頼度較正図)を表示
 3. **Claude API連携**: Jevに続く比較対象として、Anthropic Claude APIを追加する。モデル選択と、reasoning(拡張思考)のon/offを切り替えられるようにする。BYOK方式(利用者自身のAPIキーをブラウザのlocalStorageに保存し、ブラウザから直接Claude APIを呼ぶ。ClaudeはCORS対応済みなのでサーバー側でのキー中継が不要)。OpenAI・Grok等への対応は現時点では対象外(必要になったら誰かがフォークして追加すればよい。MITライセンス)
 4. **ログ異常検知への転用**: `digit` の Choice を `is_anomaly` の Noul などに差し替え、ホームラボのログを流す
-5. **管理用の簡易ダッシュボード**: 直近のレート制限ヒット状況や残り回数を確認できる画面(現状は `X-RateLimit-Remaining-*` ヘッダーと Cloudflare ダッシュボードの Durable Object 参照で代用)
+5. **管理用の簡易ダッシュボード**: 直近のレート制限ヒット状況や残り回数を確認できる画面。**最小版として `GET /api/status`(残り回数を読むだけで返す。4章)を実装済み**(Issue #18)。画面(ヒット状況の履歴やグラフ)は未実装で、現状は `/api/status`・`X-RateLimit-Remaining-*` ヘッダー・Cloudflare ダッシュボードの Durable Object 参照で代用

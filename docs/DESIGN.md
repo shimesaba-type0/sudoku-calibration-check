@@ -43,11 +43,14 @@ export default {
   async fetch(request, env) {
     var url = new URL(request.url);
     if (url.pathname === "/api/judge" && request.method === "POST") return handleJudge(request, env);
+    if (url.pathname === "/api/status" && request.method === "GET") return readRateLimitStatus(request, env);
     if (url.pathname === "/" && request.method === "GET") return new Response(PAGE_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
     return new Response("Not found", { status: 404 });
   },
 };
 ````
+
+`GET /api/status` は `readRateLimitStatus(request, env)`(3.2)。レート制限のカウンタを `peek` だけで読んで残り回数を返す。判定はしないので `AI.run` は呼ばない(SPEC 4章)。
 
 ### 3.2 `checkRateLimit(request, env)`
 
@@ -66,6 +69,8 @@ IP単位・全体、の2段構えの固定ウィンドウ・レート制限。`h
 - **バインディングの有無と、カウンタの障害は区別する**
   - `env.RATE_LIMITER` が無い → 何もチェックせず `{ allowed:true, headers:{} }`(フェイルオープン。`wrangler dev` など Durable Object 未設定の環境でアプリ自体が動かなくなるのを防ぐ)
   - バインディングはあるのに呼び出しが例外を投げる / 非2xx を返す / 応答の形が違う → **フェイルクローズ**。`console.error` でログを残し、`{ allowed:false, scope:"counter", reason:"レート制限の記録に失敗しました。しばらくしてから再試行してください", headers:{ "Retry-After": "60" } }` を返す。`handleJudge` はこれを 503 にする。回数を数えられない状態で Workers AI を呼ぶと、コストの上限が外れてしまうため
+
+- **状態の読み取り(`readRateLimitStatus` / `GET /api/status`)は `peek` のみ**。全体と呼び出し元 IP のカウンタを読むだけで加算せず(残数を見るために残数を減らさない)、ウィンドウ幅・上限・バケット計算は `checkRateLimit` と同じヘルパー(`currentWindow` / `clientIp` / `readLimit`)を共有する。バインディングが無ければ `{ rate_limit: "disabled" }`、カウンタの障害は 503 + `Retry-After: 60` と、`checkRateLimit` の区別をそのまま踏襲する(SPEC 4章)
 
 #### `RateLimitCounter`(Durable Object)
 
