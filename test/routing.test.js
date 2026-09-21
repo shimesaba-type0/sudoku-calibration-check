@@ -21,7 +21,10 @@ test("GET / は HTML をセキュリティヘッダー付きで返す", async ()
 
   var html = await res.text();
   assert.ok(html.includes("数独キャリブレーションチェック"));
-  assert.ok(html.includes("実装中"));
+  // Issue #3 でフロントエンド(PAGE_HTML)を実装。「実装中」のプレースホルダーの代わりに、
+  // 実際のUIが返す判定パネル・実行ボタンのマーカーで存在を確認する。
+  assert.ok(html.includes("判定パネル"));
+  assert.ok(html.includes('data-action="run"'));
   assert.ok(html.includes("var GIVEN ="));
   assert.equal(env.aiCalls.length, 0);
 });
