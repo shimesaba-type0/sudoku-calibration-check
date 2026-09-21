@@ -1,6 +1,6 @@
 // テスト用のモック env とヘルパー(docs/DESIGN.md 10章)。
-// node --test は test/ 配下のファイルをすべてテストファイルとして読み込むため、
-// このファイルにはテストを書かない(0件で成功扱いになる)。
+// `npm test` は `node --test "test/**/*.test.js"` なので、このファイル自体は
+// テストファイルとしては拾われない(各 *.test.js から import して使う)。
 
 export var GIVEN = [
   "53..7....",
@@ -53,24 +53,52 @@ export function jevResponse() {
   };
 }
 
-/** Map ベースの KV スタブ。put の expirationTtl も記録する。 */
-export function makeKV(initial) {
+/**
+ * Map ベースの KV スタブ。
+ *
+ * - `gets` に読んだキー、`puts` に書いたキー・値・options を順に記録する
+ *   (「全体超過なら IP のキーを読まない」「超過なら書かない」の確認に使う)
+ * - `initial` のキーは末尾に `*` を付けると前方一致のシードになる。
+ *   レート制限のキーにはバケット番号(現在時刻依存)が入るため、テスト側で
+ *   バケットを計算すると境界をまたいだ瞬間に落ちる。`{"rl:global:*": 5}` の形で
+ *   シードしておけば、どのバケットになっても同じ値が読める。
+ * - `failOn` に `"get"` / `"put"` を渡すと、その操作で例外を投げる(KV 障害の再現)
+ */
+export function makeKV(initial, failOn) {
   var store = new Map();
+  var prefixes = [];
   if (initial) {
-    for (var key in initial) store.set(key, String(initial[key]));
+    for (var key in initial) {
+      if (key.endsWith("*")) prefixes.push({ prefix: key.slice(0, -1), value: String(initial[key]) });
+      else store.set(key, String(initial[key]));
+    }
   }
+  var gets = [];
   var puts = [];
   return {
     store: store,
+    gets: gets,
     puts: puts,
     async get(key) {
-      return store.has(key) ? store.get(key) : null;
+      gets.push(key);
+      if (failOn === "get") throw new Error("KV get failed");
+      if (store.has(key)) return store.get(key);
+      for (var i = 0; i < prefixes.length; i++) {
+        if (key.startsWith(prefixes[i].prefix)) return prefixes[i].value;
+      }
+      return null;
     },
     async put(key, value, options) {
       puts.push({ key: key, value: value, options: options });
+      if (failOn === "put") throw new Error("KV put failed");
       store.set(key, String(value));
     },
   };
+}
+
+/** `rl:global:<bucket>` / `rl:ip:<ip>:<bucket>` からバケット番号を取り出す。 */
+export function bucketFromKey(key) {
+  return Number(key.slice(key.lastIndexOf(":") + 1));
 }
 
 /**
@@ -109,13 +137,18 @@ export function validBody(overrides) {
   return body;
 }
 
-export function judgeRequest(body, ip) {
+/**
+ * POST /api/judge のリクエストを組み立てる。
+ * contentType に null を渡すと content-type ヘッダーの無いリクエストになる
+ * (文字列ボディだと fetch 仕様で text/plain が自動で付くので Blob を使う)。
+ */
+export function judgeRequest(body, ip, contentType) {
+  var serialized = typeof body === "string" ? body : JSON.stringify(body);
+  var headers = { "CF-Connecting-IP": ip || "203.0.113.1" };
+  if (contentType !== null) headers["content-type"] = contentType || "application/json";
   return new Request("https://example.com/api/judge", {
     method: "POST",
-    headers: {
-      "content-type": "application/json",
-      "CF-Connecting-IP": ip || "203.0.113.1",
-    },
-    body: typeof body === "string" ? body : JSON.stringify(body),
+    headers: headers,
+    body: contentType === null ? new Blob([serialized]) : serialized,
   });
 }

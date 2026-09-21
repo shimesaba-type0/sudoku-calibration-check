@@ -9,7 +9,7 @@ Cloudflare Workers 1つで完結し、ビルドステップはありません。
 
 ## 必要なもの
 
-- Node.js 20 以上
+- Node.js 22 以上
 - Cloudflare アカウント(Workers AI と Workers KV を使います)
 
 ## セットアップ
@@ -69,11 +69,11 @@ npm run deploy
 
 | パス | メソッド | 説明 |
 | --- | --- | --- |
-| `/` | GET | フロントエンド一式(HTML) |
+| `/` | GET | フロントエンド一式(HTML)。**現時点では「実装中」と表示するだけの仮ページ**で、本格的なUIは別 Issue で入ります |
 | `/api/judge` | POST | 盤面と対象マスを受け取り、`{ probabilities, choice, confidence }` を返す |
 
-それ以外のパスは 404 です。CORS ヘッダーは付けていないため、他サイトのページからは
-`/api/judge` を呼べません。
+それ以外のパスは 404 です。`/api/judge` は `content-type: application/json` 以外を 415 で
+弾き、CORS ヘッダーも付けていないため、他サイトのページからは呼べません。
 
 ## レート制限
 

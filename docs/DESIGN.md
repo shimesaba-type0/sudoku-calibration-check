@@ -55,26 +55,37 @@ IP単位・全体、の2段構えの固定ウィンドウ・レート制限。`h
 
 - ウィンドウ幅 `windowSeconds`、IP単位上限 `perIpMax`、全体上限 `globalMax` は `env.RATE_LIMIT_WINDOW_SECONDS` / `env.RATE_LIMIT_PER_IP_MAX` / `env.RATE_LIMIT_GLOBAL_MAX` から読む(それぞれ既定 3600 / 30 / 500)
 - 現在時刻を `windowSeconds` で割った商を `bucket` とし、`rl:global:<bucket>` と `rl:ip:<ip>:<bucket>` の2つのKVキーでカウントする(固定ウィンドウ方式。ウィンドウの境界をまたぐ攻撃には多少甘いが、実装が単純で十分)
-- 先に **全体** を見て、超過していれば即座に `{ allowed:false, reason, headers }` を返す(全体超過ならIP単位のチェックやKV書き込みをする意味が無いため)
-- 次に **IP単位** を見て、超過していれば同様に拒否
-- どちらも下回っていれば、両方のキーを +1 して `expirationTtl: windowSeconds + 60` で書き込み、`{ allowed:true, headers }` を返す。TTLをウィンドウ幅より60秒長くしているのは、次のバケットの書き込みと若干重なっても古いキーが自然に消えるようにするため
-- `env.RATE_LIMIT_KV` が無ければ何もチェックせず `{ allowed:true, headers:{} }`(フェイルオープン。`wrangler dev` などKV未設定の環境でアプリ自体が動かなくなるのを防ぐ)
+- 戻り値は `{ allowed, scope?, reason?, headers }`。`scope` は拒否したときだけ入り、`"global"` / `"ip"` / `"kv"` のいずれか。`handleJudge` は `"kv"` を 503、それ以外を 429 に対応づける
+- 先に **全体** を見て、超過していれば即座に `{ allowed:false, scope:"global", reason, headers }` を返す(全体超過ならIP単位のチェックやKV書き込みをする意味が無いため、IP単位のキーは読みもしない)
+- 次に **IP単位** を見て、超過していれば同様に `scope:"ip"` で拒否
+- どちらも下回っていれば、両方のキーを +1 して `expirationTtl: windowSeconds + 60` で `Promise.all` で並行に書き込み、`{ allowed:true, headers }` を返す。TTLをウィンドウ幅より60秒長くしているのは、次のバケットの書き込みと若干重なっても古いキーが自然に消えるようにするため
+- `[vars]` の値は **10進整数の文字列としてそのまま読めて1以上のときだけ** 採用し、それ以外(空文字・`" 30 "`・`"1e3"`・`"0x10"`・`"0"` など)は既定値に落とす。緩い数値変換をすると、書き間違いで上限が 0(全面停止)や想定外の値になる
+- KVに入っていたカウンタが10進整数として読めない場合は **上限超過として扱う**(フェイルクローズ)。数えられないまま AI を呼ぶよりは止める
+- **バインディングの有無と、KVの障害は区別する**
+  - `env.RATE_LIMIT_KV` が無い → 何もチェックせず `{ allowed:true, headers:{} }`(フェイルオープン。`wrangler dev` などKV未設定の環境でアプリ自体が動かなくなるのを防ぐ)
+  - バインディングはあるのに `get` / `put` が例外を投げる → **フェイルクローズ**。`console.error` でログを残し、`{ allowed:false, scope:"kv", reason:"レート制限の記録に失敗しました。しばらくしてから再試行してください", headers:{ "Retry-After": "60" } }` を返す。`handleJudge` はこれを 503 にする。回数を数えられない状態で Workers AI を呼ぶと、コストの上限が外れてしまうため
 - KVは強い一貫性を持たないので、同時に大量のリクエストが来た際に多少のオーバーカウント/アンダーカウントは起こり得る。このアプリの目的(コストの青天井を防ぐ大まかな安全弁)には十分な精度と判断し、Durable Objectsのような厳密な実装は採用しない
 
 ### 3.3 `handleJudge(request, env)`
 
-0. `checkRateLimit` を呼び、`allowed:false` なら 429 を返す(`error` に理由、レスポンスヘッダーに `Retry-After` と `X-RateLimit-Scope`)
-1. `request.json()` → 失敗なら 400
-2. 入力を検証し、不備なら 400 を返す。検証項目は次の通り
+0. `content-type` ヘッダーが `application/json` で始まらなければ 415(`{ "error": "content-type は application/json である必要があります" }`)。**レート制限より前**に行う。これは 7 章のクロスサイト対策の要なので外さない
+1. `checkRateLimit` を呼ぶ。`allowed:false` かつ `scope` が `"ip"` / `"global"` なら 429(`error` に理由、レスポンスヘッダーに `Retry-After` と `X-RateLimit-Scope`)、`scope` が `"kv"` なら 503(`error` に理由、`Retry-After: 60`)
+2. `request.json()` → 失敗なら 400
+3. 入力を検証し、不備なら 400 を返す。検証項目は次の通り
    - `puzzle` が長さ9の配列で、各要素が9文字の文字列。文字は `1`〜`9` と `.` のみ
    - `target.row` / `target.col` が 0〜8 の整数
    - `puzzle` の与えられたマス(`GIVEN`)が改変されていない(与えられた数字がそのまま入っている)
    - `target` が `GIVEN` の空マスである(与えられたマスを判定対象にしない)
+   - `puzzle` の `target` のマスが `.`(空)である。再判定のときも対象マスの前回の推測は消して送る(アンカリング回避。4.2 `buildSnapshot`・SPEC F3)
    - `GIVEN` は秘密ではないので Worker 側にも持つ。`SOLUTION` は持たない(1 章・10 章)
-3. `criteria` を `{ "1": "the digit 1", ..., "9": "the digit 9" }` として生成
-4. `env.AI.run("typesafe/jev", { state, questions })` を呼ぶ
-5. `result.answers.digit` が無ければ 502(`raw` に生レスポンスを添えて返す。デバッグ用)
-6. `{ probabilities, choice, confidence }` に絞って 200 で返す。レスポンスヘッダーに `X-RateLimit-Remaining-IP` / `X-RateLimit-Remaining-Global`(その時点の残り回数)を付ける
+4. `criteria` を `{ "1": "the digit 1", ..., "9": "the digit 9" }` として生成
+5. `env.AI.run("typesafe/jev", { state, questions })` を呼ぶ。例外は 502(`raw` に例外メッセージを200文字まで入れ、`console.error` でログを残す)
+6. 返ってきた `result.answers.digit` を検証し、次のどれかを満たさなければ 502(`raw` に生レスポンスを添えて返す。デバッグ用)
+   - `answers.digit` が存在し、オブジェクトである
+   - `probabilities` がオブジェクトで、キーがちょうど `"1"`〜`"9"` の9個。値はすべて有限の数値
+   - `choice` が文字列で、`"1"`〜`"9"` のいずれか
+   - `confidence` が有限の数値
+7. `{ probabilities, choice, confidence }` に絞って 200 で返す。レスポンスヘッダーに `X-RateLimit-Remaining-IP` / `X-RateLimit-Remaining-Global`(その時点の残り回数)を付ける
 
 `state` はオブジェクトで渡す(Jev は string / object / array を受け付ける):
 
@@ -135,6 +146,8 @@ await env.AI.run("typesafe/jev", {
 
 バッククォート付きテンプレートリテラルにHTML全体を格納。中で `${...}` は使っていない(素のHTMLを埋めているだけ)ので、テンプレート内のJSで `${}` を書く必要が出たら `\${}` とエスケープすること。
 
+`PAGE_HTML` は **`src/index.js` の最後の宣言に固定する**。不変条件7のテスト(10 章)は「ファイル最後のバッククォート = テンプレートの閉じ」と見なして外側のソースを切り出し、その後ろに `;` と空白しか無いことも併せて検査する。ここに何かを足すと検査が無効になるので、新しいコードは `PAGE_HTML` より前に書く。
+
 ## 4. フロントエンド設計(`PAGE_HTML` 内の `<script>`)
 
 ### 4.1 状態
@@ -163,7 +176,7 @@ var pendingCommit = null;       // API結果を受けて確定待ちの1件
 
 | 関数 | 責務 |
 |---|---|
-| `buildSnapshot()` | `GIVEN` + `state.values`(正誤問わず)から9行の文字列配列を作る。未確定は `.` |
+| `buildSnapshot()` | `GIVEN` + `state.values`(正誤問わず)から9行の文字列配列を作る。未確定は `.`。**判定対象のマスだけは `.` にして送る(他のマスの過去の推測は正誤問わず残す)**。Worker 側も 3.3 でこれを検証する |
 | `judgeCell(r,c)` | `/api/judge` を `fetch`。非2xxは `Error` にして投げる |
 | `focusNext()` | `queue` から1つ取り出しフォーカス→`judgeCell`→バー表示→(待ち)→`commitFocused`→(待ち)→再帰。`queue` が空なら `finalizeRound` |
 | `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong` を更新 |
@@ -218,11 +231,11 @@ var SOLUTION = [ "534678912", "672195348", "198342567", "859761423", "426853791"
 ## 7. セキュリティ・運用上の注意
 
 - `/api/judge` は認証なしだが、F6のレート制限(IP単位30回/時・全体500回/時、既定値)でコストの上限を確保している。値は `wrangler.toml` の `[vars]` で調整可能
-- 上限を緩める(数値を大きくする、または `RATE_LIMIT_KV` バインディングを外す)と、フェイルオープンの設計上、制限なしで動いてしまう。**理由なく緩めない**
-- 入力は `puzzle` の長さと `target` の型しか見ていない。文字列の中身は Jev に渡るだけで実行されないので、現状は害はない
+- 上限を緩める(数値を大きくする、または `RATE_LIMIT_KV` バインディングを外す)と、コストの上限が無くなる。特にバインディングを外すとフェイルオープンの設計上、制限なしで動いてしまう(KVが一時的に落ちた場合は 3.2 のとおりフェイルクローズで 503)。**理由なく緩めない**
 - リポジトリには秘密情報を置かない。`account_id` も置かない
-- `/api/judge` には CORS ヘッダーを付けない。`content-type: application/json` の POST はブラウザではプリフライトが必要で、CORS ヘッダーが無ければ他サイトのページからは呼べない(第三者のサイトに埋め込まれてコストを消費される経路を塞ぐ)。`curl` 等からの直接アクセスはレート制限で頭打ちにする
+- `/api/judge` には CORS ヘッダーを付けない。加えて **`content-type` が `application/json` で始まらないリクエストは 415 で弾く**(`handleJudge` の最初、レート制限より前)。この2つはセットで意味を持つ: `application/json` の POST はブラウザで必ずプリフライトが必要になり、CORS ヘッダーを返していないのでプリフライトが通らず、他サイトのページからは呼べない。一方 `text/plain` などプリフライト不要の content-type はフォーム送信等でクロスサイトに投げられてしまうため、415 で入口を閉じる(第三者のサイトに埋め込まれて Workers AI のコストを消費される経路を塞ぐ)。`curl` 等からの直接アクセスはレート制限で頭打ちにする
 - `GET /` のレスポンスには `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、`Content-Security-Policy: frame-ancestors 'none'` を付ける(クリックジャッキング対策。インラインスクリプトを使うため、それ以上の CSP はかけない)
+- 3.3 の検証を通った盤面文字列だけが Jev に渡る(形式・`GIVEN` との一致・対象マスが空であることまで見る)
 - `SOLUTION` は Wikipedia の例題の答えなので秘密ではない。守るべきは「Jev に渡る `state` に `SOLUTION` が混ざらないこと」であり、そのために `SOLUTION` をブラウザ用スクリプトの中にだけ置き、Worker の判定コードから構造的に隔離する(8 章)
 
 ## 8. 設計上の判断と理由
@@ -259,13 +272,15 @@ var SOLUTION = [ "534678912", "672195348", "198342567", "859761423", "426853791"
 - `src/index.js` を ES Module として import し、`default.fetch(request, env)` をモックの `env` で直接呼ぶ。Node 22 のグローバル `Request` / `Response` をそのまま使う
 - モック `env`
   - `AI.run(model, payload)`: 呼び出しを記録し、3.4 の形式の固定レスポンスを返す。失敗や異常な形を返すケースも用意する
-  - `RATE_LIMIT_KV`: `Map` ベースの `get` / `put`(`expirationTtl` は記録だけ)
+  - `RATE_LIMIT_KV`: `Map` ベースの `get` / `put`(読んだキー・書いたキー・`expirationTtl` を記録する)。`get` / `put` が例外を投げるモードも用意する
+    - レート制限のキーにはバケット番号(現在時刻依存)が入る。テスト側でバケットを計算するとウィンドウ境界をまたいだ瞬間に落ちるので、**シードは前方一致で行い、検証は実際に読み書きされたキーからバケットを取り出して行う**
   - `RATE_LIMIT_*`: 文字列で与える(`wrangler.toml` の `[vars]` は文字列として渡ってくるため)
 - 必ず含めるテスト
-  - **不変条件1**: `AI.run` に渡された `payload` を `JSON.stringify` した文字列に、`SOLUTION` の9行のどれも含まれていない。かつ `payload.state` のキーが `puzzle` / `target` / `note` だけである
-  - **不変条件7**: `src/index.js` のソースを読み、`PAGE_HTML` のテンプレートリテラルの外に `SOLUTION` という文字列が現れない
-  - 入力検証: 3.3 の各項目について 400 になること。正常入力で 200 と9キーの `probabilities` が返ること
-  - レート制限: IP上限・全体上限それぞれの超過で 429 と `Retry-After` / `X-RateLimit-Scope` が返ること。全体超過時にKVへ書き込まないこと。KV が無ければ通ること。`[vars]` の値が反映されること
-  - `AI.run` が例外を投げる / `answers.digit` が無い場合に 502 になること
+  - **不変条件1**: `AI.run` に渡された `payload` が期待どおりのオブジェクトと **完全に一致する**(`deepStrictEqual`)。期待値の `note` / `instructions` / `criteria` は実装から import せず、テスト側に意図的に複製して持つ(`state` に何かが足されたら落ちるようにするため)。加えて `JSON.stringify` した文字列に `SOLUTION` の9行のどれも含まれていないこと
+  - **不変条件7**: `src/index.js` のソースを読み、`PAGE_HTML` のテンプレートリテラルの外に `SOLUTION` という文字列が現れない。閉じバッククォートは「ファイル最後のバッククォート」とし、その後ろが `;` と空白だけであること(= `PAGE_HTML` が最後の宣言であること。3.5)も併せて検査する
+  - content-type: `text/plain` や content-type 無しのリクエストが 415 になり、`AI.run` もKVも触られないこと
+  - 入力検証: 3.3 の各項目について 400 になること(対象マスが空でない場合を含む)。正常入力で 200 と9キーの `probabilities` が返ること
+  - レート制限: IP上限・全体上限それぞれの超過で 429 と `Retry-After` / `X-RateLimit-Scope` が返ること。全体超過時にKVへ書き込まず、IP単位のキーを読みもしないこと。`Retry-After` が `(bucket+1)*window - now` であること。KVのカウンタが壊れていれば超過扱いになること。KV が無ければ通ること(フェイルオープン)。KVの `get` / `put` が例外を投げれば 503 になり `AI.run` が呼ばれないこと(フェイルクローズ)。`[vars]` の値が反映され、紛らわしい表記が既定値に落ちること
+  - `AI.run` が例外を投げる / `answers.digit` が無い / `answers.digit` の形が 3.3 の条件を満たさない場合に 502 になること
   - `GET /` が `text/html; charset=utf-8` と 7 章のセキュリティヘッダーを返し、それ以外のパスが 404 であること
 - CI(`.github/workflows/ci.yml`)は push と PR で `npm ci` → `npm test` → `npm run check` を実行する。`check` は `wrangler deploy --dry-run` で、認証なしで動く

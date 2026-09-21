@@ -25,10 +25,16 @@ var GIVEN = [
 
 var DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
 
-// レート制限の既定値(wrangler.toml の [vars] が無いときだけ使う)
+// レート制限の既定値(wrangler.toml の [vars] が無い・読めないときだけ使う)
 var DEFAULT_WINDOW_SECONDS = 3600;
 var DEFAULT_PER_IP_MAX = 30;
 var DEFAULT_GLOBAL_MAX = 500;
+
+// KV 障害(フェイルクローズ)時に返す待ち時間(秒)
+var KV_FAILURE_RETRY_AFTER = 60;
+
+// 502 の raw に入れるメッセージの最大長
+var RAW_MAX_LENGTH = 200;
 
 // Jev にルールを伝えるための固定文。何を聞かれているかを誤解させないための最低限の説明。
 var NOTE =
@@ -39,6 +45,8 @@ var NOTE =
   "Standard Sudoku rules apply: every row, every column and every 3x3 box must " +
   "contain each of the digits 1 to 9 exactly once. Some of the digits already " +
   "placed may be wrong. Answer which digit belongs in the target cell.";
+
+var INSTRUCTIONS = "Which digit from 1 to 9 belongs in the target cell of this Sudoku grid?";
 
 function jsonResponse(body, status, extraHeaders) {
   var headers = { "content-type": "application/json; charset=utf-8" };
@@ -53,20 +61,28 @@ function errorResponse(message, status, extraHeaders) {
 }
 
 /**
- * [vars] は文字列で渡ってくる。1以上の整数として読めなければ既定値を使う
- * (空文字やタイプミスで上限が 0 になって全部止まる、という事故を避ける)。
+ * [vars] は文字列で渡ってくる。10進の整数として素直に読めて1以上のときだけ採用し、
+ * それ以外(空文字・"0x10"・"1e3"・" 30 " のような紛らわしい表記)は既定値に落とす。
+ * 上限が意図せず 0 や巨大な値になる事故を防ぐため、緩い数値変換はしない。
  */
 function readLimit(value, fallback) {
-  if (value === undefined || value === null || value === "") return fallback;
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return fallback;
   var parsed = Number(value);
-  if (!Number.isInteger(parsed) || parsed < 1) return fallback;
+  if (!Number.isSafeInteger(parsed) || parsed < 1) return fallback;
   return parsed;
 }
 
+/**
+ * KV に入っているカウンタの読み取り。キーが無ければ 0。
+ * 10進整数として読めない値(壊れている・改ざんされた)は「上限超過」として扱う
+ * = フェイルクローズ。カウントできないまま AI を呼ぶよりは止める。
+ */
 function readCount(value) {
+  if (value === null || value === undefined) return 0;
+  if (typeof value !== "string" || !/^\d+$/.test(value)) return Number.POSITIVE_INFINITY;
   var parsed = Number(value);
-  if (!Number.isFinite(parsed) || parsed < 0) return 0;
-  return Math.floor(parsed);
+  if (!Number.isSafeInteger(parsed) || parsed < 0) return Number.POSITIVE_INFINITY;
+  return parsed;
 }
 
 /**
@@ -74,7 +90,10 @@ function readCount(value) {
  *
  * 全体 → IP単位 の順に見て、どちらか超過していれば書き込まずに拒否する。
  * 両方下回っていたときだけ2つのカウンタを +1 する。
- * RATE_LIMIT_KV が無い環境ではフェイルオープン(制限なしで通す)。
+ *
+ * バインディングの有無で挙動が変わる:
+ * - RATE_LIMIT_KV が無い       → フェイルオープン(制限なしで通す。ローカル開発の利便性)
+ * - RATE_LIMIT_KV が例外を投げる → フェイルクローズ(scope:"kv" で拒否。handleJudge が 503)
  */
 async function checkRateLimit(request, env) {
   var kv = env && env.RATE_LIMIT_KV;
@@ -93,46 +112,59 @@ async function checkRateLimit(request, env) {
   var globalKey = "rl:global:" + bucket;
   var ipKey = "rl:ip:" + ip + ":" + bucket;
 
-  // 先に全体。超過していれば IP 単位を読む意味も書き込む意味も無い。
-  var globalCount = readCount(await kv.get(globalKey));
-  if (globalCount >= globalMax) {
+  try {
+    // 先に全体。超過していれば IP 単位を読む意味も書き込む意味も無い。
+    var globalCount = readCount(await kv.get(globalKey));
+    if (globalCount >= globalMax) {
+      return {
+        allowed: false,
+        scope: "global",
+        reason: "全体のレート制限(" + globalMax + "回/" + windowSeconds + "秒)を超えました",
+        headers: {
+          "Retry-After": String(retryAfter),
+          "X-RateLimit-Scope": "global",
+        },
+      };
+    }
+
+    var ipCount = readCount(await kv.get(ipKey));
+    if (ipCount >= perIpMax) {
+      return {
+        allowed: false,
+        scope: "ip",
+        reason:
+          "アクセス元(IP)ごとのレート制限(" + perIpMax + "回/" + windowSeconds + "秒)を超えました",
+        headers: {
+          "Retry-After": String(retryAfter),
+          "X-RateLimit-Scope": "ip",
+        },
+      };
+    }
+
+    // ウィンドウ幅より60秒長い TTL。次のバケットと多少重なっても古いキーは自然に消える。
+    var options = { expirationTtl: windowSeconds + 60 };
+    await Promise.all([
+      kv.put(globalKey, String(globalCount + 1), options),
+      kv.put(ipKey, String(ipCount + 1), options),
+    ]);
+
     return {
-      allowed: false,
-      scope: "global",
-      reason: "全体のレート制限(" + globalMax + "回/" + windowSeconds + "秒)を超えました",
+      allowed: true,
       headers: {
-        "Retry-After": String(retryAfter),
-        "X-RateLimit-Scope": "global",
+        "X-RateLimit-Remaining-IP": String(Math.max(0, perIpMax - (ipCount + 1))),
+        "X-RateLimit-Remaining-Global": String(Math.max(0, globalMax - (globalCount + 1))),
       },
     };
-  }
-
-  var ipCount = readCount(await kv.get(ipKey));
-  if (ipCount >= perIpMax) {
+  } catch (err) {
+    // バインディングはあるのに KV が使えない。回数を数えられないので通さない。
+    console.error("rate limit KV error", err);
     return {
       allowed: false,
-      scope: "ip",
-      reason:
-        "アクセス元(IP)ごとのレート制限(" + perIpMax + "回/" + windowSeconds + "秒)を超えました",
-      headers: {
-        "Retry-After": String(retryAfter),
-        "X-RateLimit-Scope": "ip",
-      },
+      scope: "kv",
+      reason: "レート制限の記録に失敗しました。しばらくしてから再試行してください",
+      headers: { "Retry-After": String(KV_FAILURE_RETRY_AFTER) },
     };
   }
-
-  // ウィンドウ幅より60秒長い TTL。次のバケットと多少重なっても古いキーは自然に消える。
-  var options = { expirationTtl: windowSeconds + 60 };
-  await kv.put(globalKey, String(globalCount + 1), options);
-  await kv.put(ipKey, String(ipCount + 1), options);
-
-  return {
-    allowed: true,
-    headers: {
-      "X-RateLimit-Remaining-IP": String(Math.max(0, perIpMax - (ipCount + 1))),
-      "X-RateLimit-Remaining-Global": String(Math.max(0, globalMax - (globalCount + 1))),
-    },
-  };
 }
 
 var CELL_PATTERN = /^[1-9.]{9}$/;
@@ -180,7 +212,60 @@ function validateInput(body) {
     return "targetは与えられたマスではなく空マスを指す必要があります";
   }
 
+  // 再判定のときも対象マス自身は空にして送る。前回の推測を Jev に見せない(アンカリング回避)。
+  if (puzzle[row][col] !== ".") {
+    return "puzzleのtargetのマスは.(空)である必要があります";
+  }
+
   return null;
+}
+
+/**
+ * Jev の回答が期待した形かを検証する(docs/DESIGN.md 3.3 step 5)。
+ * 形が違うものをそのまま 200 で返すとフロントが黙って壊れるので、502 にして raw を見せる。
+ * 問題なければ null、不備があれば日本語の理由を返す。
+ */
+function validateAnswer(answer) {
+  if (answer === null || typeof answer !== "object" || Array.isArray(answer)) {
+    return "AIの応答が予期しない形式です";
+  }
+
+  var probabilities = answer.probabilities;
+  if (
+    probabilities === null ||
+    typeof probabilities !== "object" ||
+    Array.isArray(probabilities)
+  ) {
+    return "AIの応答にprobabilitiesがありません";
+  }
+
+  var keys = Object.keys(probabilities);
+  if (keys.length !== DIGITS.length) {
+    return "AIの応答のprobabilitiesが1〜9の9キーになっていません";
+  }
+  for (var i = 0; i < DIGITS.length; i++) {
+    var digit = DIGITS[i];
+    if (!Object.prototype.hasOwnProperty.call(probabilities, digit)) {
+      return "AIの応答のprobabilitiesが1〜9の9キーになっていません";
+    }
+    if (typeof probabilities[digit] !== "number" || !Number.isFinite(probabilities[digit])) {
+      return "AIの応答のprobabilitiesに数値でない値が含まれています";
+    }
+  }
+
+  if (typeof answer.choice !== "string" || DIGITS.indexOf(answer.choice) === -1) {
+    return "AIの応答のchoiceが1〜9のいずれかではありません";
+  }
+
+  if (typeof answer.confidence !== "number" || !Number.isFinite(answer.confidence)) {
+    return "AIの応答のconfidenceが数値ではありません";
+  }
+
+  return null;
+}
+
+function truncate(text) {
+  return text.length > RAW_MAX_LENGTH ? text.slice(0, RAW_MAX_LENGTH) + "…" : text;
 }
 
 /**
@@ -188,8 +273,19 @@ function validateInput(body) {
  * 受け取った盤面だけを見て Jev に1マス分の確率を聞く。盤面も結果も保存しない。
  */
 async function handleJudge(request, env) {
+  // 0. content-type の検査。application/json 以外は 415。
+  //    これがあるおかげで他サイトからの POST は CORS プリフライトを強いられ、
+  //    CORS ヘッダーを返していない以上ブラウザに止められる(docs/DESIGN.md 7章)。
+  var contentType = request.headers.get("content-type") || "";
+  if (!contentType.toLowerCase().trim().startsWith("application/json")) {
+    return errorResponse("content-type は application/json である必要があります", 415);
+  }
+
   var rate = await checkRateLimit(request, env);
   if (!rate.allowed) {
+    if (rate.scope === "kv") {
+      return errorResponse(rate.reason, 503, rate.headers);
+    }
     return errorResponse(rate.reason, 429, rate.headers);
   }
 
@@ -221,7 +317,7 @@ async function handleJudge(request, env) {
     questions: {
       digit: {
         type: "choice",
-        instructions: "Which digit from 1 to 9 belongs in the target cell of this Sudoku grid?",
+        instructions: INSTRUCTIONS,
         criteria: criteria,
       },
     },
@@ -231,10 +327,11 @@ async function handleJudge(request, env) {
   try {
     result = await env.AI.run("typesafe/jev", payload);
   } catch (err) {
+    console.error("AI.run failed", err);
     return jsonResponse(
       {
         error: "AIの呼び出しに失敗しました",
-        raw: String((err && err.message) || err),
+        raw: truncate(String((err && err.message) || err)),
       },
       502,
       rate.headers
@@ -242,12 +339,9 @@ async function handleJudge(request, env) {
   }
 
   var answer = result && result.answers && result.answers.digit;
-  if (!answer) {
-    return jsonResponse(
-      { error: "AIの応答が予期しない形式です", raw: result },
-      502,
-      rate.headers
-    );
+  var badAnswer = answer === undefined ? "AIの応答が予期しない形式です" : validateAnswer(answer);
+  if (badAnswer !== null) {
+    return jsonResponse({ error: badAnswer, raw: result }, 502, rate.headers);
   }
 
   return jsonResponse(
@@ -283,6 +377,11 @@ export default {
 // ---------------------------------------------------------------------------
 // ブラウザ用の一式。このテンプレートリテラルの中だけが正解表を知っている。
 // テンプレート内で ${} を書く必要が出たら \${} とエスケープすること。
+//
+// PAGE_HTML はこのファイルの最後の宣言のままにすること。閉じバッククォートが
+// ファイル末尾にあることを前提に、不変条件7のテストが「テンプレートリテラルの外」を
+// 機械的に切り出している(docs/DESIGN.md 3.5・10章)。この下には何も足さない。
+//
 // 本格的なUIは別 Issue。ここでは隔離の構造だけ先に用意しておく。
 // ---------------------------------------------------------------------------
 var PAGE_HTML = `<!doctype html>
