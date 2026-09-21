@@ -9,20 +9,13 @@
  * 判定ループ・採点・周回はすべてブラウザ側にあり、この Worker はステートレス。
  */
 
-// 固定問題の初期配置(与えられたマス)。秘密ではないので入力検証のために Worker 側にも持つ。
-// 正解表はここには置かない。ブラウザ用スクリプト(PAGE_HTML の中)にだけ定義し、
+// 盤面はブラウザ側で生成される(固定問題とは限らない)ので、Worker は特定の問題を持たない。
+// 正解表も当然ここには置かない。ブラウザ用スクリプト(PAGE_HTML の中)にだけ定義し、
 // 判定コードから構造的に隔離する(docs/DESIGN.md 9章 不変条件7)。
-var GIVEN = [
-  "53..7....",
-  "6..195...",
-  ".98....6.",
-  "8...6...3",
-  "4..8.3..1",
-  "7...2...6",
-  ".6....28.",
-  "...419..5",
-  "....8..79",
-];
+
+// 一意解を持つ数独の最小ヒント数(McGuire et al. 2012 で 17 と証明されている)。
+// これ未満の盤面は数独として成立しないので受け付けない。
+var MIN_FILLED_CELLS = 17;
 
 var DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
 
@@ -374,22 +367,23 @@ function validateInput(body) {
     return "target.rowとtarget.colは0〜8の整数である必要があります";
   }
 
-  for (var gr = 0; gr < 9; gr++) {
-    for (var gc = 0; gc < 9; gc++) {
-      var given = GIVEN[gr][gc];
-      if (given !== "." && puzzle[gr][gc] !== given) {
-        return "puzzleの与えられたマスが書き換えられています";
-      }
-    }
-  }
-
-  if (GIVEN[row][col] !== ".") {
-    return "targetは与えられたマスではなく空マスを指す必要があります";
-  }
-
+  // 対象マスは必ず空。判定対象のマスに数字が入っていたら、そのマスは聞く必要がない。
   // 再判定のときも対象マス自身は空にして送る。前回の推測を Jev に見せない(アンカリング回避)。
   if (puzzle[row][col] !== ".") {
     return "puzzleのtargetのマスは.(空)である必要があります";
+  }
+
+  // 埋まっているマスが少なすぎる盤面は数独として成立しない。
+  // なお行・列・箱の矛盾は検証しない。不正解の推測を正誤問わず残して送る設計なので、
+  // 矛盾した盤面が来るのは正常な状態(docs/DESIGN.md 3.3)。
+  var filled = 0;
+  for (var fr = 0; fr < 9; fr++) {
+    for (var fc = 0; fc < 9; fc++) {
+      if (puzzle[fr][fc] !== ".") filled++;
+    }
+  }
+  if (filled < MIN_FILLED_CELLS) {
+    return "puzzleの埋まっているマスが少なすぎます(" + MIN_FILLED_CELLS + "個以上必要です)";
   }
 
   return null;
@@ -825,19 +819,236 @@ var PAGE_HTML = `<!doctype html>
   }
 
   // -------------------------------------------------------------------
+  // 数独ジェネレーター / ソルバー(SPEC 7章 拡張1、docs/DESIGN.md 4.2)
+  // 盤面は 9行の文字列配列と、81要素の数値配列(0 が空)の2つの表現を行き来する。
+  // 探索は数値配列 + ビットマスクで行い、外に出すときだけ文字列に戻す。
+  // -------------------------------------------------------------------
+
+  // 3x3 の箱の番号(0〜8)
+  function boxIndex(r, c) {
+    return ((r / 3) | 0) * 3 + ((c / 3) | 0);
+  }
+
+  function gridToCells(grid) {
+    var cells = [];
+    for (var r = 0; r < 9; r++) {
+      for (var c = 0; c < 9; c++) {
+        var ch = grid[r][c];
+        cells.push(ch === "." ? 0 : Number(ch));
+      }
+    }
+    return cells;
+  }
+
+  function cellsToGrid(cells) {
+    var rows = [];
+    for (var r = 0; r < 9; r++) {
+      var line = "";
+      for (var c = 0; c < 9; c++) {
+        var d = cells[r * 9 + c];
+        line += d === 0 ? "." : String(d);
+      }
+      rows.push(line);
+    }
+    return rows;
+  }
+
+  // Fisher-Yates。元の配列は壊さない。
+  function shuffled(list) {
+    var a = list.slice();
+    for (var i = a.length - 1; i > 0; i--) {
+      var j = Math.floor(Math.random() * (i + 1));
+      var t = a[i];
+      a[i] = a[j];
+      a[j] = t;
+    }
+    return a;
+  }
+
+  /**
+   * 解の個数を数える。limit 個見つかった時点で打ち切る(一意解の判定は limit=2 で足りる)。
+   * found に配列を渡すと、見つけた解を9行の文字列配列として最大 limit 個まで積む。
+   * 置かれている数字がすでに矛盾している盤面は 0 を返す。
+   * 候補が最も少ないマスから埋める(MRV)。
+   */
+  function solveCount(grid, limit, found) {
+    var max = typeof limit === "number" && limit > 0 ? limit : 1;
+    var cells = gridToCells(grid);
+    var rowMask = [];
+    var colMask = [];
+    var boxMask = [];
+    for (var m = 0; m < 9; m++) {
+      rowMask[m] = 0;
+      colMask[m] = 0;
+      boxMask[m] = 0;
+    }
+    for (var idx = 0; idx < 81; idx++) {
+      var d0 = cells[idx];
+      if (d0 === 0) continue;
+      var r0 = (idx / 9) | 0;
+      var c0 = idx % 9;
+      var b0 = boxIndex(r0, c0);
+      var bit0 = 1 << d0;
+      // すでに同じ行・列・箱に同じ数字がある = 解なし
+      if ((rowMask[r0] & bit0) || (colMask[c0] & bit0) || (boxMask[b0] & bit0)) return 0;
+      rowMask[r0] |= bit0;
+      colMask[c0] |= bit0;
+      boxMask[b0] |= bit0;
+    }
+
+    var count = 0;
+
+    function search() {
+      // MRV: 候補が最も少ない空マスを選ぶ。候補0のマスがあればそこで行き止まり。
+      var bestIdx = -1;
+      var bestUsed = 0;
+      var bestCount = 10;
+      for (var i = 0; i < 81; i++) {
+        if (cells[i] !== 0) continue;
+        var r = (i / 9) | 0;
+        var c = i % 9;
+        var used = rowMask[r] | colMask[c] | boxMask[boxIndex(r, c)];
+        var n = 0;
+        for (var d = 1; d <= 9; d++) {
+          if ((used & (1 << d)) === 0) n++;
+        }
+        if (n === 0) return;
+        if (n < bestCount) {
+          bestCount = n;
+          bestIdx = i;
+          bestUsed = used;
+          if (n === 1) break;
+        }
+      }
+      if (bestIdx === -1) {
+        // 空マスが無い = 解が1つ確定
+        count++;
+        if (found && found.length < max) found.push(cellsToGrid(cells));
+        return;
+      }
+      var br = (bestIdx / 9) | 0;
+      var bc = bestIdx % 9;
+      var bb = boxIndex(br, bc);
+      for (var pick = 1; pick <= 9; pick++) {
+        var bit = 1 << pick;
+        if (bestUsed & bit) continue;
+        cells[bestIdx] = pick;
+        rowMask[br] |= bit;
+        colMask[bc] |= bit;
+        boxMask[bb] |= bit;
+        search();
+        cells[bestIdx] = 0;
+        rowMask[br] &= ~bit;
+        colMask[bc] &= ~bit;
+        boxMask[bb] &= ~bit;
+        if (count >= max) return;
+      }
+    }
+
+    search();
+    return count;
+  }
+
+  // 空盤面から、候補をシャッフルしながらバックトラッキングで完成盤を1つ作る。
+  function generateSolvedGrid() {
+    var cells = [];
+    for (var i = 0; i < 81; i++) cells.push(0);
+    var rowMask = [];
+    var colMask = [];
+    var boxMask = [];
+    for (var m = 0; m < 9; m++) {
+      rowMask[m] = 0;
+      colMask[m] = 0;
+      boxMask[m] = 0;
+    }
+
+    function fill(idx) {
+      if (idx === 81) return true;
+      var r = (idx / 9) | 0;
+      var c = idx % 9;
+      var b = boxIndex(r, c);
+      var candidates = shuffled(DIGIT_NUMBERS);
+      for (var k = 0; k < candidates.length; k++) {
+        var d = candidates[k];
+        var bit = 1 << d;
+        if ((rowMask[r] | colMask[c] | boxMask[b]) & bit) continue;
+        cells[idx] = d;
+        rowMask[r] |= bit;
+        colMask[c] |= bit;
+        boxMask[b] |= bit;
+        if (fill(idx + 1)) return true;
+        cells[idx] = 0;
+        rowMask[r] &= ~bit;
+        colMask[c] &= ~bit;
+        boxMask[b] &= ~bit;
+      }
+      return false;
+    }
+
+    if (!fill(0)) throw new Error("failed to generate a solved grid");
+    return cellsToGrid(cells);
+  }
+
+  /**
+   * 完成盤からマスをランダム順に消していき、消すたびに一意解のままかを確認する
+   * (2つ目の解が見つかるなら戻す)。与えられた数字が targetGivens になったら打ち切り。
+   * 戻り値 { given: 9行の文字列配列, solution: 9行の文字列配列 }。
+   */
+  function generatePuzzle(targetGivens) {
+    var goal = Number.isFinite(targetGivens) ? targetGivens : DEFAULT_TARGET_GIVENS;
+    if (goal < MIN_TARGET_GIVENS) goal = MIN_TARGET_GIVENS;
+    if (goal > 81) goal = 81;
+
+    var solution = generateSolvedGrid();
+    var cells = gridToCells(solution);
+    var order = [];
+    for (var i = 0; i < 81; i++) order.push(i);
+    order = shuffled(order);
+
+    var givens = 81;
+    for (var k = 0; k < order.length && givens > goal; k++) {
+      var idx = order[k];
+      var saved = cells[idx];
+      if (saved === 0) continue;
+      cells[idx] = 0;
+      if (solveCount(cellsToGrid(cells), 2) === 1) {
+        givens--;
+      } else {
+        cells[idx] = saved; // 一意解でなくなるなら元に戻す
+      }
+    }
+
+    return { given: cellsToGrid(cells), solution: solution };
+  }
+
+  // 空マスの数(TOTAL_EMPTY の再計算に使う)。
+  function countEmpty(grid) {
+    var empty = 0;
+    for (var r = 0; r < 9; r++) {
+      for (var c = 0; c < 9; c++) {
+        if (grid[r][c] === ".") empty++;
+      }
+    }
+    return empty;
+  }
+
+  // -------------------------------------------------------------------
   // データ・状態(docs/DESIGN.md 4.1 / 5章)
   // -------------------------------------------------------------------
   var DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+  var DIGIT_NUMBERS = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 
+  // ジェネレーターが目指す「与えられた数字」の数。下限を割り込むほどは削らない
+  // (削るほど生成に時間がかかり、実験としても手がかりが減りすぎる)。
+  var DEFAULT_TARGET_GIVENS = 30;
+  var MIN_TARGET_GIVENS = 24;
+
+  // 初期表示は Wikipedia の固定問題(docs/DESIGN.md 5章)。
+  // 「新しい問題」を押すと generatePuzzle() の結果で丸ごと差し替える。
   var GIVEN = ["53..7....", "6..195...", ".98....6.", "8...6...3", "4..8.3..1", "7...2...6", ".6....28.", "...419..5", "....8..79"];
   var SOLUTION = ["534678912", "672195348", "198342567", "859761423", "426853791", "713924856", "961537284", "287419635", "345286179"];
 
-  var TOTAL_EMPTY = 0;
-  for (var gr = 0; gr < 9; gr++) {
-    for (var gc = 0; gc < 9; gc++) {
-      if (GIVEN[gr][gc] === ".") TOTAL_EMPTY++;
-    }
-  }
+  var TOTAL_EMPTY = countEmpty(GIVEN);
 
   // 速度モード(SPEC F4)
   var SLOW_BEFORE_COMMIT_MS = 700;
@@ -869,6 +1080,8 @@ var PAGE_HTML = `<!doctype html>
   var roundSize = TOTAL_EMPTY; // 開始前は「0 / 51」と見せる
   var started = false;
   var pendingCommit = null;
+  // 問題を生成している最中か。生成中はボタンを押せなくする。
+  var generating = false;
   // 実行の世代。reset() / showError() のたびに進める。進行中の fetch や
   // setTimeout のコールバックは、捕まえた世代と一致するときだけ続行する。
   var runToken = 0;
@@ -1065,6 +1278,30 @@ var PAGE_HTML = `<!doctype html>
     render();
   }
 
+  /**
+   * 「新しい問題」。reset() で進行中のループを世代トークンごと無効化してから、
+   * 生成した盤面で GIVEN / SOLUTION と派生値(TOTAL_EMPTY / roundSize)を差し替える。
+   * 生成は同期処理(概ね10ms以下)なので、いったん「生成中…」を描いてから
+   * setTimeout(0) で走らせ、画面が固まったように見えないようにする。
+   */
+  function newPuzzle() {
+    if (generating) return;
+    generating = true;
+    reset(); // 世代を進めて進行中の fetch / setTimeout を無効化し、盤面表示も初期化する
+    setTimeout(function () {
+      try {
+        var puzzle = generatePuzzle(DEFAULT_TARGET_GIVENS);
+        GIVEN = puzzle.given;
+        SOLUTION = puzzle.solution;
+        TOTAL_EMPTY = countEmpty(GIVEN);
+        roundSize = TOTAL_EMPTY;
+      } finally {
+        generating = false;
+      }
+      render();
+    }, 0);
+  }
+
   // -------------------------------------------------------------------
   // 描画(docs/DESIGN.md 4.4)。state から毎回 innerHTML で作り直す。
   // -------------------------------------------------------------------
@@ -1140,12 +1377,19 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function renderControls() {
-    var runDisabled = state.running || state.done || state.errorMessage ? "disabled" : "";
+    var runDisabled = state.running || state.done || state.errorMessage || generating ? "disabled" : "";
+    // 生成中・実行中は問題を差し替えない(実行中の差し替えは盤面と周回ログの意味を壊す)
+    var newDisabled = state.running || generating ? "disabled" : "";
+    // リセットは進行中の判定があっても安全に行える(SPEC F5、世代トークンが古い連鎖を無効化する)。
+    // 生成中だけは差し替え中の盤面と衝突するので無効化する。
+    var resetDisabled = generating ? "disabled" : "";
+    var newLabel = generating ? "生成中…" : "新しい問題";
     var slowActive = state.speedMode === "slow" ? " active" : "";
     var fastActive = state.speedMode === "fast" ? " active" : "";
     return "<div class=\\"controls\\">" +
       "<button id=\\"run-btn\\" onclick=\\"run()\\" " + runDisabled + ">実行</button>" +
-      "<button id=\\"reset-btn\\" onclick=\\"reset()\\">リセット</button>" +
+      "<button id=\\"reset-btn\\" onclick=\\"reset()\\" " + resetDisabled + ">リセット</button>" +
+      "<button id=\\"new-puzzle-btn\\" onclick=\\"newPuzzle()\\" " + newDisabled + ">" + newLabel + "</button>" +
       "<div id=\\"speed-toggle\\">" +
       "<button class=\\"speed-btn" + slowActive + "\\" onclick=\\"setSpeed('slow')\\">じっくり確認</button>" +
       "<button class=\\"speed-btn" + fastActive + "\\" onclick=\\"setSpeed('fast')\\">最速</button>" +

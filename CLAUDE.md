@@ -81,8 +81,8 @@ npm run dev                 # ローカル起動。AIバインディングはリ
 - v0.1 を Issue 単位で実装中。進捗は GitHub の Issues / PR を参照(`docs/HANDOFF.md` の「現在地」も併せて更新する)
 - デプロイ済み: https://sudoku-calibration-check.takashi-kono-rb.workers.dev 。フロントエンド(Issue #3)もマージ済みで、v0.1 の機能はすべて実装済み。実環境での UI 確認(SPEC 6章の「デプロイ後」の項目)はマージ後のデプロイで行う
 - **Jev は 2026-09-21 に Worker 経由で実環境検証済み**(Issue #4)。レスポンスは AI Gateway のラッパー付きだった(`docs/DESIGN.md` 3.4)。`confidence` は `probabilities[choice]` と一致せず、同じ入力でも `choice` が揺れる
-- レート制限のカウンタは Durable Object(`RATE_LIMITER` / `RateLimitCounter`)。`wrangler deploy` が `[[migrations]]` から作るので、ネームスペース作成のような手作業は不要(Issue #10 で Workers KV から移行。KV は結果整合で全体上限が分散アクセスに効かなかった)。PR #14 でマージ・デプロイ済み(Version 7f6d90b7)
-- マージ済み PR: #7(Worker 本体)、#9(Jev 実レスポンス形式 + KV id)、#11(#7/#9 のレビュー指摘)、#13(フロントエンド)、#14(レート制限を Durable Object に置き換え)
-- 数独ジェネレーター/ソルバー(#5)は **PR #15 でレビュー中**(未マージ)。「新しい問題」ボタンで毎回違う問題を出せる実装は済み、マージ待ち
-- 既知の未実装: 集計ビュー(信頼度較正図)(#6)、Playwright E2E スモーク(#17)、GET /api/status(#18)、AbortController + 振る舞いテスト(#19)、難易度(#21)
+- レート制限のカウンタは Durable Object(`RATE_LIMITER` / `RateLimitCounter`)。`wrangler deploy` が `[[migrations]]` から作るので、ネームスペース作成のような手作業は不要(Issue #10 で Workers KV から移行。KV は結果整合で全体上限が分散アクセスに効かなかった)。PR #14 でマージ・デプロイ済み。`GET /api/status` で残数を読める(#18)
+- マージ済み PR: #7(Worker 本体)、#9(Jev 実レスポンス形式 + KV id)、#11(#7/#9 のレビュー指摘)、#13(フロントエンド)、#14(レート制限を Durable Object に置き換え)、#22(モデル方針)、#23(`/api/status`)
+- 数独ジェネレーター/ソルバー(#5)は実装済み。「新しい問題」ボタンで毎回違う問題を出せる。これに伴い Worker 側の入力検証から固定問題(`GIVEN`)前提の項目を外した(`docs/DESIGN.md` 3.3)
+- 既知の未実装: 集計ビュー(信頼度較正図)(#6)、Playwright E2E スモーク(#17)、AbortController + 振る舞いテスト(#19)、難易度(#21)
 - 要判断(オーナー): IP 単位のレート制限(30 回/時)の緩和可否は Issue #20 を参照。上限を緩める変更は作業ルール4によりオーナーの判断が必要

@@ -99,10 +99,10 @@ Durable Object は同じ名前のインスタンスが世界に1つしか存在�
 3. 入力を検証し、不備なら 400 を返す。検証項目は次の通り
    - `puzzle` が長さ9の配列で、各要素が9文字の文字列。文字は `1`〜`9` と `.` のみ
    - `target.row` / `target.col` が 0〜8 の整数
-   - `puzzle` の与えられたマス(`GIVEN`)が改変されていない(与えられた数字がそのまま入っている)
-   - `target` が `GIVEN` の空マスである(与えられたマスを判定対象にしない)
    - `puzzle` の `target` のマスが `.`(空)である。再判定のときも対象マスの前回の推測は消して送る(アンカリング回避。4.2 `buildSnapshot`・SPEC F3)
-   - `GIVEN` は秘密ではないので Worker 側にも持つ。`SOLUTION` は持たない(1 章・10 章)
+   - `puzzle` の埋まっているマスが `MIN_FILLED_CELLS`(17)個以上。17 は一意解を持つ数独の最小ヒント数で、これ未満は数独として成立しない
+   - **行・列・箱の矛盾は検証しない**。過去の周の不正解の推測を正誤問わず残して送る設計なので、矛盾した盤面が来るのは正常な状態(8 章)
+   - 盤面はブラウザ側のジェネレーターが作る(4.2 `generatePuzzle`)ので、Worker は特定の問題の初期配置を持たない。`GIVEN` も `SOLUTION` も Worker 側には無い(1 章・10 章)
 4. `criteria` を `{ "1": "the digit 1", ..., "9": "the digit 9" }` として生成
 5. `env.AI.run("typesafe/jev", { state, questions })` を呼ぶ。例外は 502(`raw` に例外メッセージを200文字まで入れ、`console.error` でログを残す)
 6. 返ってきたレスポンスから `answers.digit` を取り出して検証し(`extractAnswer` → `validateAnswer`)、次のどれかを満たさなければ 502(`raw` に生レスポンスを添えて返す。デバッグ用)
@@ -227,7 +227,8 @@ var state = {
 var queue = [];                 // この周でまだ判定していないマス [{r,c}]
 var roundWrong = [];            // この周で不正解だったマス。次の周の queue になる
 var roundTally = { correct:0, total:0 };
-var roundSize = TOTAL_EMPTY;    // この周の対象マス数(「この周の進捗」の分母)。開始前は空マス数の51
+var roundSize = TOTAL_EMPTY;    // この周の対象マス数(「この周の進捗」の分母)。開始前は空マス数
+var generating = false;         // 問題を生成している最中か(4.2 newPuzzle)
 var started = false;
 var pendingCommit = null;       // API結果を受けて確定待ちの1件
 var runToken = 0;               // 実行の世代。reset() / showError() で +1 する(4.3)
@@ -237,6 +238,11 @@ var runToken = 0;               // 実行の世代。reset() / showError() で +
 
 | 関数 | 責務 |
 |---|---|
+| `solveCount(grid, limit, found)` | 解の個数を数えるソルバー。`limit` 個見つけたら打ち切る(一意解の判定は `limit=2` で足りる)。候補の少ないマスから埋める(MRV)+ 行・列・箱のビットマスクでのバックトラッキング。`found` に配列を渡すと見つけた解を9行の文字列配列で受け取れる。置かれている数字がすでに矛盾していれば 0 |
+| `generateSolvedGrid()` | 空盤面に対し、各マスの候補をシャッフルしながらバックトラッキングして完成盤を1つ作る純粋関数(乱数のみ外部依存) |
+| `generatePuzzle(targetGivens)` | 完成盤からマスをランダム順に消し、消すたびに `solveCount(grid, 2) === 1` を確認する(2 になるなら戻す)。与えられた数字が `targetGivens`(既定 `DEFAULT_TARGET_GIVENS` = 30、下限 `MIN_TARGET_GIVENS` = 24)になったら打ち切る。戻り値 `{ given, solution }`(どちらも9行の文字列配列) |
+| `newPuzzle()` | 「新しい問題」ボタン。`generating` を立てて `reset()`(= 世代トークンを進めて進行中のループを無効化)し、`setTimeout(…, 0)` で生成してから `GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize` を差し替えて再描画。生成は同期で概ね 10 ms 以下(実測: 中央値 4ms、最大 10ms、100回) |
+| `countEmpty(grid)` / `boxIndex` / `gridToCells` / `cellsToGrid` / `shuffled` | 上記の下請け。盤面の2つの表現(9行の文字列配列 ⇔ 81要素の数値配列。0 が空)の変換と、Fisher-Yates シャッフル |
 | `buildSnapshot()` | `GIVEN` + `state.values`(正誤問わず)から9行の文字列配列を作る。未確定は `.`。**判定対象のマスだけは `.` にして送る(他のマスの過去の推測は正誤問わず残す)**。Worker 側も 3.3 でこれを検証する |
 | `formatRoundSummary(round, correct, total)` | 周回ログの1行「N周目: M中K正解 (P%)」を組み立てる純粋関数。`total` が0でも割り算しない |
 | `nextQueue(roundWrong)` | 次の周の `queue` を作る純粋関数。配列も要素も複製して返す(`roundWrong = []` の影響を受けないため) |
@@ -308,14 +314,17 @@ idle ──run()──▶ focusNext()
 
 ## 5. データ
 
-固定の1問。Wikipedia の数独記事で使われている例題と同じ。
+`GIVEN`(与えられた数字)と `SOLUTION`(正解表)は **再代入できる `var`** で、初期値は
+Wikipedia の数独記事で使われている例題。「新しい問題」(4.2 `newPuzzle`)を押すと
+`generatePuzzle()` の結果で丸ごと差し替わり、`TOTAL_EMPTY` と `roundSize` も再計算される。
+どちらもブラウザ用スクリプトの中にだけあり、Worker 側には無い(1 章・9 章 不変条件7)。
 
 ````javascript
 var GIVEN = [ "53..7....", "6..195...", ".98....6.", "8...6...3", "4..8.3..1", "7...2...6", ".6....28.", "...419..5", "....8..79" ];
 var SOLUTION = [ "534678912", "672195348", "198342567", "859761423", "426853791", "713924856", "961537284", "287419635", "345286179" ];
 ````
 
-空マスは51。`SOLUTION` は採点表示にだけ使う。
+固定問題の空マスは51。生成した問題は既定30ヒント(空マス51)で、下限24ヒントまでしか削らない。`SOLUTION` は採点表示にだけ使う。
 
 ## 6. 設定・デプロイ
 
@@ -344,7 +353,7 @@ new_sqlite_classes = ["RateLimitCounter"]
 - リポジトリには秘密情報を置かない。`account_id` も置かない
 - `/api/judge` には CORS ヘッダーを付けない。加えて **`content-type` のメディアタイプが `application/json` でないリクエストは 415 で弾く**(`handleJudge` の最初、レート制限より前)。この2つはセットで意味を持つ: `application/json` の POST はブラウザで必ずプリフライトが必要になり、CORS ヘッダーを返していないのでプリフライトが通らず、他サイトのページからは呼べない。一方 `text/plain` などプリフライト不要の content-type はフォーム送信等でクロスサイトに投げられてしまうため、415 で入口を閉じる(第三者のサイトに埋め込まれて Workers AI のコストを消費される経路を塞ぐ)。`curl` 等からの直接アクセスはレート制限で頭打ちにする
 - `GET /` のレスポンスには `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、`Content-Security-Policy: frame-ancestors 'none'` を付ける(クリックジャッキング対策。インラインスクリプトを使うため、それ以上の CSP はかけない)
-- 3.3 の検証を通った盤面文字列だけが Jev に渡る(形式・`GIVEN` との一致・対象マスが空であることまで見る)
+- 3.3 の検証を通った盤面文字列だけが Jev に渡る(形式・対象マスが空であること・埋まっているマスが17個以上であることまで見る)
 - `SOLUTION` は Wikipedia の例題の答えなので秘密ではない。守るべきは「Jev に渡る `state` に `SOLUTION` が混ざらないこと」であり、そのために `SOLUTION` をブラウザ用スクリプトの中にだけ置き、Worker の判定コードから構造的に隔離する(8 章)
 
 ## 8. 設計上の判断と理由
@@ -355,7 +364,9 @@ new_sqlite_classes = ["RateLimitCounter"]
 | 判定ループをブラウザ側で駆動 | Worker をステートレスに保てる。1マスごとの待ち時間(演出)もブラウザ側で自然に入れられる |
 | スナップショットに不正解の推測も含める | 「周を重ねて文脈が増えると精度が上がるか」を見るのが目的。正解だけ渡すと SOLUTION のリークになる |
 | `SOLUTION` を Worker に渡さない | 実験の前提。Worker 側でも採点しない |
-| 固定の1問 | v0.1 の範囲を小さくするため。ジェネレーター/ソルバーは次のタスク |
+| 問題はブラウザ側で生成し、Worker は問題を知らない | ジェネレーター(#5)を入れた以上、Worker が特定の初期配置を持つと「新しい問題」のたびに Worker も直す羽目になる。Worker は「数独の盤面として受け付けられる形か」だけを見るステートレスな層に留める。初期表示だけは固定問題のままにして、開いてすぐ同じ条件で比べられるようにしている |
+| 生成した問題の一意解をソルバーで確認する | 解が複数ある問題だと「Jev の答えが不正解」の判定そのものが無意味になる。マスを1つ消すたびに `solveCount(grid, 2) === 1` を確認するので、出題時点で一意解であることが保証される |
+| 行・列・箱の矛盾を Worker で検証しない | 不正解の推測を正誤問わず残して送るのが実験の前提(F3)なので、矛盾した盤面は正常な入力。ここを弾くと2周目以降がほぼ全部 400 になる |
 | 速度モード2択 | 「じっくり見る」と「Jevの速さを体感する」の両方が目的 |
 | IP単位+全体の2段レート制限 | IP単位だけだと分散アクセス(多数のIPからの同時アクセス)で回避され、コストが青天井になる。全体上限を最終防衛ラインとして併設 |
 | カウンタをKVでなくDurable Objectに(Issue #10) | KVは結果整合で `get` がコロケーションごとに最大60秒キャッシュされるため、複数コロからの同時アクセスが lost update を起こし、**全体上限が「分散アクセスへの最終防衛ライン」という唯一の目的に対して効かなかった**(実測で確認)。Durable Object はインスタンスが1つで直列実行のため厳密に数えられる。カウンタが緩いと Workers AI のコストの上限が実質無くなるので、ここは実装の単純さより正確さを取る(3.2) |
@@ -396,4 +407,10 @@ new_sqlite_classes = ["RateLimitCounter"]
   - `AI.run` が例外を投げる / `answers.digit` が無い(ラッパーの有無どちらでも)/ `state` が `"Completed"` でない / `answers.digit` の形が 3.3 の条件を満たさない場合に 502 になること
   - ラッパー付き(3.4 の実測形式)とラッパー無し(素の `{ model, answers, usage }`)の **どちらでも** 200 になること。`confidence` は Jev の値がそのまま返り、`probabilities[choice]` に差し替えられていないこと
   - `GET /` が `text/html; charset=utf-8` と 7 章のセキュリティヘッダーを返し、それ以外のパスが 404 であること
+  - **ジェネレーター / ソルバー**(`test/page.test.js`)。`PAGE_HTML` の `<script>` を取り出し、`node:vm` のコンテキストで丸ごと評価する harness を使う(`document` は `#app` だけ、`setTimeout` は待たずに即実行、`fetch` は呼び出しを記録するスタブ)。スクリプト直下の `var` / 関数宣言はコンテキストのプロパティになるので、`ctx.generatePuzzle` のように直接呼べる
+    - `solveCount` が固定問題で 1 を返し、その解が既知の正解(DESIGN 5 章の `SOLUTION`)と一致すること。空盤面は `limit` で打ち切られ、矛盾した盤面は 0 になること
+    - `generatePuzzle` を **20回** 呼び、毎回 `solveCount(given, 2) === 1`、`solveCount` が見つける解が `solution` と一致、与えられた数字が 17〜40 個、`solution` が数独として正しい(行・列・箱に1〜9が1回ずつ)こと。乱数を使うので所要時間の上限も見る(実測: 20回で 160ms 前後)
+    - `newPuzzle()` で `GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize` が差し替わり、周回・統計が初期化されること。初期表示は固定問題のままであること
+    - 「新しい問題」の後に `run()` すると、**新しい `GIVEN` の空マスだけを行優先の順で** `/api/judge` に問い合わせること(回数と座標の両方を見る。空マスの「数」は固定問題と同じ51になりうるため)
+    - vm のコンテキストで作った配列は host とは別レルムなので、`deepStrictEqual` の前に host 側の配列へ移し替える(`hostRows`)
 - CI(`.github/workflows/ci.yml`)は push と PR で `npm ci` → `npm test` → `npm run check` を実行する。`check` は `wrangler deploy --dry-run` で、認証なしで動く

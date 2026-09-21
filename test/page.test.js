@@ -2,6 +2,7 @@
 // 実際のブラウザ DOM は使わず、GET / のレスポンステキストを検査する。
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
 
 import worker from "../src/index.js";
 import { GIVEN, ANSWER_KEY, makeEnv } from "./helpers.js";
@@ -60,6 +61,118 @@ function stripLineComments(text) {
       return i >= 0 ? line.slice(0, i) : line;
     })
     .join("\n");
+}
+
+/**
+ * <script> の中身を node:vm で丸ごと評価し、そのコンテキスト(= ブラウザで言う
+ * グローバル)を返す。スクリプト直下の `var` / 関数宣言はコンテキストのプロパティに
+ * なるので、`ctx.generatePuzzle` / `ctx.GIVEN` のように取り出して呼べる。
+ *
+ * ブラウザの代わりに与えるのは最低限:
+ * - document: render() が触る #app と、周回ログの querySelector(常に null)だけ
+ * - setTimeout: 待ち時間を無視して即座に実行する(テストを速く・決定的にする)
+ * - fetch: 呼び出しを記録するスタブ(既定では呼ばれたら失敗させる)
+ */
+function runScript(html, options) {
+  var opts = options || {};
+  var app = { innerHTML: "" };
+  var context = {
+    console: console,
+    document: {
+      getElementById: function (id) {
+        return id === "app" ? app : null;
+      },
+      querySelector: function () {
+        return null;
+      },
+    },
+    setTimeout: function (fn) {
+      return setImmediate(fn);
+    },
+    fetch:
+      opts.fetch ||
+      function () {
+        throw new Error("fetch を呼ばない想定のテストで fetch が呼ばれた");
+      },
+  };
+  vm.createContext(context);
+  vm.runInContext(extractScript(html), context);
+  context.appElement = app;
+  return context;
+}
+
+/** setImmediate 1回分だけイベントループを進める。 */
+function tick() {
+  return new Promise(function (resolve) {
+    setImmediate(resolve);
+  });
+}
+
+/** cond() が true になるまで(上限つきで)イベントループを回す。 */
+async function waitFor(cond, label) {
+  for (var i = 0; i < 100000; i++) {
+    if (cond()) return;
+    await tick();
+  }
+  throw new Error("待っても条件が満たされなかった: " + label);
+}
+
+/** 9行の文字列配列が数独として正しい完成盤か(行・列・箱に1〜9が1回ずつ)。 */
+function assertSolvedGrid(grid, label) {
+  assert.equal(grid.length, 9, label + ": 9行でない");
+  var expected = "123456789";
+  function sorted(chars) {
+    return chars.slice().sort().join("");
+  }
+  for (var r = 0; r < 9; r++) {
+    assert.equal(grid[r].length, 9, label + ": " + r + "行目が9文字でない");
+    assert.equal(sorted(grid[r].split("")), expected, label + ": " + r + "行目に1〜9が揃っていない");
+  }
+  for (var c = 0; c < 9; c++) {
+    var col = [];
+    for (var r2 = 0; r2 < 9; r2++) col.push(grid[r2][c]);
+    assert.equal(sorted(col), expected, label + ": " + c + "列目に1〜9が揃っていない");
+  }
+  for (var b = 0; b < 9; b++) {
+    var box = [];
+    var baseR = ((b / 3) | 0) * 3;
+    var baseC = (b % 3) * 3;
+    for (var dr = 0; dr < 3; dr++) {
+      for (var dc = 0; dc < 3; dc++) box.push(grid[baseR + dr][baseC + dc]);
+    }
+    assert.equal(sorted(box), expected, label + ": 箱" + b + "に1〜9が揃っていない");
+  }
+}
+
+/**
+ * node:vm のコンテキストで作られた配列は host とは別レルダムの Array なので、
+ * assert.deepEqual(= deepStrictEqual)がプロトタイプ違いで落ちる。
+ * 中身(文字列)だけを host 側の配列に移し替えてから比べる。
+ */
+function hostRows(grid) {
+  return Array.prototype.slice.call(grid).map(String);
+}
+
+/** 空マスの座標を "r-c" の配列で返す(順序は行優先)。 */
+function emptyKeys(grid) {
+  var keys = [];
+  for (var r = 0; r < 9; r++) {
+    for (var c = 0; c < 9; c++) {
+      if (grid[r][c] === ".") keys.push(r + "-" + c);
+    }
+  }
+  return keys;
+}
+
+/** 埋まっているマスの数。 */
+function countFilled(grid) {
+  var filled = 0;
+  for (var r = 0; r < 9; r++) {
+    for (var c = 0; c < 9; c++) {
+      if (grid[r][c] !== ".") filled++;
+    }
+  }
+  return filled;
 }
 
 test("GET / は判定ループが依存するDOMフック一式と /api/judge を含む", async () => {
@@ -327,4 +440,275 @@ test("render() は周回ログのスクロール位置を引き継ぐ", async ()
   var replace = src.indexOf("app.innerHTML");
   assert.ok(save >= 0 && save < replace, "innerHTML を置き換える前にスクロール位置を保存していない");
   assert.ok(src.lastIndexOf("scrollTop") > replace, "innerHTML 置き換え後にスクロール位置を復元していない");
+});
+
+// --- 数独ジェネレーター / ソルバー(Issue #5) ------------------------------
+
+test("solveCount: 固定問題(Wikipedia)は一意解で、その解は既知の正解と一致する", { timeout: 10000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+
+  var found = [];
+  assert.equal(ctx.solveCount(GIVEN, 2, found), 1, "固定問題の解は1つだけのはず");
+  assert.deepEqual(hostRows(found[0]), ANSWER_KEY);
+
+  // limit を 1 にしても 1 で打ち切られる
+  assert.equal(ctx.solveCount(GIVEN, 1), 1);
+
+  // 完成盤そのものは当然 1 通り
+  assert.equal(ctx.solveCount(ANSWER_KEY, 2), 1);
+
+  // 空盤面は解が山ほどあるので limit で打ち切られる
+  var empty = [];
+  for (var i = 0; i < 9; i++) empty.push(".........");
+  assert.equal(ctx.solveCount(empty, 2), 2, "limit 個見つけたら打ち切る");
+
+  // 矛盾した盤面(同じ行に 5 が2つ)は解なし
+  var broken = GIVEN.slice();
+  broken[0] = "53.5.....";
+  assert.equal(ctx.solveCount(broken, 2), 0);
+
+  // 1マスだけ消した完成盤も一意解
+  var oneHole = ANSWER_KEY.slice();
+  oneHole[4] = "4268537.1";
+  assert.equal(ctx.solveCount(oneHole, 2), 1);
+});
+
+// 空盤面だけを見る専用テスト。solveCount の早期打ち切り(if (count >= max) return;)が
+// 外れると空盤面の解を数え切ろうとしてハングする。timeout により、ハングでも
+// スイート全体を止めずに即座に検出できる。
+test("solveCount: 空盤面は limit(2)で打ち切る(早期打ち切りが無いとハングする)", { timeout: 10000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+  var empty = [];
+  for (var i = 0; i < 9; i++) empty.push(".........");
+  assert.equal(ctx.solveCount(empty, 2), 2);
+});
+
+test("generateSolvedGrid: 完成盤として正しく、毎回同じではない", { timeout: 10000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+  var first = ctx.generateSolvedGrid();
+  assertSolvedGrid(first, "generateSolvedGrid");
+
+  var differs = false;
+  for (var i = 0; i < 5; i++) {
+    var next = ctx.generateSolvedGrid();
+    assertSolvedGrid(next, "generateSolvedGrid #" + i);
+    if (next.join("") !== first.join("")) differs = true;
+  }
+  assert.ok(differs, "何度生成しても同じ盤面しか出てこない(シャッフルが効いていない)");
+});
+
+test("generatePuzzle を20回: 常に一意解・解が一致・与えられた数字は既定30個ちょうど", { timeout: 10000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+  var started = Date.now();
+
+  for (var i = 0; i < 20; i++) {
+    var puzzle = ctx.generatePuzzle(30);
+    var label = "#" + i;
+
+    assert.equal(puzzle.given.length, 9, label + ": given が9行でない");
+    assert.equal(puzzle.solution.length, 9, label + ": solution が9行でない");
+
+    // solution は数独として正しい完成盤
+    assertSolvedGrid(puzzle.solution, label);
+
+    // given は solution からマスを消しただけ(残っている数字は solution と一致する)
+    for (var r = 0; r < 9; r++) {
+      assert.ok(/^[1-9.]{9}$/.test(puzzle.given[r]), label + ": given の文字が不正");
+      for (var c = 0; c < 9; c++) {
+        if (puzzle.given[r][c] !== ".") {
+          assert.equal(puzzle.given[r][c], puzzle.solution[r][c], label + ": given が solution と食い違う");
+        }
+      }
+    }
+
+    // 一意解であり、その解が solution と一致する
+    var found = [];
+    assert.equal(ctx.solveCount(puzzle.given, 2, found), 1, label + ": 解が一意でない");
+    assert.deepEqual(hostRows(found[0]), hostRows(puzzle.solution), label + ": solveCount の解と solution が違う");
+
+    var filled = countFilled(puzzle.given);
+    assert.equal(filled, 30, label + ": 与えられた数字が既定の30個ちょうどでない: " + filled);
+  }
+
+  var elapsed = Date.now() - started;
+  // 乱数任せなので上限は緩めに。桁違いに遅くなったら気づけるようにしておく。
+  assert.ok(elapsed < 20000, "generatePuzzle 20回が遅すぎる: " + elapsed + "ms");
+});
+
+// 注意: generatePuzzle(24) は「ちょうど24個」を保証しない。実装はランダム順にマスを
+// 消していき、消せなくなった時点で打ち切る(消しすぎて一意解が崩れる場合は戻す)ので、
+// 24(MIN_TARGET_GIVENS)は「これより減らさない」下限であって、常に到達できる目標ではない。
+// 実測(1000回)では 24 に到達するのは約6割で、25〜28個で止まることもある。
+// ここでは「下限を下回らない」という実際の契約だけを検証する(=== 24 は書くとflakyになる)。
+test("generatePuzzle(24): 下限(MIN_TARGET_GIVENS)を下回らない", { timeout: 10000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+  for (var i = 0; i < 20; i++) {
+    var puzzle = ctx.generatePuzzle(24);
+    var label = "#" + i;
+    assertSolvedGrid(puzzle.solution, label);
+    assert.equal(ctx.solveCount(puzzle.given, 2), 1, label + ": generatePuzzle(24) が一意解でない");
+    var filled = countFilled(puzzle.given);
+    assert.ok(filled >= 24, label + ": 与えられた数字が下限24を下回った: " + filled);
+  }
+});
+
+test("generatePuzzle(NaN): DEFAULT_TARGET_GIVENS(30)にフォールバックする", { timeout: 10000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+  var puzzle = ctx.generatePuzzle(NaN);
+  assert.equal(
+    countFilled(puzzle.given),
+    30,
+    "targetGivens が NaN のとき DEFAULT_TARGET_GIVENS(30) にフォールバックしていない(81ヒントの「問題」を返していないか)"
+  );
+});
+
+test("リセットは実行中でも押せる(SPEC F5)。生成中だけ無効化される", async () => {
+  var ctx = runScript(await getPageHtml());
+
+  function resetButtonHtml() {
+    var html = ctx.renderControls();
+    var m = html.match(/<button id="reset-btn"[^>]*>/);
+    assert.ok(m, "reset-btn が見つからない");
+    return m[0];
+  }
+  function runButtonHtml() {
+    var html = ctx.renderControls();
+    var m = html.match(/<button id="run-btn"[^>]*>/);
+    assert.ok(m, "run-btn が見つからない");
+    return m[0];
+  }
+  function newPuzzleButtonHtml() {
+    var html = ctx.renderControls();
+    var m = html.match(/<button id="new-puzzle-btn"[^>]*>/);
+    assert.ok(m, "new-puzzle-btn が見つからない");
+    return m[0];
+  }
+
+  // 初期状態: どれも無効化されていない
+  assert.ok(!resetButtonHtml().includes("disabled"), "初期状態で reset-btn が無効化されている");
+
+  // 実行中: リセットは押せる。実行/新しい問題は押せない
+  ctx.state.running = true;
+  assert.ok(!resetButtonHtml().includes("disabled"), "実行中に reset-btn が無効化されている(SPEC F5違反)");
+  assert.ok(runButtonHtml().includes("disabled"), "実行中に run-btn が無効化されていない");
+  assert.ok(newPuzzleButtonHtml().includes("disabled"), "実行中に new-puzzle-btn が無効化されていない");
+  ctx.state.running = false;
+
+  // 生成中: リセットも無効化される(差し替え中の盤面と衝突するため)
+  ctx.generating = true;
+  assert.ok(resetButtonHtml().includes("disabled"), "生成中に reset-btn が無効化されていない");
+  assert.ok(runButtonHtml().includes("disabled"), "生成中に run-btn が無効化されていない");
+  assert.ok(newPuzzleButtonHtml().includes("disabled"), "生成中に new-puzzle-btn が無効化されていない");
+  ctx.generating = false;
+});
+
+test("「新しい問題」ボタンがヘッダにあり、生成中・実行中は押せない", async () => {
+  var html = await getPageHtml();
+  assert.ok(html.includes('id=\\"new-puzzle-btn\\"'), "新しい問題ボタンの id が無い");
+  assert.ok(html.includes("newPuzzle()"), "newPuzzle() の呼び出しが無い");
+
+  var script = extractScript(html);
+  var controlsSrc = extractFunctionSource(script, "renderControls");
+  assert.ok(/state\.running \|\| generating/.test(controlsSrc), "実行中・生成中に無効化していない");
+
+  var newPuzzleSrc = extractFunctionSource(script, "newPuzzle");
+  assert.ok(/reset\(\)/.test(newPuzzleSrc), "newPuzzle() が reset() 相当の初期化をしていない");
+  assert.ok(/GIVEN = /.test(newPuzzleSrc), "newPuzzle() が GIVEN を差し替えていない");
+  assert.ok(/SOLUTION = /.test(newPuzzleSrc), "newPuzzle() が SOLUTION を差し替えていない");
+  assert.ok(/TOTAL_EMPTY = /.test(newPuzzleSrc), "newPuzzle() が TOTAL_EMPTY を再計算していない");
+});
+
+test("初期表示は固定問題のまま、newPuzzle() で GIVEN / SOLUTION と派生値が差し替わる", { timeout: 10000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+
+  assert.deepEqual(hostRows(ctx.GIVEN), GIVEN, "初期表示は Wikipedia の固定問題");
+  assert.deepEqual(hostRows(ctx.SOLUTION), ANSWER_KEY);
+  assert.equal(ctx.TOTAL_EMPTY, 51);
+
+  ctx.newPuzzle();
+  await waitFor(function () {
+    return ctx.generating === false;
+  }, "生成の完了");
+
+  assert.notDeepEqual(hostRows(ctx.GIVEN), GIVEN, "GIVEN が差し替わっていない");
+  assert.equal(ctx.TOTAL_EMPTY, 81 - countFilled(ctx.GIVEN), "TOTAL_EMPTY が再計算されていない");
+  assert.equal(ctx.roundSize, ctx.TOTAL_EMPTY, "roundSize が新しい空マス数になっていない");
+  assert.equal(ctx.solveCount(ctx.GIVEN, 2), 1, "差し替わった問題が一意解でない");
+
+  // SOLUTION は GIVEN の唯一の解
+  var found = [];
+  ctx.solveCount(ctx.GIVEN, 2, found);
+  assert.deepEqual(hostRows(found[0]), hostRows(ctx.SOLUTION));
+
+  // 周回・統計は初期化されている
+  assert.equal(ctx.state.round, 1);
+  assert.deepEqual(Object.keys(ctx.state.values), []);
+  assert.equal(ctx.state.roundLog.length, 0);
+  assert.equal(ctx.state.running, false);
+  assert.equal(ctx.state.done, false);
+});
+
+test("「新しい問題」の後に run() すると、新しい GIVEN の空マス数だけ /api/judge を呼ぶ", { timeout: 10000 }, async () => {
+  var calls = [];
+  var ctx;
+  var fetchStub = async function (url, init) {
+    var body = JSON.parse(init.body);
+    calls.push({ url: url, body: body });
+    // 正解をそのまま返す ⇒ 1周で全マス正解になり、fetch 回数 = 空マス数になる
+    var digit = ctx.SOLUTION[body.target.row][body.target.col];
+    var probabilities = {};
+    for (var d = 1; d <= 9; d++) probabilities[String(d)] = String(d) === digit ? 0.9 : 0.0125;
+    return {
+      ok: true,
+      json: async function () {
+        return { probabilities: probabilities, choice: digit, confidence: 0.5 };
+      },
+    };
+  };
+
+  ctx = runScript(await getPageHtml(), { fetch: fetchStub });
+
+  ctx.newPuzzle();
+  await waitFor(function () {
+    return ctx.generating === false;
+  }, "生成の完了");
+
+  var expectedKeys = emptyKeys(ctx.GIVEN);
+  assert.equal(expectedKeys.length, ctx.TOTAL_EMPTY);
+  // 空マスの「数」は固定問題と同じ51になることがある(生成は30ヒント固定)ので、
+  // どのマスを聞いたかまで見る。
+  assert.notDeepEqual(expectedKeys, emptyKeys(GIVEN), "空マスの位置が固定問題と同じでは検証にならない");
+
+  ctx.run();
+  await waitFor(function () {
+    return ctx.state.done === true;
+  }, "1周での完了");
+
+  assert.equal(calls.length, expectedKeys.length, "fetch 回数が新しい GIVEN の空マス数と一致しない");
+  assert.deepEqual(
+    calls.map(function (call) {
+      return call.body.target.row + "-" + call.body.target.col;
+    }),
+    expectedKeys,
+    "聞いたマスが新しい GIVEN の空マス(行優先)と一致しない"
+  );
+  assert.equal(ctx.state.roundsToSolve, 1, "全部正解を返したので1周で終わるはず");
+  assert.equal(ctx.state.roundLog.length, 1);
+
+  // 送った盤面はすべて新しい GIVEN と矛盾せず、対象マスは必ず空
+  for (var i = 0; i < calls.length; i++) {
+    var body = calls[i].body;
+    assert.equal(calls[i].url, "/api/judge");
+    assert.equal(body.puzzle[body.target.row][body.target.col], ".", "対象マスが空でない");
+    assert.equal(ctx.GIVEN[body.target.row][body.target.col], ".", "given のマスを聞いている");
+  }
+
+  // リクエストに載るのは puzzle と target だけ(正解表そのものを別キーで送っていない)。
+  // 「盤面の中身が SOLUTION と一致しないこと」は検証できない点に注意: このスタブは常に
+  // 正解を返すので、周の後半のスナップショットは正解表とほぼ同じ見た目になる。それは
+  // 「過去の周の推測を残して送る」設計どおりの姿であって、リークではない。
+  for (var j = 0; j < calls.length; j++) {
+    assert.deepEqual(Object.keys(calls[j].body).sort(), ["puzzle", "target"]);
+    assert.deepEqual(Object.keys(calls[j].body.target).sort(), ["col", "row"]);
+  }
 });
