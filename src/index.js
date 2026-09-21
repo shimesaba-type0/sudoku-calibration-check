@@ -3,6 +3,7 @@
  *
  * GET  /           … フロントエンド一式(PAGE_HTML)
  * POST /api/judge  … 盤面と対象マスを受け取り、typesafe/jev に1マス分の確率を聞いて返す
+ * GET  /api/status … レート制限の残り回数を読むだけ(カウンタは加算しない)
  *
  * 設計は docs/DESIGN.md 3章・6章・7章・10章に対応する。
  * 判定ループ・採点・周回はすべてブラウザ側にあり、この Worker はステートレス。
@@ -185,6 +186,26 @@ async function callCounter(limiter, name, op, bucket, max) {
 }
 
 /**
+ * 固定ウィンドウの現在位置。`bucket` は現在時刻をウィンドウ幅で割った商、
+ * `resetsIn` は今のバケットが終わるまでの秒数(= 429 の `Retry-After`)。
+ * `checkRateLimit` と `readRateLimitStatus` で同じ式を使うためのヘルパー。
+ */
+function currentWindow(windowSeconds) {
+  var nowSeconds = Math.floor(Date.now() / 1000);
+  var bucket = Math.floor(nowSeconds / windowSeconds);
+  return { bucket: bucket, resetsIn: (bucket + 1) * windowSeconds - nowSeconds };
+}
+
+/**
+ * Durable Object のインスタンス名に使う呼び出し元 IP。
+ * CF-Connecting-IP はエッジが付けるので偽装はできないが、インスタンス名が際限なく
+ * 長くならないよう念のため長さを抑える。
+ */
+function clientIp(request) {
+  return (request.headers.get("CF-Connecting-IP") || "unknown").slice(0, 64);
+}
+
+/**
  * IP単位・全体の2段構えの固定ウィンドウ・レート制限(docs/DESIGN.md 3.2)。
  * `handleJudge` の先頭(415 の検査の後)で呼ぶ。
  *
@@ -209,14 +230,12 @@ async function checkRateLimit(request, env) {
   var perIpMax = readLimit(env.RATE_LIMIT_PER_IP_MAX, DEFAULT_PER_IP_MAX);
   var globalMax = readLimit(env.RATE_LIMIT_GLOBAL_MAX, DEFAULT_GLOBAL_MAX);
 
-  var nowSeconds = Math.floor(Date.now() / 1000);
-  var bucket = Math.floor(nowSeconds / windowSeconds);
+  var window = currentWindow(windowSeconds);
+  var bucket = window.bucket;
   // 今のバケットが終わるまでの秒数
-  var retryAfter = (bucket + 1) * windowSeconds - nowSeconds;
+  var retryAfter = window.resetsIn;
 
-  // CF-Connecting-IP はエッジが付けるので偽装はできないが、Durable Object の名前が
-  // 際限なく長くならないよう念のため長さを抑える。
-  var ip = (request.headers.get("CF-Connecting-IP") || "unknown").slice(0, 64);
+  var ip = clientIp(request);
 
   function denyGlobal() {
     return {
@@ -270,6 +289,56 @@ async function checkRateLimit(request, env) {
       reason: "レート制限の記録に失敗しました。しばらくしてから再試行してください",
       headers: { "Retry-After": String(COUNTER_FAILURE_RETRY_AFTER) },
     };
+  }
+}
+
+// /api/status のレスポンスに付けるヘッダー。残数は数秒で変わるのでキャッシュさせない。
+// CORS ヘッダーは付けない(/api/judge と同じ方針。docs/DESIGN.md 7章)。
+var STATUS_HEADERS = { "Cache-Control": "no-store" };
+
+/** 上限と現在のカウントから `{ max, used, remaining }` を作る。 */
+function usageOf(max, count) {
+  return { max: max, used: count, remaining: Math.max(0, max - count) };
+}
+
+/**
+ * GET /api/status(docs/SPEC.md 4章 / docs/DESIGN.md 3.1)。
+ * レート制限の残り回数を **読むだけ** で返す。カウンタは `peek` でしか触らないので、
+ * この呼び出し自体は回数に数えられない(状態を見るために残数を減らさない)。
+ *
+ * - `RATE_LIMITER` バインディングが無い → `{ rate_limit: "disabled" }`(フェイルオープン中)
+ * - カウンタが例外/非2xx → 503。`checkRateLimit` のフェイルクローズと同じ `Retry-After: 60`
+ */
+async function readRateLimitStatus(request, env) {
+  var limiter = env && env.RATE_LIMITER;
+  if (!limiter) return jsonResponse({ rate_limit: "disabled" }, 200, STATUS_HEADERS);
+
+  var windowSeconds = readLimit(env.RATE_LIMIT_WINDOW_SECONDS, DEFAULT_WINDOW_SECONDS);
+  var perIpMax = readLimit(env.RATE_LIMIT_PER_IP_MAX, DEFAULT_PER_IP_MAX);
+  var globalMax = readLimit(env.RATE_LIMIT_GLOBAL_MAX, DEFAULT_GLOBAL_MAX);
+
+  var window = currentWindow(windowSeconds);
+  var ip = clientIp(request);
+
+  try {
+    var globalPeek = await callCounter(limiter, "global", "peek", window.bucket, globalMax);
+    var ipPeek = await callCounter(limiter, "ip:" + ip, "peek", window.bucket, perIpMax);
+    return jsonResponse(
+      {
+        window_seconds: windowSeconds,
+        resets_in: window.resetsIn,
+        global: usageOf(globalMax, globalPeek.count),
+        ip: usageOf(perIpMax, ipPeek.count),
+      },
+      200,
+      STATUS_HEADERS
+    );
+  } catch (err) {
+    console.error("rate limit status error", err);
+    return errorResponse("レート制限の状態を取得できません", 503, {
+      "Retry-After": String(COUNTER_FAILURE_RETRY_AFTER),
+      "Cache-Control": "no-store",
+    });
   }
 }
 
@@ -540,6 +609,9 @@ export default {
   async fetch(request, env) {
     var url = new URL(request.url);
     if (url.pathname === "/api/judge" && request.method === "POST") return handleJudge(request, env);
+    if (url.pathname === "/api/status" && request.method === "GET") {
+      return readRateLimitStatus(request, env);
+    }
     if (url.pathname === "/" && request.method === "GET") {
       return new Response(PAGE_HTML, { headers: PAGE_HEADERS });
     }
