@@ -748,6 +748,13 @@ var PAGE_HTML = `<!doctype html>
   .banner.success { background: var(--correct-bg); color: var(--correct); border: 1px solid var(--correct); }
   .banner.warning { background: var(--incorrect-bg); color: var(--incorrect); border: 1px solid var(--incorrect); }
 
+  .calib-summary { font-size: 12px; color: var(--muted); margin: 0 0 12px; }
+  .calib-charts { display: flex; flex-wrap: wrap; gap: 16px; }
+  .calib-chart { flex: 1 1 220px; min-width: 200px; }
+  .calib-chart-title { font-size: 11px; color: var(--muted); margin: 0 0 6px; text-align: center; }
+  .calib-chart svg { width: 100%; height: auto; display: block; }
+  .calib-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+
   @media (max-width: 640px) {
     .grid { grid-template-columns: repeat(9, 32px); grid-template-rows: repeat(9, 32px); }
     .cell { font-size: 15px; }
@@ -810,6 +817,31 @@ var PAGE_HTML = `<!doctype html>
     if (incorrectCount === 0) return "solved";
     if (round >= MAX_ROUNDS) return "limit";
     return "continue";
+  }
+
+  // 集計ビュー(SPEC F1 拡張2、docs/DESIGN.md 4.2)。records を key("pc" | "conf")の
+  // 値で10%刻み10帯に振り分け、帯ごとの件数・正解数・正解率を返す純粋関数。
+  // 値 v の帯は Math.min(9, Math.floor(v * 10))(1.0 は最後の帯に入る)。
+  // 数値でない・NaN・有限でない値は除外する。
+  function binRecords(records, key) {
+    var bins = [];
+    for (var i = 0; i < 10; i++) {
+      bins.push({ lo: i / 10, hi: (i + 1) / 10, n: 0, correct: 0, rate: null });
+    }
+    var list = Array.isArray(records) ? records : [];
+    for (var j = 0; j < list.length; j++) {
+      var rec = list[j];
+      var v = rec ? rec[key] : undefined;
+      if (typeof v !== "number" || !isFinite(v)) continue;
+      var idx = Math.min(9, Math.floor(v * 10));
+      if (idx < 0) continue;
+      bins[idx].n += 1;
+      if (rec.ok) bins[idx].correct += 1;
+    }
+    for (var b = 0; b < 10; b++) {
+      bins[b].rate = bins[b].n === 0 ? null : bins[b].correct / bins[b].n;
+    }
+    return bins;
   }
 
   // 実行世代のチェック。reset() / showError() で runToken が進むので、
@@ -1567,6 +1599,117 @@ var PAGE_HTML = `<!doctype html>
     return "<div id=\\"completion-banner\\"></div>";
   }
 
+  // 帯1つ分の較正図(横軸=帯0〜100%、縦軸=正解率0〜100%)を描くインラインSVG。
+  // 対角線(理想の較正線)は薄いグレー、棒はアクセント色(正解/不正解の色とは分ける)。
+  // 件数0の帯は棒を描かない。色は PAGE_HTML の CSS 変数をそのまま使う(ライブラリ不使用)。
+  function renderCalibrationChart(bins, titleText) {
+    var width = 240;
+    var height = 160;
+    var padLeft = 28;
+    var padRight = 8;
+    var padTop = 10;
+    var padBottom = 20;
+    var plotW = width - padLeft - padRight;
+    var plotH = height - padTop - padBottom;
+    var barGap = 2;
+    var barSlot = plotW / 10;
+    var barWidth = barSlot - barGap;
+
+    function xAt(i) {
+      return padLeft + i * barSlot;
+    }
+    function yAt(rate) {
+      return padTop + (1 - rate) * plotH;
+    }
+
+    var svg = "<svg viewBox=\\"0 0 " + width + " " + height + "\\" role=\\"img\\" aria-label=\\"" + escapeHtml(titleText) + "\\">";
+    svg += "<line x1=\\"" + xAt(0) + "\\" y1=\\"" + yAt(0) + "\\" x2=\\"" + xAt(10) + "\\" y2=\\"" + yAt(1) +
+      "\\" style=\\"stroke:var(--muted);stroke-width:1;stroke-dasharray:4 3;opacity:0.6;\\" />";
+    svg += "<line x1=\\"" + padLeft + "\\" y1=\\"" + (padTop + plotH) + "\\" x2=\\"" + (padLeft + plotW) +
+      "\\" y2=\\"" + (padTop + plotH) + "\\" style=\\"stroke:var(--border);stroke-width:1;\\" />";
+    for (var i = 0; i < bins.length; i++) {
+      var bin = bins[i];
+      if (bin.n === 0) continue;
+      var barH = bin.rate * plotH;
+      var bx = xAt(i) + barGap / 2;
+      var by = padTop + plotH - barH;
+      svg += "<rect x=\\"" + bx + "\\" y=\\"" + by + "\\" width=\\"" + barWidth + "\\" height=\\"" + barH +
+        "\\" style=\\"fill:var(--accent);\\" />";
+      svg += "<text x=\\"" + (bx + barWidth / 2) + "\\" y=\\"" + Math.max(9, by - 3) +
+        "\\" text-anchor=\\"middle\\" font-size=\\"8\\" style=\\"fill:var(--muted);\\">" + bin.n + "</text>";
+    }
+    svg += "<text x=\\"" + (padLeft - 4) + "\\" y=\\"" + (padTop + 3) + "\\" text-anchor=\\"end\\" font-size=\\"8\\" style=\\"fill:var(--muted);\\">100</text>";
+    svg += "<text x=\\"" + (padLeft - 4) + "\\" y=\\"" + (padTop + plotH) + "\\" text-anchor=\\"end\\" font-size=\\"8\\" style=\\"fill:var(--muted);\\">0</text>";
+    svg += "<text x=\\"" + padLeft + "\\" y=\\"" + (height - 4) + "\\" font-size=\\"8\\" style=\\"fill:var(--muted);\\">0%</text>";
+    svg += "<text x=\\"" + (padLeft + plotW) + "\\" y=\\"" + (height - 4) + "\\" text-anchor=\\"end\\" font-size=\\"8\\" style=\\"fill:var(--muted);\\">100%</text>";
+    svg += "</svg>";
+
+    return "<div class=\\"calib-chart\\"><p class=\\"calib-chart-title\\">" + escapeHtml(titleText) + "</p>" + svg + "</div>";
+  }
+
+  // 集計パネル(SPEC F1 拡張2)。records は state ではなく localStorage 由来なので、
+  // render() のたびに loadRecords() で読み直す(上限5,000件なので毎回集計してよい)。
+  function renderCalibration() {
+    var records = loadRecords();
+    var total = records.length;
+    var correctCount = 0;
+    var puzzles = {};
+    for (var i = 0; i < records.length; i++) {
+      var rec = records[i];
+      if (!rec) continue;
+      if (rec.ok) correctCount++;
+      if (typeof rec.p === "string") puzzles[rec.p] = true;
+    }
+    var puzzleCount = Object.keys(puzzles).length;
+    var pct = total === 0 ? 0 : Math.round((correctCount / total) * 100);
+
+    var pcBins = binRecords(records, "pc");
+    var confBins = binRecords(records, "conf");
+
+    return "<div id=\\"calibration-panel\\" class=\\"panel\\">" +
+      "<p class=\\"panel-title\\">較正図</p>" +
+      "<p class=\\"calib-summary\\">合計 " + total + " 件 / 全体正解率 " + pct + "% / 記録している問題数 " + puzzleCount + "</p>" +
+      "<div class=\\"calib-charts\\">" +
+      renderCalibrationChart(pcBins, "choiceの確率(pc)による較正") +
+      renderCalibrationChart(confBins, "Jevのconfidenceによる較正") +
+      "</div>" +
+      "<div class=\\"calib-actions\\">" +
+      "<button id=\\"export-records-btn\\" onclick=\\"exportRecords()\\">JSONエクスポート</button>" +
+      "<button id=\\"clear-records-btn\\" onclick=\\"clearRecords()\\">記録を消す</button>" +
+      "</div>" +
+      "</div>";
+  }
+
+  function pad2(n) {
+    return n < 10 ? "0" + n : String(n);
+  }
+
+  // ファイル名 sudoku-calibration-YYYYMMDD-HHMMSS.json(ローカル時刻)。
+  function recordsExportFileName() {
+    var d = new Date();
+    return "sudoku-calibration-" + d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate()) +
+      "-" + pad2(d.getHours()) + pad2(d.getMinutes()) + pad2(d.getSeconds()) + ".json";
+  }
+
+  function exportRecords() {
+    var payload = { version: 1, exported_at: new Date().toISOString(), records: loadRecords() };
+    var blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = recordsExportFileName();
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function clearRecords() {
+    if (!confirm("記録した判定をすべて削除します。よろしいですか?")) return;
+    saveRecords([]);
+    render();
+  }
+
   function render() {
     var app = document.getElementById("app");
     // 周回ログのスクロール位置を引き継ぐ(innerHTML を作り直すと先頭に戻るため)。
@@ -1585,6 +1728,7 @@ var PAGE_HTML = `<!doctype html>
       renderStats() +
       renderCurrentPanel() +
       renderRoundLog() +
+      renderCalibration() +
       renderBanner() +
       "</div>" +
       "</div>";

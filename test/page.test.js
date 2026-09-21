@@ -882,3 +882,126 @@ test(
     }
   }
 );
+
+// -------------------------------------------------------------------
+// 集計ビュー: 較正図パネル(binRecords / renderCalibration / エクスポート / 消去)
+// -------------------------------------------------------------------
+
+test("純粋関数 binRecords: 境界(0.0→帯0 / 0.1→帯1 / 0.95・1.0→帯9)と件数/正解数/正解率", async () => {
+  var ctx = runScript(await getPageHtml());
+  var records = [
+    { pc: 0.0, ok: true },
+    { pc: 0.1, ok: false },
+    { pc: 0.95, ok: false },
+    { pc: 1.0, ok: true },
+    { pc: 1.0, ok: false },
+  ];
+  var bins = ctx.binRecords(records, "pc");
+  assert.equal(bins.length, 10);
+
+  assert.equal(bins[0].n, 1);
+  assert.equal(bins[0].correct, 1);
+  assert.equal(bins[0].rate, 1);
+
+  assert.equal(bins[1].n, 1);
+  assert.equal(bins[1].correct, 0);
+  assert.equal(bins[1].rate, 0);
+
+  // 0.95 と 1.0(2件)はどれも最後の帯(帯9)に入る
+  assert.equal(bins[9].n, 3, "0.95/1.0 が帯9に集約されていない");
+  assert.equal(bins[9].correct, 1);
+  assert.ok(Math.abs(bins[9].rate - 1 / 3) < 1e-9);
+
+  // 件数0の帯は rate が null
+  assert.equal(bins[2].n, 0);
+  assert.equal(bins[2].rate, null);
+});
+
+test("純粋関数 binRecords: 数値でない/NaNの値を除外し、pc と conf を独立に集計する", async () => {
+  var ctx = runScript(await getPageHtml());
+  var records = [
+    { pc: 0.25, conf: 0.85, ok: true },
+    { pc: "0.5", conf: 0.15, ok: true }, // pc が文字列 → pc集計から除外
+    { pc: NaN, conf: 0.15, ok: false }, // pc が NaN → pc集計から除外
+    { pc: 0.25, ok: true }, // conf が無い(undefined)→ conf集計から除外
+  ];
+
+  var pcBins = ctx.binRecords(records, "pc");
+  var pcTotal = pcBins.reduce(function (sum, b) {
+    return sum + b.n;
+  }, 0);
+  assert.equal(pcTotal, 2, "数値でない/NaNのpcが除外されていない");
+  assert.equal(pcBins[2].n, 2, "pc=0.25(帯2)の集計が合わない");
+  assert.equal(pcBins[2].rate, 1);
+
+  var confBins = ctx.binRecords(records, "conf");
+  var confTotal = confBins.reduce(function (sum, b) {
+    return sum + b.n;
+  }, 0);
+  assert.equal(confTotal, 3, "confが無い記録が除外されていない");
+  assert.equal(confBins[8].n, 1, "conf=0.85(帯8)の集計が合わない");
+  assert.equal(confBins[1].n, 2, "conf=0.15(帯1)が2件、集計が合わない");
+  assert.equal(confBins[1].rate, 0.5);
+});
+
+test("renderCalibration: 記録が無ければ0件/0%/0問、あれば件数・正解率・SVGが出る", async () => {
+  var ctx = runScript(await getPageHtml());
+  ctx.render();
+  var emptyHtml = ctx.appElement.innerHTML;
+  assert.ok(emptyHtml.includes('id="calibration-panel"'), "集計パネルが描画されていない");
+  assert.ok(emptyHtml.includes("較正図"));
+  assert.ok(emptyHtml.includes("合計 0 件"));
+
+  ctx.saveRecords([
+    { t: 1, p: "x", r: 0, c: 0, round: 1, choice: "4", pc: 0.61, conf: 0.31, ok: true },
+    { t: 2, p: "x", r: 0, c: 1, round: 1, choice: "2", pc: 0.2, conf: 0.1, ok: false },
+  ]);
+  ctx.render();
+  var html = ctx.appElement.innerHTML;
+  assert.ok(html.includes("合計 2 件"));
+  assert.ok(html.includes('id="export-records-btn"'));
+  assert.ok(html.includes('id="clear-records-btn"'));
+  assert.ok(html.includes("exportRecords()"));
+  assert.ok(html.includes("clearRecords()"));
+  assert.ok(html.includes("<svg"), "較正図のSVGが描画されていない");
+});
+
+test("exportRecords: エクスポート内容(version/exported_at/records)がloadRecords()と一致する", async () => {
+  var ctx = runScript(await getPageHtml());
+  var sample = [
+    { t: 1, p: "aaaa1111", r: 0, c: 0, round: 1, choice: "1", pc: 0.5, conf: 0.4, ok: true },
+    { t: 2, p: "aaaa1111", r: 0, c: 1, round: 1, choice: "2", pc: 0.3, conf: 0.2, ok: false },
+  ];
+  ctx.saveRecords(sample);
+
+  ctx.exportRecords();
+
+  assert.equal(ctx.createdBlobs.length, 1, "Blob が作られていない");
+  var blob = ctx.createdBlobs[0];
+  assert.equal(blob.options.type, "application/json");
+  var payload = JSON.parse(blob.parts[0]);
+  assert.equal(payload.version, 1);
+  assert.ok(typeof payload.exported_at === "string" && !isNaN(Date.parse(payload.exported_at)), "exported_at がISO文字列でない");
+  assert.deepEqual(payload.records, sample);
+
+  // <a download> が作られ、appendChild/removeChild が対になっている
+  assert.equal(ctx.bodyChildren.length, 0, "<a> がbodyに残ったまま");
+});
+
+test("clearRecords: confirmがtrueなら記録が0件になり、falseなら消えない", async () => {
+  var sampleRecord = { t: 1, p: "x", r: 0, c: 0, round: 1, choice: "1", pc: 0.5, conf: 0.5, ok: true };
+
+  var ctxKeep = runScript(await getPageHtml(), {
+    confirm: function () {
+      return false;
+    },
+  });
+  ctxKeep.saveRecords([sampleRecord]);
+  ctxKeep.clearRecords();
+  assert.equal(ctxKeep.loadRecords().length, 1, "confirmがfalseなのに削除された");
+
+  var ctxClear = runScript(await getPageHtml()); // 既定の confirm は true を返す
+  ctxClear.saveRecords([sampleRecord]);
+  ctxClear.clearRecords();
+  assert.equal(ctxClear.loadRecords().length, 0, "confirmがtrueなのに削除されていない");
+});
