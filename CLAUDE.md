@@ -39,13 +39,13 @@ TypeSafe AI の決定モデル **Jev**(`typesafe/jev`、Cloudflare Workers AI �
 - Cloudflare Workers(Module Worker、JavaScript)。フレームワーク・ビルドステップなし
 - フロントエンドは `src/index.js` 内の `PAGE_HTML` テンプレート文字列に素のHTML/CSS/JSとして埋め込み。**別ファイル化や React 化はしない**(1ファイルで読める・デプロイできることを優先)
 - AI 呼び出しは `env.AI.run('typesafe/jev', {...})` のみ。他のモデル・外部APIは使わない
-- Node.js 20 以上、wrangler 4.x
+- Node.js 22 以上、wrangler 4.x(wrangler 4.135 の engines が Node 22 以上。`npm test` のグロブ指定も Node 22 以降の機能)
 
 ## よく使うコマンド
 
 ````bash
 npm install                 # wrangler を入れる
-npm test                    # node --test test/(認証不要。ロジックと不変条件の検証)
+npm test                    # node --test "test/**/*.test.js"(認証不要。ロジックと不変条件の検証)
 npm run check               # wrangler deploy --dry-run(認証不要。設定とビルドの検証だけ)
 npm run deploy              # 本番デプロイ(CLOUDFLARE_API_TOKEN が必要)
 npm run dev                 # ローカル起動。AIバインディングはリモート実行なので、これもトークンが必要

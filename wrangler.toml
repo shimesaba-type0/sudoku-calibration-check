@@ -1,0 +1,26 @@
+name = "sudoku-calibration-check"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+# Workers AI バインディング。Worker 内では env.AI として見える。
+[ai]
+binding = "AI"
+
+# レート制限のカウンタ置き場(固定ウィンドウ)。
+# id は初回デプロイ前に一度だけ手作業で作る必要がある:
+#   npx wrangler kv namespace create RATE_LIMIT_KV
+# 出力された id を下の REPLACE_WITH_KV_NAMESPACE_ID と置き換えてからでないと
+# deploy は失敗する。id は秘密情報ではないのでコミットしてよい。
+[[kv_namespaces]]
+binding = "RATE_LIMIT_KV"
+id = "REPLACE_WITH_KV_NAMESPACE_ID"
+
+# レート制限の唯一の調整つまみ。ここの値を書き換えて再デプロイするだけで
+# 上限が変わる(src/index.js は触らない)。数値は文字列として Worker に渡り、
+# 10進整数として読めない値は既定値(30 / 500 / 3600)に落ちる。
+# これが Workers AI のコストを頭打ちにする唯一の砦なので、理由なく緩めないこと
+# (docs/DESIGN.md 7章 / CLAUDE.md 作業ルール4)。
+[vars]
+RATE_LIMIT_PER_IP_MAX = "30"
+RATE_LIMIT_GLOBAL_MAX = "500"
+RATE_LIMIT_WINDOW_SECONDS = "3600"
