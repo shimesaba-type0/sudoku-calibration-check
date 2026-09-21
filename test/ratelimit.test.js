@@ -21,6 +21,9 @@ test("IP単位の上限を超えると 429(Retry-After と X-RateLimit-Scope: ip
   var res = await worker.fetch(judgeRequest(validBody(), "198.51.100.7"), env);
   assert.equal(res.status, 429);
   assert.equal(res.headers.get("X-RateLimit-Scope"), "ip");
+  // 拒否応答には残数ヘッダーを付けない
+  assert.equal(res.headers.get("X-RateLimit-Remaining-IP"), null);
+  assert.equal(res.headers.get("X-RateLimit-Remaining-Global"), null);
   var retryAfter = Number(res.headers.get("Retry-After"));
   assert.ok(Number.isInteger(retryAfter) && retryAfter > 0, "Retry-After が正の整数でない");
   assert.ok(retryAfter <= 3600);
@@ -50,6 +53,8 @@ test("全体の上限を超えると 429(X-RateLimit-Scope: global)", async () =
   var res = await worker.fetch(judgeRequest(validBody(), "198.51.100.3"), env);
   assert.equal(res.status, 429);
   assert.equal(res.headers.get("X-RateLimit-Scope"), "global");
+  assert.equal(res.headers.get("X-RateLimit-Remaining-IP"), null);
+  assert.equal(res.headers.get("X-RateLimit-Remaining-Global"), null);
   assert.ok(Number(res.headers.get("Retry-After")) > 0);
   var body = await res.json();
   assert.ok(body.error.includes("全体"));

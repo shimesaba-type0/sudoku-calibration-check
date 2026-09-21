@@ -89,7 +89,7 @@ IP単位・全体、の2段構えの固定ウィンドウ・レート制限。`h
    - `choice` が文字列で、`"1"`〜`"9"` のいずれか
    - `confidence` が有限の数値。**値の妥当性は見ない**(Jev 独自の確信度で `probabilities[choice]` とは一致しないため。3.4 / SPEC 4章)
 7. `{ probabilities, choice, confidence }` に絞って 200 で返す。`confidence` は Jev の値をそのまま通す(`probabilities[choice]` に差し替えない)
-8. `X-RateLimit-Remaining-IP` / `X-RateLimit-Remaining-Global`(その時点の残り回数)は、**レート制限を通過したすべてのレスポンス** に付く。200 だけでなく、その後の 400(入力不正)や 502(AI 失敗・形式不正)にも付く(どれも1回として数えているため)。レート制限より手前で止まる 415 と、制限に引っかかった 429 / 503 には付かない
+8. `X-RateLimit-Remaining-IP` / `X-RateLimit-Remaining-Global`(その時点の残り回数)は、**レート制限を通過したすべてのレスポンス** に付く(`RATE_LIMIT_KV` バインディングがあるとき。無いフェイルオープン時は残数が存在しないので付かない)。200 だけでなく、その後の 400(入力不正)や 502(AI 失敗・形式不正)にも付く(どれも1回として数えているため)。レート制限より手前で止まる 415 と、制限に引っかかった 429 / 503 には付かない
 
 `state` はオブジェクトで渡す(Jev は string / object / array を受け付ける):
 
