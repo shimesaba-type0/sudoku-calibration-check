@@ -559,6 +559,9 @@ async function handleJudge(request, env) {
       {
         error: "AIの呼び出しに失敗しました",
         raw: truncate(String((err && err.message) || err)),
+        // env.AI.run に渡したペイロードそのもの(Issue #34)。失敗時もフロントで
+        // 「何を送って失敗したか」を確認できるように添える。
+        request: payload,
       },
       502,
       rate.headers
@@ -572,7 +575,12 @@ async function handleJudge(request, env) {
     // AI.run が undefined を解決したとき、そのままだと raw のキーごと JSON から消える。
     // デバッグ用に「何が返ってきたか」を必ず残したいので null に寄せる。
     return jsonResponse(
-      { error: badAnswer, raw: rawForResponse(result === undefined ? null : result) },
+      {
+        error: badAnswer,
+        raw: rawForResponse(result === undefined ? null : result),
+        // env.AI.run に渡したペイロードそのもの(Issue #34)。
+        request: payload,
+      },
       502,
       rate.headers
     );
@@ -585,6 +593,9 @@ async function handleJudge(request, env) {
       choice: answer.choice,
       // Jev 独自の確信度。probabilities[choice] とは一致しない(docs/SPEC.md 4章)。
       confidence: answer.confidence,
+      // env.AI.run に渡したペイロードそのもの(Issue #34)。フロントの「Jev に送った
+      // プロンプト」パネルがそのまま表示する。別のオブジェクトを組み立て直さない。
+      request: payload,
     },
     200,
     rate.headers
@@ -740,6 +751,20 @@ var PAGE_HTML = `<!doctype html>
   .bar-fill { height: 100%; border-radius: 4px; }
   .bar-pct { text-align: right; font-family: "IBM Plex Mono", monospace; color: var(--muted); }
   .muted { color: var(--muted); font-size: 13px; margin: 0; }
+  .prompt-json {
+    overflow: auto;
+    max-height: 320px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    font-family: "IBM Plex Mono", "Courier New", monospace;
+    font-size: 12px;
+    color: var(--muted);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin: 0;
+  }
 
   #round-log ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
   #round-log li { font-size: 12px; font-family: "IBM Plex Mono", monospace; color: var(--muted); }
@@ -1167,7 +1192,9 @@ var PAGE_HTML = `<!doctype html>
     difficulty: DEFAULT_DIFFICULTY, // "easy" | "normal" | "hard"(SPEC F1)。次の newPuzzle() から効く
     errorMessage: null,
     stoppedAtLimit: false,
-    lastJudgment: null // 直前に確定した1件(最速モードでも結果が見えるように残す)
+    lastJudgment: null, // 直前に確定した1件(最速モードでも結果が見えるように残す)
+    lastRequest: null, // 直近の判定で Worker が Jev に渡したペイロード(request、Issue #34)
+    lastRequestFailed: false // lastRequest が失敗した判定(502)のものなら true(Issue #34)
   };
   // 描画に不要な進行管理はモジュール変数(docs/DESIGN.md 4.1)
   var queue = [];
@@ -1201,13 +1228,20 @@ var PAGE_HTML = `<!doctype html>
     });
     if (res.ok) return res.json();
     var message = "HTTP " + res.status;
+    var data = null;
     try {
-      var data = await res.json();
+      data = await res.json();
       if (data && typeof data.error === "string") message = data.error;
     } catch (e) {
       // JSONでないボディはそのまま HTTP <status> にフォールバック
     }
-    throw new Error(message);
+    var error = new Error(message);
+    // 502 には Worker が Jev に渡したペイロード(request)が付く(Issue #34)。
+    // 「何を送って失敗したか」をパネルに出せるよう、エラーに載せて呼び出し元へ渡す。
+    if (data && data.request && typeof data.request === "object") {
+      error.request = data.request;
+    }
+    throw error;
   }
 
   // -------------------------------------------------------------------
@@ -1341,6 +1375,12 @@ var PAGE_HTML = `<!doctype html>
         return { digit: d, pct: Math.round((typeof p === "number" ? p : 0) * 100), isPick: d === result.choice };
       });
       state.currentProbs = probs;
+      // Worker が Jev に渡したペイロードそのもの(Issue #34)。停止中でも消さず、
+      // 次の判定が確定するまで(エラー時もそのまま)残す。
+      if (result.request && typeof result.request === "object") {
+        state.lastRequest = result.request;
+        state.lastRequestFailed = false;
+      }
       pendingCommit = { r: cell.r, c: cell.c, choice: result.choice, confidence: result.confidence, probabilities: result.probabilities };
       render();
       var beforeCommitMs = state.speedMode === "slow" ? SLOW_BEFORE_COMMIT_MS : FAST_BEFORE_COMMIT_MS;
@@ -1359,6 +1399,12 @@ var PAGE_HTML = `<!doctype html>
       // reset() / showError() による abort() が原因の AbortError はユーザーへの
       // エラー表示にしない。世代トークンの判定と同じ「古い世代は無視する」扱い(Issue #19)。
       if (err && err.name === "AbortError") return;
+      // 502 に付いてきた request(Jev に渡したペイロード)は「このプロンプトで失敗」
+      // としてパネルに残す(Issue #34)。request の無い 400/429/503 は直前の値のまま。
+      if (err && err.request && typeof err.request === "object") {
+        state.lastRequest = err.request;
+        state.lastRequestFailed = true;
+      }
       showError(err && err.message ? err.message : String(err));
     }).catch(function (err) {
       // 成功ハンドラ(render など)が投げた場合。API エラーとは区別して表示する。
@@ -1536,7 +1582,9 @@ var PAGE_HTML = `<!doctype html>
       difficulty: keepDifficulty,
       errorMessage: null,
       stoppedAtLimit: false,
-      lastJudgment: null
+      lastJudgment: null,
+      lastRequest: null,
+      lastRequestFailed: false
     };
     queue = [];
     roundWrong = [];
@@ -1774,6 +1822,28 @@ var PAGE_HTML = `<!doctype html>
     return head + "<p class=\\"muted\\">待機中</p>" + tail;
   }
 
+  // 「Jev に送ったプロンプト」パネル(Issue #34)。Worker が env.AI.run に渡した
+  // ペイロード(request)をそのまま JSON で表示する。フロント側で組み立て直さない
+  // (handleJudge と二重管理にしないため)。停止中・エラー時も直近の値を残す。
+  function renderPromptPanel() {
+    var head = "<div id=\\"prompt-panel\\" class=\\"panel\\"><p class=\\"panel-title\\">Jev に送ったプロンプト</p>";
+    var tail = "</div>";
+    var req = state.lastRequest;
+    if (!req) {
+      return head + "<p class=\\"muted\\">まだ判定していません(実行すると直近の判定に使ったプロンプトが表示されます)</p>" + tail;
+    }
+    var target = req.state && req.state.target;
+    var usedFor = "";
+    var failedNote = state.lastRequestFailed ? "(このプロンプトで失敗)" : "";
+    if (target && typeof target.row === "number" && typeof target.col === "number") {
+      usedFor = "<p class=\\"muted\\">" + escapeHtml(coordLabel(target.row, target.col)) + " の判定に使用" + failedNote + "</p>";
+    } else if (failedNote) {
+      usedFor = "<p class=\\"muted\\">" + failedNote + "</p>";
+    }
+    return head + usedFor +
+      "<pre class=\\"prompt-json\\">" + escapeHtml(JSON.stringify(req, null, 2)) + "</pre>" + tail;
+  }
+
   function renderRoundLog() {
     if (state.roundLog.length === 0) {
       return "<div id=\\"round-log\\" class=\\"panel\\"><p class=\\"panel-title\\">周回ログ</p><p class=\\"muted\\">まだ記録はありません</p></div>";
@@ -1944,6 +2014,7 @@ var PAGE_HTML = `<!doctype html>
       renderControls() +
       renderStats() +
       renderCurrentPanel() +
+      renderPromptPanel() +
       renderRoundLog() +
       renderCalibration() +
       renderBanner() +
