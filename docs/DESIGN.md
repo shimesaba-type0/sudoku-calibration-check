@@ -218,6 +218,7 @@ var state = {
   done: false,
   roundsToSolve: null, // 完了時の周数
   speedMode: "slow",   // "slow" | "fast"
+  difficulty: "normal", // "easy" | "normal" | "hard"。次の newPuzzle() のヒント数に効く(SPEC F1/F4')
   errorMessage: null,  // エラーボックスに出す文言。null なら非表示
   stoppedAtLimit: false, // 15周の安全弁で止まったか(完了バナーの出し分け)
   lastJudgment: null   // 直前に確定した1件 { r, c, choice, confidence, status, probs }。
@@ -257,8 +258,9 @@ var inflightController = null;  // in-flight の /api/judge 用 AbortController(
 |---|---|
 | `solveCount(grid, limit, found)` | 解の個数を数えるソルバー。`limit` 個見つけたら打ち切る(一意解の判定は `limit=2` で足りる)。候補の少ないマスから埋める(MRV)+ 行・列・箱のビットマスクでのバックトラッキング。`found` に配列を渡すと見つけた解を9行の文字列配列で受け取れる。置かれている数字がすでに矛盾していれば 0 |
 | `generateSolvedGrid()` | 空盤面に対し、各マスの候補をシャッフルしながらバックトラッキングして完成盤を1つ作る純粋関数(乱数のみ外部依存) |
-| `generatePuzzle(targetGivens)` | 完成盤からマスをランダム順に消し、消すたびに `solveCount(grid, 2) === 1` を確認する(2 になるなら戻す)。与えられた数字が `targetGivens`(既定 `DEFAULT_TARGET_GIVENS` = 30、下限 `MIN_TARGET_GIVENS` = 24)になったら打ち切る。戻り値 `{ given, solution }`(どちらも9行の文字列配列) |
-| `newPuzzle()` | 「新しい問題」ボタン。`generating` を立てて `reset()`(= 世代トークンを進めて進行中のループを無効化し、in-flight の `/api/judge` も `abort()` する。Issue #19)し、`setTimeout(…, 0)` で生成してから `GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize` を差し替えて再描画。生成は同期で概ね 10 ms 以下(実測: 中央値 4ms、最大 10ms、100回) |
+| `generatePuzzle(targetGivens)` | 完成盤からマスをランダム順に消し、消すたびに `solveCount(grid, 2) === 1` を確認する(2 になるなら戻す)。与えられた数字が `targetGivens`(既定 `DEFAULT_TARGET_GIVENS` = 30、下限 `MIN_TARGET_GIVENS` = 24)になったら打ち切る。戻り値 `{ given, solution }`(どちらも9行の文字列配列)。ランダム順の都合で `targetGivens` ちょうどに届かず、それより多いヒント数で止まることがある(下は `generatePuzzleWithRetry`) |
+| `generatePuzzleWithRetry(targetGivens)` | `generatePuzzle(targetGivens)` をランダム順を変えて最大 `GENERATE_RETRIES`(既定3)回試し、ちょうど `targetGivens` に届いた時点で打ち切って返す。「むずかしい」(`DIFFICULTY_GIVENS.hard` = 25)は目標ちょうどに届かず26〜28で止まることがある(既知。PR #15 の補足)ため、3回とも届かなければ、そのうち最もヒント数が少ない結果を返す(無限ループにしない)。`newPuzzle()` が呼ぶ |
+| `newPuzzle()` | 「新しい問題」ボタン。`generating` を立てて `reset()`(= 世代トークンを進めて進行中のループを無効化し、in-flight の `/api/judge` も `abort()` する。Issue #19)し、`reset()` で維持される `state.difficulty` から目標ヒント数(`DIFFICULTY_GIVENS[state.difficulty]`)を決めてから `setTimeout(…, 0)` で `generatePuzzleWithRetry()` を呼んで生成し、`GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize` を差し替えて再描画。生成は同期で「むずかしい」の3回試行でも概ね数十 ms 以下(実測: 10回で 200ms 未満) |
 | `countEmpty(grid)` / `boxIndex` / `gridToCells` / `cellsToGrid` / `shuffled` | 上記の下請け。盤面の2つの表現(9行の文字列配列 ⇔ 81要素の数値配列。0 が空)の変換と、Fisher-Yates シャッフル |
 | `buildSnapshot()` | `GIVEN` + `state.values`(正誤問わず)から9行の文字列配列を作る。未確定は `.`。**判定対象のマスだけは `.` にして送る(他のマスの過去の推測は正誤問わず残す)**。Worker 側も 3.3 でこれを検証する |
 | `formatRoundSummary(round, correct, total)` | 周回ログの1行「N周目: M中K正解 (P%)」を組み立てる純粋関数。`total` が0でも割り算しない |
@@ -270,9 +272,10 @@ var inflightController = null;  // in-flight の /api/judge 用 AbortController(
 | `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong`/`state.lastJudgment` を更新。`pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない。正誤が確定するこの時点で `appendRecord()` を呼び、集計ビュー用の1件を記録する |
 | `finalizeRound()` | ログ追記→`shouldStop` の結果で完了 / 強制終了 / 次の周(`queue = nextQueue(roundWrong)`) |
 | `run()` | 初回のみ queue を全空マスで初期化し `focusNext` を開始 |
-| `reset()` | `runToken` を進め、`inflightController` があれば `abort()` して in-flight の `/api/judge` を打ち切り、進行管理と `state` を初期化(`speedMode` は維持)(Issue #19) |
+| `reset()` | `runToken` を進め、`inflightController` があれば `abort()` して in-flight の `/api/judge` を打ち切り、進行管理と `state` を初期化(`speedMode` / `difficulty` は維持)(Issue #19、#21) |
 | `showError(message)` | `runToken` を進め、`inflightController` があれば `abort()` して `state.errorMessage` を立て、`running=false` で止める(不変条件4、Issue #19) |
 | `setSpeed(mode)` | `state.speedMode` を切り替えて再描画。実行中でも切り替えられる(4.4) |
+| `setDifficulty(mode)` | `state.difficulty`(`"easy"` / `"normal"` / `"hard"`)を切り替えて再描画。変えただけでは盤面は変わらず、次の `newPuzzle()` の目標ヒント数に効く(Issue #21) |
 | `render()` | `state` から DOM(グリッド・統計・バー・ログ・集計パネル・バナー・ボタン)を **全部 innerHTML で再生成**。周回ログのスクロール位置だけは引き継ぐ |
 | `render*()` | `renderGrid` / `renderLegend` / `renderControls` / `renderErrorBox` / `renderStats`(+`statCard`)/ `renderCurrentPanel`(+`coordLabel` / `renderBars`)/ `renderRoundLog` / `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`。それぞれHTML文字列を返すだけで、DOMには触らない |
 | `buildCellStyle()` | マスの状態(given/pending/correct/incorrect + focused)からインラインstyle文字列を返す |
@@ -349,7 +352,7 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
 
 `GIVEN`(与えられた数字)と `SOLUTION`(正解表)は **再代入できる `var`** で、初期値は
 Wikipedia の数独記事で使われている例題。「新しい問題」(4.2 `newPuzzle`)を押すと
-`generatePuzzle()` の結果で丸ごと差し替わり、`TOTAL_EMPTY` と `roundSize` も再計算される。
+`generatePuzzleWithRetry()` の結果で丸ごと差し替わり、`TOTAL_EMPTY` と `roundSize` も再計算される。
 どちらもブラウザ用スクリプトの中にだけあり、Worker 側には無い(1 章・9 章 不変条件7)。
 
 ````javascript
@@ -357,7 +360,15 @@ var GIVEN = [ "53..7....", "6..195...", ".98....6.", "8...6...3", "4..8.3..1", "
 var SOLUTION = [ "534678912", "672195348", "198342567", "859761423", "426853791", "713924856", "961537284", "287419635", "345286179" ];
 ````
 
-固定問題の空マスは51。生成した問題は既定30ヒント(空マス51)で、下限24ヒントまでしか削らない。`SOLUTION` は採点表示にだけ使う。
+固定問題の空マスは51(ヒント数30)。初期表示は難易度に関係なく常にこの固定問題。
+
+「新しい問題」で生成する目標ヒント数は `DIFFICULTY_GIVENS`(`state.difficulty` で選ぶ。SPEC F4'):
+
+````javascript
+var DIFFICULTY_GIVENS = { easy: 36, normal: 30, hard: 25 };
+````
+
+`generatePuzzle()` 単体は下限 `MIN_TARGET_GIVENS`(24)までしか削らない。「やさしい」「ふつう」はほぼ常に目標ちょうどに届くが、「むずかしい」(25)はランダムに消す順序の都合でちょうどに届かず26〜28で止まることがある(実測: 2000回中 25=84%・26=12.5%・27=3%・28=0.5%、`generatePuzzle` 単体呼び出し時)。`newPuzzle()` はこれを `generatePuzzleWithRetry()`(4.2)でランダム順を変えて最大 `GENERATE_RETRIES`(3)回まで再試行し、目標ちょうどに届いた結果があればそれを、3回とも届かなければ最もヒント数が少ない結果を採用する形で吸収する。`SOLUTION` は採点表示にだけ使う。
 
 ## 6. 設定・デプロイ
 
@@ -445,7 +456,13 @@ new_sqlite_classes = ["RateLimitCounter"]
     - `generatePuzzle` を **20回** 呼び、毎回 `solveCount(given, 2) === 1`、`solveCount` が見つける解が `solution` と一致、与えられた数字が 17〜40 個、`solution` が数独として正しい(行・列・箱に1〜9が1回ずつ)こと。乱数を使うので所要時間の上限も見る(実測: 20回で 160ms 前後)
     - `newPuzzle()` で `GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize` が差し替わり、周回・統計が初期化されること。初期表示は固定問題のままであること
     - 「新しい問題」の後に `run()` すると、**新しい `GIVEN` の空マスだけを行優先の順で** `/api/judge` に問い合わせること(回数と座標の両方を見る。空マスの「数」は固定問題と同じ51になりうるため)
-    - vm のコンテキストで作った配列は host とは別レルムなので、`deepStrictEqual` の前に host 側の配列へ移し替える(`hostRows`)
+    - vm のコンテキストで作った配列は host とは別レルムなので、`deepStrictEqual` の前に host 側の配列へ移し替える(`hostRows`)。オブジェクト(`DIFFICULTY_GIVENS` など)も同じ理由で `deepStrictEqual` はプロトタイプ違いで落ちるので、値だけを個別に比較する
+  - **難易度(ヒント数)**(`test/page.test.js`、Issue #21)。ジェネレーター系と同じ `runScript` harness を使う
+    - 難易度ごとの `generatePuzzle(DIFFICULTY_GIVENS[difficulty])` を各10回: 常に一意解、解が `solution` と一致、ヒント数がやさしい36/ふつう30は**ちょうど**、むずかしいは25〜28(下限24以上、5章の実測分布どおりジェネレーター単体では時々ちょうどに届かないことがある契約を検証する)
+    - 難易度トグルの描画(`renderControls()`): 選択中のボタンだけに `active` クラスと `aria-pressed="true"` が付き、他は `aria-pressed="false"` であること。`setDifficulty("hard")` で `state.difficulty` が変わり、`reset()` 後も維持されること
+    - `setDifficulty()` だけを呼んでも `GIVEN` は変わらない(次の `newPuzzle()` から効く)こと
+    - `newPuzzle()` が `state.difficulty` に応じたヒント数で生成すること(`hard` で25〜28、`easy` で36ちょうど)
+    - `newPuzzle()` の所要時間: `hard`(再試行が最も起きやすい)を10回で2秒以内であること(実測: 10回で200ms未満)
   - **周回ロジックの振る舞い: in-flight の abort**(`test/page.test.js` S1〜S4、Issue #19)。これまでの世代トークンの検査は正規表現によるソース検査だけだったが、`runScript` harness で `run()` / `reset()` / `newPuzzle()` を実際に走らせて振る舞いを検証する。`fetch` モックは resolve/reject を外側から制御できる「宙吊り」な `Promise` を返し、`init.signal` に `addEventListener("abort", ...)` を仕込んで `inflightController.abort()` を再現する(`makeAbortAwareFetch`)
     - S1: `run()` → 1件目の fetch を宙吊り → `reset()` → `run()` → 宙吊りを解決 → 全部流す。fetch 総数が51以下(abort により宙吊り分が再送されない)、commit 51、空マス0、`state.done === true` であること
     - S2: in-flight で `reset()` のみ。commit 0、`state.values` が空、`state.running === false`、記録(`getRecords()`)も増えないこと

@@ -255,6 +255,7 @@ test("GET / は判定ループが依存するDOMフック一式と /api/judge �
   assert.ok(html.includes('id=\\"run-btn\\"'), "実行ボタンの id が無い");
   assert.ok(html.includes('id=\\"reset-btn\\"'), "リセットボタンの id が無い");
   assert.ok(html.includes('id=\\"speed-toggle\\"'), "速度トグルの id が無い");
+  assert.ok(html.includes('id=\\"difficulty-toggle\\"'), "難易度トグルの id が無い");
   assert.ok(html.includes('id=\\"error-box\\"'), "エラーボックスの id が無い");
   assert.ok(html.includes('id=\\"stats\\"'), "統計カードの id が無い");
   assert.ok(html.includes('id=\\"current-panel\\"'), "現在の判定パネルの id が無い");
@@ -634,6 +635,46 @@ test("generatePuzzle(NaN): DEFAULT_TARGET_GIVENS(30)にフォールバックす�
   );
 });
 
+// 難易度(SPEC F1/F4)ごとの目標ヒント数: やさしい36 / ふつう30 / むずかしい25。
+// 「むずかしい」は generatePuzzle 単体では 25 ちょうどに届かず 26〜28 で止まることが
+// ある(PR #15 の補足。下限は MIN_TARGET_GIVENS の24)。ここでは generatePuzzle(n) を
+// 直接呼ぶ場合の契約だけを見る(再試行は newPuzzle() 側の generatePuzzleWithRetry。
+// 別テストで検証する)。
+test("難易度ごとの generatePuzzle: 常に一意解・解が一致し、ヒント数がやさしい36/ふつう30ちょうど、むずかしいは25〜28(下限24以上)", { timeout: 10000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+  // ctx.DIFFICULTY_GIVENS は vm の別レルムのオブジェクトなので、deepStrictEqual は
+  // プロトタイプ違いで落ちる(hostRows と同じ事情)。値だけを個別に比較する。
+  assert.equal(ctx.DIFFICULTY_GIVENS.easy, 36, "DIFFICULTY_GIVENS.easy が仕様(36)と違う");
+  assert.equal(ctx.DIFFICULTY_GIVENS.normal, 30, "DIFFICULTY_GIVENS.normal が仕様(30)と違う");
+  assert.equal(ctx.DIFFICULTY_GIVENS.hard, 25, "DIFFICULTY_GIVENS.hard が仕様(25)と違う");
+
+  var cases = [
+    { difficulty: "easy", target: ctx.DIFFICULTY_GIVENS.easy, exact: true },
+    { difficulty: "normal", target: ctx.DIFFICULTY_GIVENS.normal, exact: true },
+    { difficulty: "hard", target: ctx.DIFFICULTY_GIVENS.hard, exact: false },
+  ];
+
+  cases.forEach(function (c) {
+    for (var i = 0; i < 10; i++) {
+      var label = c.difficulty + " #" + i;
+      var puzzle = ctx.generatePuzzle(c.target);
+      assertSolvedGrid(puzzle.solution, label);
+
+      var found = [];
+      assert.equal(ctx.solveCount(puzzle.given, 2, found), 1, label + ": 解が一意でない");
+      assert.deepEqual(hostRows(found[0]), hostRows(puzzle.solution), label + ": solveCount の解と solution が違う");
+
+      var filled = countFilled(puzzle.given);
+      assert.ok(filled >= 24, label + ": 与えられた数字が下限24を下回った: " + filled);
+      if (c.exact) {
+        assert.equal(filled, c.target, label + ": ヒント数が" + c.target + "ちょうどでない: " + filled);
+      } else {
+        assert.ok(filled >= 25 && filled <= 28, label + ": ヒント数が25〜28の範囲外: " + filled);
+      }
+    }
+  });
+});
+
 test("リセットは実行中でも押せる(SPEC F5)。生成中だけ無効化される", async () => {
   var ctx = runScript(await getPageHtml());
 
@@ -718,6 +759,95 @@ test("初期表示は固定問題のまま、newPuzzle() で GIVEN / SOLUTION �
   assert.equal(ctx.state.roundLog.length, 0);
   assert.equal(ctx.state.running, false);
   assert.equal(ctx.state.done, false);
+});
+
+test("難易度トグルの描画: 選択中のボタンだけにアクセントが付き、setDifficulty() で state.difficulty が変わり reset() 後も維持される", async () => {
+  var ctx = runScript(await getPageHtml());
+
+  function difficultyToggleHtml() {
+    var html = ctx.renderControls();
+    var m = html.match(/<div id="difficulty-toggle">[\s\S]*?<\/div>/);
+    assert.ok(m, "difficulty-toggle が見つからない");
+    return m[0];
+  }
+  function activeLabels(html) {
+    var re = /<button class="difficulty-btn active"[^>]*>([^<]*)<\/button>/g;
+    var labels = [];
+    var m;
+    while ((m = re.exec(html)) !== null) labels.push(m[1]);
+    return labels;
+  }
+  function pressedState(html, label) {
+    var re = new RegExp('aria-pressed="(true|false)"[^>]*>' + label + "</button>");
+    var m = html.match(re);
+    assert.ok(m, label + " ボタンの aria-pressed が見つからない");
+    return m[1];
+  }
+
+  // 既定は「ふつう」(normal)
+  assert.equal(ctx.state.difficulty, "normal", "既定の難易度が normal でない");
+  var html0 = difficultyToggleHtml();
+  assert.deepEqual(activeLabels(html0), ["ふつう"], "既定でふつうだけがアクセントになっていない");
+  assert.equal(pressedState(html0, "ふつう"), "true");
+  assert.equal(pressedState(html0, "やさしい"), "false");
+  assert.equal(pressedState(html0, "むずかしい"), "false");
+
+  // setDifficulty('hard') で切り替わる
+  ctx.setDifficulty("hard");
+  assert.equal(ctx.state.difficulty, "hard");
+  var html1 = difficultyToggleHtml();
+  assert.deepEqual(activeLabels(html1), ["むずかしい"], "hard 選択後にむずかしいだけがアクセントになっていない");
+  assert.equal(pressedState(html1, "むずかしい"), "true");
+  assert.equal(pressedState(html1, "ふつう"), "false");
+
+  // reset() しても難易度は維持される(speedMode と同じ扱い。DESIGN 4.1)
+  ctx.reset();
+  assert.equal(ctx.state.difficulty, "hard", "reset() 後に難易度が維持されていない");
+});
+
+test("newPuzzle() は state.difficulty に応じたヒント数で生成する(hard: 25〜28 / easy: 36)", { timeout: 10000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+
+  ctx.setDifficulty("hard");
+  ctx.newPuzzle();
+  await waitFor(function () {
+    return ctx.generating === false;
+  }, "hard 生成の完了");
+  var hardFilled = countFilled(ctx.GIVEN);
+  assert.ok(hardFilled >= 25 && hardFilled <= 28, "hard で生成したヒント数が25〜28の範囲外: " + hardFilled);
+  assert.equal(ctx.solveCount(ctx.GIVEN, 2), 1, "hard で生成した問題が一意解でない");
+
+  ctx.setDifficulty("easy");
+  ctx.newPuzzle();
+  await waitFor(function () {
+    return ctx.generating === false;
+  }, "easy 生成の完了");
+  var easyFilled = countFilled(ctx.GIVEN);
+  assert.equal(easyFilled, 36, "easy で生成したヒント数が36ちょうどでない: " + easyFilled);
+  assert.equal(ctx.solveCount(ctx.GIVEN, 2), 1, "easy で生成した問題が一意解でない");
+});
+
+test("難易度を変えただけでは盤面は変わらない(次の newPuzzle() から効く)", { timeout: 10000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+  var beforeGiven = hostRows(ctx.GIVEN);
+
+  ctx.setDifficulty("hard");
+  assert.deepEqual(hostRows(ctx.GIVEN), beforeGiven, "setDifficulty() だけで盤面が変わってしまっている");
+});
+
+test("newPuzzle() の生成時間: むずかしいを10回で2秒以内", { timeout: 10000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+  ctx.setDifficulty("hard");
+
+  var started = Date.now();
+  for (var i = 0; i < 10; i++) {
+    ctx.newPuzzle();
+    await waitFor(function () {
+      return ctx.generating === false;
+    }, "hard 生成 #" + i + " の完了");
+  }
+  var elapsed = Date.now() - started;
+  assert.ok(elapsed < 2000, "hard を10回生成するのに2秒を超えた: " + elapsed + "ms");
 });
 
 test("「新しい問題」の後に run() すると、新しい GIVEN の空マス数だけ /api/judge を呼ぶ", { timeout: 10000 }, async () => {

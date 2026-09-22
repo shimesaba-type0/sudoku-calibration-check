@@ -712,9 +712,9 @@ var PAGE_HTML = `<!doctype html>
   button:hover:not(:disabled) { border-color: var(--accent); }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   #run-btn { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600; }
-  #speed-toggle { display: inline-flex; border: 1px solid var(--panel-border); border-radius: 6px; overflow: hidden; }
-  .speed-btn { border: none; border-radius: 0; background: var(--panel-bg); }
-  .speed-btn.active { background: var(--accent); color: #0b1220; }
+  #speed-toggle, #difficulty-toggle { display: inline-flex; border: 1px solid var(--panel-border); border-radius: 6px; overflow: hidden; }
+  .speed-btn, .difficulty-btn { border: none; border-radius: 0; background: var(--panel-bg); }
+  .speed-btn.active, .difficulty-btn.active { background: var(--accent); color: #0b1220; }
 
   #error-box.error {
     background: var(--error-bg);
@@ -1071,6 +1071,28 @@ var PAGE_HTML = `<!doctype html>
     return { given: cellsToGrid(cells), solution: solution };
   }
 
+  /**
+   * generatePuzzle() をランダム順を変えて最大 GENERATE_RETRIES 回試し、目標ヒント数
+   * (targetGivens)にちょうど届いた結果があればそこで打ち切って返す。「むずかしい」
+   * (25)は目標ちょうどには届かず 26〜28 で止まることがある(既知。PR #15 の補足)ため、
+   * 3回とも届かなければ、そのうち最もヒント数が少ない(= 最も難しい)結果を返す
+   * (無限ループにはしない。docs/DESIGN.md 5章)。
+   */
+  function generatePuzzleWithRetry(targetGivens) {
+    var best = null;
+    var bestGivens = Infinity;
+    for (var i = 0; i < GENERATE_RETRIES; i++) {
+      var puzzle = generatePuzzle(targetGivens);
+      var givens = 81 - countEmpty(puzzle.given);
+      if (givens < bestGivens) {
+        best = puzzle;
+        bestGivens = givens;
+      }
+      if (givens <= targetGivens) break; // 目標に届いた(generatePuzzle の設計上、届けば必ずちょうど)
+    }
+    return best;
+  }
+
   // 空マスの数(TOTAL_EMPTY の再計算に使う)。
   function countEmpty(grid) {
     var empty = 0;
@@ -1092,6 +1114,13 @@ var PAGE_HTML = `<!doctype html>
   // (削るほど生成に時間がかかり、実験としても手がかりが減りすぎる)。
   var DEFAULT_TARGET_GIVENS = 30;
   var MIN_TARGET_GIVENS = 24;
+
+  // 難易度(SPEC F1/F4)ごとの目標ヒント数。「新しい問題」を押した時点の
+  // state.difficulty に応じて newPuzzle() が generatePuzzleWithRetry() に渡す。
+  var DIFFICULTY_GIVENS = { easy: 36, normal: 30, hard: 25 };
+  var DEFAULT_DIFFICULTY = "normal";
+  // generatePuzzleWithRetry() が目標ヒント数に届かないとき再試行する回数の上限。
+  var GENERATE_RETRIES = 3;
 
   // 初期表示は Wikipedia の固定問題(docs/DESIGN.md 5章)。
   // 「新しい問題」を押すと generatePuzzle() の結果で丸ごと差し替える。
@@ -1128,6 +1157,7 @@ var PAGE_HTML = `<!doctype html>
     done: false,
     roundsToSolve: null,
     speedMode: "slow",
+    difficulty: DEFAULT_DIFFICULTY, // "easy" | "normal" | "hard"(SPEC F1)。次の newPuzzle() から効く
     errorMessage: null,
     stoppedAtLimit: false,
     lastJudgment: null // 直前に確定した1件(最速モードでも結果が見えるように残す)
@@ -1427,6 +1457,12 @@ var PAGE_HTML = `<!doctype html>
     render();
   }
 
+  // 難易度トグル(SPEC F1)。変えただけでは盤面は変わらず、次の newPuzzle() から効く。
+  function setDifficulty(mode) {
+    state.difficulty = mode;
+    render();
+  }
+
   function reset() {
     // 世代を進める。進行中の fetch / setTimeout はこれで続きを実行しなくなる
     runToken += 1;
@@ -1437,6 +1473,7 @@ var PAGE_HTML = `<!doctype html>
       inflightController = null;
     }
     var keepSpeed = state.speedMode;
+    var keepDifficulty = state.difficulty;
     state = {
       round: 1,
       values: {},
@@ -1447,6 +1484,7 @@ var PAGE_HTML = `<!doctype html>
       done: false,
       roundsToSolve: null,
       speedMode: keepSpeed,
+      difficulty: keepDifficulty,
       errorMessage: null,
       stoppedAtLimit: false,
       lastJudgment: null
@@ -1462,17 +1500,20 @@ var PAGE_HTML = `<!doctype html>
 
   /**
    * 「新しい問題」。reset() で進行中のループを世代トークンごと無効化してから、
-   * 生成した盤面で GIVEN / SOLUTION と派生値(TOTAL_EMPTY / roundSize)を差し替える。
-   * 生成は同期処理(概ね10ms以下)なので、いったん「生成中…」を描いてから
-   * setTimeout(0) で走らせ、画面が固まったように見えないようにする。
+   * state.difficulty(reset() で維持される)に応じたヒント数で生成した盤面で
+   * GIVEN / SOLUTION と派生値(TOTAL_EMPTY / roundSize)を差し替える。難易度を
+   * 変えただけでは盤面は変わらず、この「新しい問題」の生成から効く。
+   * 生成は同期処理(「むずかしい」で3回試行しても概ね数十ms以下)なので、いったん
+   * 「生成中…」を描いてから setTimeout(0) で走らせ、画面が固まったように見えないようにする。
    */
   function newPuzzle() {
     if (generating) return;
     generating = true;
     reset(); // 世代を進めて進行中の fetch / setTimeout を無効化し、盤面表示も初期化する
+    var targetGivens = DIFFICULTY_GIVENS[state.difficulty] || DEFAULT_TARGET_GIVENS;
     setTimeout(function () {
       try {
-        var puzzle = generatePuzzle(DEFAULT_TARGET_GIVENS);
+        var puzzle = generatePuzzleWithRetry(targetGivens);
         GIVEN = puzzle.given;
         SOLUTION = puzzle.solution;
         TOTAL_EMPTY = countEmpty(GIVEN);
@@ -1568,6 +1609,9 @@ var PAGE_HTML = `<!doctype html>
     var newLabel = generating ? "生成中…" : "新しい問題";
     var slowActive = state.speedMode === "slow" ? " active" : "";
     var fastActive = state.speedMode === "fast" ? " active" : "";
+    var easyActive = state.difficulty === "easy" ? " active" : "";
+    var normalActive = state.difficulty === "normal" ? " active" : "";
+    var hardActive = state.difficulty === "hard" ? " active" : "";
     return "<div class=\\"controls\\">" +
       "<button id=\\"run-btn\\" onclick=\\"run()\\" " + runDisabled + ">実行</button>" +
       "<button id=\\"reset-btn\\" onclick=\\"reset()\\" " + resetDisabled + ">リセット</button>" +
@@ -1575,6 +1619,11 @@ var PAGE_HTML = `<!doctype html>
       "<div id=\\"speed-toggle\\">" +
       "<button class=\\"speed-btn" + slowActive + "\\" onclick=\\"setSpeed('slow')\\">じっくり確認</button>" +
       "<button class=\\"speed-btn" + fastActive + "\\" onclick=\\"setSpeed('fast')\\">最速</button>" +
+      "</div>" +
+      "<div id=\\"difficulty-toggle\\">" +
+      "<button class=\\"difficulty-btn" + easyActive + "\\" aria-pressed=\\"" + (state.difficulty === "easy") + "\\" onclick=\\"setDifficulty('easy')\\">やさしい</button>" +
+      "<button class=\\"difficulty-btn" + normalActive + "\\" aria-pressed=\\"" + (state.difficulty === "normal") + "\\" onclick=\\"setDifficulty('normal')\\">ふつう</button>" +
+      "<button class=\\"difficulty-btn" + hardActive + "\\" aria-pressed=\\"" + (state.difficulty === "hard") + "\\" onclick=\\"setDifficulty('hard')\\">むずかしい</button>" +
       "</div>" +
       "</div>";
   }
