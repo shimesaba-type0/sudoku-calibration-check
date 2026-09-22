@@ -135,6 +135,46 @@ export function jevWhereResponse(keys) {
   };
 }
 
+/**
+ * ask:"all" 用の `answers`(Issue #48)。空マスのキーごとに digit と同じ形の choice の
+ * 回答を1つ作る。`choice` と `confidence` はキーごとに変えてある(取り違えが起きたら
+ * テストが落ちるように)。`confidence` は digit / cell と同じく probabilities[choice] とは
+ * 別の値になる。
+ */
+export function jevAllAnswers(keys) {
+  var answers = {};
+  for (var i = 0; i < keys.length; i++) {
+    var choice = String((i % 9) + 1);
+    var probabilities = {};
+    for (var d = 1; d <= 9; d++) {
+      probabilities[String(d)] = String(d) === choice ? 0.6 : 0.05;
+    }
+    answers[keys[i]] = {
+      type: "choice",
+      choice: choice,
+      probabilities: probabilities,
+      confidence: Number((0.01 * ((i % 90) + 1)).toFixed(4)),
+    };
+  }
+  return answers;
+}
+
+/**
+ * ask:"all" のラッパー付きレスポンス(docs/DESIGN.md 3.4 と同じ形)。
+ * usage は 2026-09-22 に choice の質問51個を1回で投げたときの実測値。
+ */
+export function jevAllResponse(keys) {
+  return {
+    state: "Completed",
+    result: {
+      model: "jev-1.13.0",
+      answers: jevAllAnswers(keys),
+      usage: { input_tokens: 9483, output_tokens: 4083 },
+    },
+    gatewayMetadata: { keySource: "Unified" },
+  };
+}
+
 // ラッパーの無い素の形式。Cloudflare が将来ゲートウェイを外しても動くことの確認に使う。
 export function bareJevResponse() {
   return {
@@ -292,6 +332,15 @@ export function validBody(overrides) {
 /** ask:"cell"(マス選び)の既定の有効なボディ。target は付けない。 */
 export function validCellBody(overrides) {
   var body = { puzzle: GIVEN.slice(), ask: "cell" };
+  if (overrides) {
+    for (var key in overrides) body[key] = overrides[key];
+  }
+  return body;
+}
+
+/** ask:"all"(一括)の既定の有効なボディ。target も digit も付けない。 */
+export function validAllBody(overrides) {
+  var body = { puzzle: GIVEN.slice(), ask: "all" };
   if (overrides) {
     for (var key in overrides) body[key] = overrides[key];
   }
