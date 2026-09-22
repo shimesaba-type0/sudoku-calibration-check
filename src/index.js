@@ -407,20 +407,22 @@ function emptyCells(puzzle) {
  * target は digit のとき必須・cell のとき禁止(付いていたら 400。どちらのつもりの
  * リクエストか曖昧にしないため)。cell は空マスが1個も無ければ聞くものが無いので 400。
  */
-function validateInput(body) {
+function validateInput(body, ask) {
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
     return "puzzle(9行の配列)とtarget({row,col})が必要です";
   }
 
-  var ask = readAsk(body);
-  if (ask === null) {
+  // ask は呼び出し元(handleJudge)が readAsk で 1 回だけ解釈して渡す(レビュー指摘 S1。
+  // 2 か所で別々に解釈すると、検証順の変更で null が素通りする余地ができる)。
+  if (ask !== ASK_DIGIT && ask !== ASK_CELL) {
     return "askはdigitかcellである必要があります";
   }
 
   var puzzle = body.puzzle;
   var target = body.target;
   if (!Array.isArray(puzzle) || puzzle.length !== 9) {
-    return "puzzle(9行の配列)とtarget({row,col})が必要です";
+    // cell では target を取らないので、文言でも target に触れない(S3)。digit の文言は従来どおり。
+    return ask === ASK_CELL ? "puzzle(9行の配列)が必要です" : "puzzle(9行の配列)とtarget({row,col})が必要です";
   }
   if (ask === ASK_DIGIT && (target === null || typeof target !== "object" || Array.isArray(target))) {
     return "puzzle(9行の配列)とtarget({row,col})が必要です";
@@ -610,7 +612,9 @@ async function handleJudge(request, env) {
     return errorResponse("リクエストボディをJSONとして解釈できません", 400, rate.headers);
   }
 
-  var invalid = validateInput(body);
+  // ask(質問の種類)はここで 1 回だけ解釈し、検証にも payload 構築にも同じ値を使う。
+  var ask = readAsk(body);
+  var invalid = validateInput(body, ask);
   if (invalid !== null) {
     return errorResponse(invalid, 400, rate.headers);
   }
@@ -618,7 +622,6 @@ async function handleJudge(request, env) {
   // 質問の種類ごとに payload と「期待するキー集合」を組み立てる(Issue #38)。
   // どちらの経路でも Jev に渡すのは「今埋まっているマス」と質問文だけで、
   // 正解表に由来する情報は一切入れない(docs/DESIGN.md 9章 不変条件1)。
-  var ask = readAsk(body);
   var criteria = {};
   var expectedKeys = [];
   var payload;
@@ -648,7 +651,7 @@ async function handleJudge(request, env) {
         },
       },
     };
-  } else {
+  } else if (ask === ASK_DIGIT) {
     for (var i = 0; i < DIGITS.length; i++) {
       criteria[DIGITS[i]] = "the digit " + DIGITS[i];
       expectedKeys.push(DIGITS[i]);
@@ -667,6 +670,9 @@ async function handleJudge(request, env) {
         },
       },
     };
+  } else {
+    // validateInput が弾いているので通常ここには来ない。来ても 500 にせず 400 で返す(S2)。
+    return errorResponse("askはdigitかcellである必要があります", 400, rate.headers);
   }
 
   var result;

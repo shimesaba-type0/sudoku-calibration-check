@@ -615,6 +615,30 @@ test('200: ask:"cell" で埋まっているマスが17個ちょうど', async ()
   assert.equal(Object.keys(out.env.aiCalls[0].payload.questions.cell.criteria).length, 81 - 17);
 });
 
+test('200: ask:"cell" で空マスが1個(criteria 1件)でも動く', async () => {
+  // 正解表の 1 マスだけを空にした盤面(残り 80 マス埋まり)。criteria / probabilities は 1 キー。
+  var puzzle = ANSWER_KEY.slice();
+  puzzle[4] = puzzle[4].slice(0, 4) + "." + puzzle[4].slice(5);
+  var out = await judgeCell(validCellBody({ puzzle: puzzle }));
+  assert.equal(out.res.status, 200);
+  assert.deepEqual(out.keys, ["r4c4"]);
+  assert.deepEqual(Object.keys(out.env.aiCalls[0].payload.questions.cell.criteria), ["r4c4"]);
+  assert.deepEqual(Object.keys(out.body.probabilities), ["r4c4"]);
+  assert.equal(out.body.choice, "r4c4");
+  assert.deepEqual(out.body.cell, { row: 4, col: 4 });
+});
+
+test('400: ask:"cell" の puzzle 不正の文言は target に触れない(digit の文言は従来どおり)', async () => {
+  var env = makeEnv();
+  var res = await worker.fetch(judgeRequest({ ask: "cell" }), env);
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).error, "puzzle(9行の配列)が必要です");
+  var res2 = await worker.fetch(judgeRequest({ ask: "digit" }), env);
+  assert.equal(res2.status, 400);
+  assert.equal((await res2.json()).error, "puzzle(9行の配列)とtarget({row,col})が必要です");
+  assert.equal(env.aiCalls.length, 0);
+});
+
 test('502: ask:"cell" なのに answers.cell が無い', async () => {
   var shapes = [
     jevResponse(), // answers.digit しか無い(digit 用の応答が返ってきた)
