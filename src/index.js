@@ -1901,7 +1901,8 @@ var PAGE_HTML = `<!doctype html>
   var pendingCommit = null;
   // 一括モード(Issue #48)の今の周のキャッシュ。null = まだこの周で askAll() していない。
   // 応答が届いたら "r-c" 形式のキー → { choice, probabilities, confidence } に変換して持つ。
-  // 停止/再開では保つ(再度呼ばない)。周が変わる(finalizeRound)・reset()/newPuzzle() で null に戻す。
+  // 停止/再開では保つ(再度呼ばない)。周が変わる(finalizeRound)・reset()/newPuzzle()・
+  // showError() で null に戻す。
   var allResults = null;
   // 問題を生成している最中か。生成中はボタンを押せなくする。
   var generating = false;
@@ -2830,6 +2831,10 @@ var PAGE_HTML = `<!doctype html>
   // askAllRound() で1回だけ呼び、届いたら1マスずつ focusCellFromCache() へ渡す。
   // 既にキャッシュがある(= 応答済み、または停止/再開で戻ってきた)ならすぐ次のマスへ。
   function focusNextAll(token) {
+    if (queue.length === 0) {
+      finalizeRound();
+      return;
+    }
     if (allResults === null) {
       askAllRound(token);
       return;
@@ -2854,13 +2859,26 @@ var PAGE_HTML = `<!doctype html>
       if (result.request && typeof result.request === "object") {
         state.lastAllRequest = { request: result.request, failed: false, count: requestedCount };
       }
-      var cells = result.cells || {};
+      var cells = result.cells;
+      if (cells === null || typeof cells !== "object") {
+        showError("一括の応答に cells がありません");
+        return;
+      }
       var converted = {};
       var keys = Object.keys(cells);
       for (var i = 0; i < keys.length; i++) {
         var m = /^r(\\d)c(\\d)$/.exec(keys[i]);
         if (!m) continue;
         converted[m[1] + "-" + m[2]] = cells[keys[i]];
+      }
+      // 1マスも確定する前に queue の全キーが揃っていることを確かめる(欠けを途中まで
+      // appendRecord してから検出すると、壊れた応答由来の判定が記録に残ってしまうため)
+      for (var qi = 0; qi < queue.length; qi++) {
+        var qk = queue[qi].r + "-" + queue[qi].c;
+        if (!converted[qk]) {
+          showError("一括の応答に対象マスの回答がありません: " + qk);
+          return;
+        }
       }
       allResults = converted;
       state.allFetching = false;
@@ -4135,6 +4153,10 @@ var PAGE_HTML = `<!doctype html>
     var oldLog = document.querySelector("#round-log ul");
     var savedScroll = oldLog ? oldLog.scrollTop : 0;
     var wasAtBottom = oldLog ? oldLog.scrollHeight - oldLog.scrollTop - oldLog.clientHeight < 4 : true;
+    // 一括モードのプロンプト枠の折りたたみ(<details>)の開閉も同じ理由で引き継ぐ(Issue #48)。
+    // 1マスごとに render() が走るので、引き継がないと開いた直後に閉じてしまう。
+    var oldDetails = document.querySelector("details.prompt-details");
+    var detailsWasOpen = oldDetails ? oldDetails.open === true : false;
     if (embedMode) {
       // 埋め込みモード(比較シェルの iframe、Issue #46)。コントロール・Claude設定・
       // 較正図・プロンプト枠・見出しは描かず、グリッド・凡例・統計・現在の判定・
@@ -4173,6 +4195,8 @@ var PAGE_HTML = `<!doctype html>
 
     var newLog = document.querySelector("#round-log ul");
     if (newLog) newLog.scrollTop = wasAtBottom ? newLog.scrollHeight : savedScroll;
+    var newDetails = document.querySelector("details.prompt-details");
+    if (newDetails && detailsWasOpen) newDetails.open = true;
 
     if (embedMode) postStatus();
   }

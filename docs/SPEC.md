@@ -48,7 +48,7 @@ TypeSafe AI の **Jev** は「文章を生成せず、型付きの判断を較�
 - **モデルに送ったプロンプト**: 直近の判定で Worker が Jev に渡したペイロード(`request`)、または Claude 経路ならブラウザが `api.anthropic.com` に送ったリクエストボディ(ヘッダーは含めない = キーは出ない)を JSON で表示し、対象マス(「N行目 M列目 の判定に使用」)を添える。判定が 502 で失敗したときはその `request` を「(このプロンプトで失敗)」付きで表示する。まだ無ければその旨。停止中・エラー中も残り、リセット/新しい問題で消える。**確信度順モード**(Issue #38): 「マス選び」見出し + マス選びに使ったリクエスト、続けて「数字」見出し + 従来どおりの数字判定のリクエストを2段で表示する。**一括モード**(Issue #48): 「一括」1段で、質問が空マスの数だけあり大きいので「質問 N 問」の要約行 + 折りたたみ(`<details>`)で表示する。失敗時は「(このプロンプトで失敗)」を既存どおり添える
 - **凡例**: 正解・不正解・判定中の色の意味。確信度順モードのときだけ「背景の濃さ = マス選びの確率」を1項目足す
 - **周回ログ**: 「N周目: M中K正解 (P%)」を周ごとに追記
-- **集計パネル(較正図)**: 周回ログの下に、これまでの判定結果(複数問題・複数回の実行をまたいでブラウザの `localStorage` に蓄積したもの)を集計して表示する(7章 拡張2)
+- **集計パネル(較正図)**: 周回ログの下に、これまでの判定結果(複数問題・複数回の実行をまたいでブラウザの `localStorage` に蓄積したもの)を集計して表示する(7章 拡張2)。モデルフィルタには記録の `m` の値がそのまま並ぶ(例: `typesafe/jev`、`typesafe/jev/all`(一括モード、F3)、`claude-opus-5+think`)
   - 上部に合計件数・全体正解率・記録している問題数(ユニークな問題ID)
   - `pc`(`choice` の確率)と `conf`(モデルの `confidence`)それぞれで10%刻み10帯に分けた較正図(インラインSVGの棒グラフ、横並び。理想は対角線)を並べる。帯ごとに件数と実際の正解率を示す
   - **モデルのフィルタ**(`<select>`): 「すべて」か、記録に現れるモデル識別子(`typesafe/jev` / `claude-opus-5+think` など。記録の `m`。`m` の無い古い記録は `typesafe/jev` 扱い)を選び、そのモデルの記録だけを集計する(Jev と Claude の較正を並べて比べるため。Issue #37)
@@ -437,6 +437,26 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 - スキーマの `choice` は `enum` にその時点の `queue` のマスのキー(`"r" + row + "c" + col`、行優先)を並べたもの、`probabilities` はそのキー全部を `properties` / `required` に持ち `additionalProperties: false`。`confidence` は数値。呼び出しのたびに候補(= `queue`)が変わるので、毎回組み立て直す
 - 応答の検証は「`probabilities` のキーが候補キーとちょうど一致・`choice` が候補キーのいずれか・`confidence` が有限数」(digit 判定の検証を候補キー集合に一般化したもの)。`choice`(`"r0c2"` 形式)は正規表現 `/^r(\d)c(\d)$/` で座標に分解する
 - `thinking` / `max_tokens` の規則は数字判定と同じ
+
+#### 一括モードの1周ぶん(Issue #48)
+
+一括モード(3章 F3)で Claude をモデルに選んでいるときの、周の先頭の1回ぶん。`queue` の全マス(その周でまだ確定していないマス)について、マスごとの `{ choice, probabilities, confidence }` を1回の structured outputs でまとめて受け取る。
+
+````json
+{
+  "model": "claude-opus-5",
+  "max_tokens": 24000,
+  "system": "<Jev と同じ ALL_NOTE> Answer with JSON only, matching the given schema: for each cell key, ...",
+  "messages": [{ "role": "user", "content": "Which digit from 1 to 9 belongs in each empty cell of this Sudoku grid? Answer for every cell key required by the schema (...).\n{\"puzzle\":[...9行...]}" }],
+  "output_config": { "format": { "type": "json_schema", "schema": { "...": "候補キー(r0c2 など)それぞれが required で、各値は digit 判定と同じ { choice(1〜9 の enum) / probabilities(1〜9 が required) / confidence }" } } },
+  "thinking": { "type": "adaptive" }
+}
+````
+
+- `system` は Worker の `ALL_NOTE`(`ask:"all"` の `note` と同じ文字列)+「マスごとに choice / probabilities / confidence の3つ組を JSON で答えよ」の指示文(`CLAUDE_ALL_SYSTEM`)。`messages[0].content` は一括専用の1本の質問文(`CLAUDE_ALL_INSTRUCTIONS`。Worker の `ALL_INSTRUCTIONS_TEMPLATE` はマス1つぶんの文言なので使わない。対象マスの一覧はスキーマの required キーそのもの)+ 改行 + `{ puzzle }`(`target` は無い。盤面は `buildSelectionSnapshot()`)
+- スキーマはその時点の `queue` のマスのキー(`"r" + row + "c" + col`、行優先)をそれぞれ `properties` / `required` に持つオブジェクト(`additionalProperties: false`)で、各値は digit 判定と同じ形。呼び出しのたびに候補が変わるので毎回組み立て直す
+- 応答の検証は「キー集合が候補キーとちょうど一致(余分・欠けはエラー停止)・各マスは digit 判定と同じ基準」。`stop_reason` が `max_tokens` / `refusal` のときも digit 判定と同じくエラー停止(一時的な失敗ではない)
+- `thinking` の規則は数字判定と同じだが、**`max_tokens` には一括専用の下限がある**(出力が最大 64 マス × 9 確率の JSON になるため): 思考なし 16000 / adaptive 24000 / Haiku(`budget_tokens` 2048)12000 と、数字判定の値との大きい方。**この値で足りるかは実キー未検証**(`docs/DESIGN.md` 3.6)
 
 ## 5. 非機能要件
 

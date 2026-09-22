@@ -522,7 +522,8 @@ async function runMockMode(chromium, executablePath, mode) {
         // 直後には既に2周目ぶんの呼び出し(1回)が始まっていることがある(between-round の
         // 待ちが80msと短いため)。「1マスごとに呼んでいない(空マス数51より遥かに少ない)」
         // ことを検証できれば十分なので、上限は緩めに取る。
-        assert.ok(counted >= 1 && counted <= 3, "一括モードなのに /api/judge の呼び出し回数が想定と違う: " + counted);
+        // 1周1回なので、1マスごとに呼んでいれば数十回になる。mixed は 2〜3 周走るので上限は余裕を持たせる
+        assert.ok(counted >= 1 && counted <= 5, "一括モードなのに /api/judge の呼び出し回数が想定と違う(1マスごとに呼んでいる?): " + counted);
         await page.screenshot({ path: path.join(outDir, mode + "-09-all-order.png") });
         return text + " / judge=" + counted;
       } finally {

@@ -3898,6 +3898,11 @@ test(
     assert.deepStrictEqual(Object.keys(liveBody.output_config.format.schema.properties).sort(), liveKeys.slice().sort(), "スキーマの properties が queue のキーと一致しない(live)");
     var liveSent = JSON.parse(liveBody.messages[0].content.slice(liveBody.messages[0].content.indexOf("\n") + 1));
     assert.deepStrictEqual(hostRows(liveSent.puzzle), hostRows(ctx2.buildSelectionSnapshot()), "盤面が buildSelectionSnapshot() と一致しない(live)");
+    // Claude 経路の送信ボディにも SOLUTION の行が含まれない(不変条件1)
+    hostRows(ctx2.SOLUTION).forEach(function (row) {
+      assert.ok(entry.init.body.indexOf(row) === -1, "SOLUTION の行が Claude への送信ボディに含まれている: " + row);
+    });
+    assert.ok(entry.init.body.indexOf(TEST_KEY) === -1, "API キーがボディに混ざっている");
 
     var missingKeyAnswer = {};
     liveKeys.forEach(function (k, i) {
@@ -3993,4 +3998,82 @@ test("Z7: URL パラメータ order=all、setOrderMode(\"all\")、比較シェ�
   ctxCompare.compareSetOrderMode("all");
   assert.equal(ctxCompare.state.orderMode, "all", "比較シェルの compareSetOrderMode('all') が効かない");
   assert.ok(ctxCompare.compareIframeSrc("jev").indexOf("order=all") !== -1, "比較シェルの iframe URL 組み立てに order=all が反映されない");
+});
+
+test("Z8: 一括モードの Claude 経路で全マスが確定し、記録の m が \"claude-opus-5+think/all\"・o が \"all\" になる。応答に対象マスが欠けていれば1マスも確定・記録しない", { timeout: 10000 }, async () => {
+  function claudeAllResponse(ctx, keys, omitFirst) {
+    var answer = {};
+    keys.forEach(function (k, i) {
+      if (omitFirst && i === 0) return;
+      var m = /^r(\d)c(\d)$/.exec(k);
+      var digit = ctx.SOLUTION[Number(m[1])][Number(m[2])];
+      var probabilities = {};
+      for (var d = 1; d <= 9; d++) probabilities[String(d)] = String(d) === digit ? 0.6 : 0.05;
+      answer[k] = { choice: digit, probabilities: probabilities, confidence: 0.4 };
+    });
+    return {
+      ok: true,
+      status: 200,
+      json: function () {
+        return Promise.resolve({
+          id: "msg_z8",
+          type: "message",
+          role: "assistant",
+          model: "claude-opus-5",
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: JSON.stringify(answer) }],
+          usage: { input_tokens: 9000, output_tokens: 4000 },
+        });
+      },
+    };
+  }
+
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  assert.equal(ctx.saveAnthropicKey(TEST_KEY), true);
+  ctx.setModelMode("claude");
+  ctx.setOrderMode("all");
+  ctx.setSpeed("fast");
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Z8: fetch 待ち");
+  var entry = af.pending.shift();
+  var keys = Array.prototype.slice.call(ctx.selectionKeys()).map(String);
+  entry.resolve(claudeAllResponse(ctx, keys, false));
+  await waitFor(function () {
+    return ctx.state.done === true;
+  }, "Z8: 完了待ち");
+  var records = ctx.getRecords();
+  assert.equal(records.length, ctx.TOTAL_EMPTY, "記録の件数が空マス数と一致しない");
+  records.forEach(function (rec) {
+    assert.equal(rec.m, "claude-opus-5+think/all", "記録の m が claude-opus-5+think/all でない: " + rec.m);
+    assert.equal(rec.o, "all", "記録の o が all でない: " + rec.o);
+  });
+  assert.equal(af.pending.length, 0, "一括なのに複数回 fetch している");
+  ctx.render();
+  assert.ok(!ctx.appElement.innerHTML.includes(TEST_KEY), "innerHTML にキーが出ている");
+
+  // Jev 経路でも、cells に対象マスが欠けていれば 1 マスも確定・記録せずエラーになる(レビュー S2)
+  var af2 = makeAbortAwareFetch();
+  var ctx2 = runScript(await getPageHtml(), { fetch: af2.fetch });
+  ctx2.setOrderMode("all");
+  ctx2.run();
+  await waitFor(function () {
+    return af2.pending.length === 1;
+  }, "Z8: Jev の fetch 待ち");
+  var entry2 = af2.pending.shift();
+  var body2 = JSON.parse(entry2.init.body);
+  var keys2 = ctx2.selectionKeys();
+  var res2 = makeAllResponse(ctx2, body2.puzzle, keys2);
+  var payload2 = await res2.json();
+  delete payload2.cells[String(keys2[keys2.length - 1])]; // 末尾のマスを欠かす
+  entry2.resolve({ ok: true, status: 200, json: function () { return Promise.resolve(payload2); } });
+  await waitFor(function () {
+    return ctx2.state.errorMessage !== null;
+  }, "Z8: 欠けでエラー待ち");
+  assert.ok(ctx2.state.errorMessage.indexOf("対象マスの回答がありません") !== -1, "文言が違う: " + ctx2.state.errorMessage);
+  assert.equal(Object.keys(ctx2.state.values).length, 0, "欠けた応答なのにマスが確定した");
+  assert.equal(ctx2.getRecords().length, 0, "欠けた応答なのに記録が増えた");
+  assert.equal(ctx2.queue.length, ctx2.TOTAL_EMPTY, "欠けた応答なのに queue が減った");
 });
