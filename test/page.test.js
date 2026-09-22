@@ -2409,3 +2409,343 @@ test("V10: 入力欄からの保存は先に入力欄を空にし、キー保存
   ctx.clearAnthropicKey();
   assert.equal(storage.getItem("scc.anthropic_key.v1"), null, "停止後に「キーを消す」が効かない");
 });
+
+// -------------------------------------------------------------------
+// 確信度順モード(順番トグル、Issue #38)
+// -------------------------------------------------------------------
+
+/**
+ * ask:"cell"(マス選び)の /api/judge レスポンスのモック。probabilities は keys 全体に
+ * 配り、chosenKey の確率をいちばん高くする。request / cell は本物の Worker の形に揃える。
+ */
+function makeCellResponse(puzzle, keys, chosenKey, overrides) {
+  var probabilities = {};
+  var criteria = {};
+  for (var i = 0; i < keys.length; i++) {
+    probabilities[keys[i]] = keys[i] === chosenKey ? 0.5 : 0.5 / Math.max(1, keys.length - 1);
+    var m = /^r(\d)c(\d)$/.exec(keys[i]);
+    criteria[keys[i]] = "row " + m[1] + ", column " + m[2] + " (zero-based)";
+  }
+  var cm = /^r(\d)c(\d)$/.exec(chosenKey);
+  var body = Object.assign(
+    {
+      probabilities: probabilities,
+      choice: chosenKey,
+      confidence: 0.4,
+      cell: { row: Number(cm[1]), col: Number(cm[2]) },
+      request: {
+        state: { puzzle: puzzle, note: "puzzle is a 9x9 Sudoku grid, no target this time (mock)" },
+        questions: { cell: { type: "choice", instructions: "Which empty cell...", criteria: criteria } },
+      },
+    },
+    overrides || {}
+  );
+  return {
+    ok: true,
+    json: async function () {
+      return body;
+    },
+  };
+}
+
+/** Claude 経路のマス選び(askCellClaude)の応答モック。V2 の makeClaudeResponse のマス選び版。 */
+function makeClaudeCellResponse(keys, chosenKey, overrides) {
+  var probabilities = {};
+  for (var i = 0; i < keys.length; i++) {
+    probabilities[keys[i]] = keys[i] === chosenKey ? 0.6 : 0.4 / Math.max(1, keys.length - 1);
+  }
+  var answer = Object.assign({ choice: chosenKey, probabilities: probabilities, confidence: 0.5 }, overrides || {});
+  return {
+    ok: true,
+    status: 200,
+    json: function () {
+      return Promise.resolve({
+        id: "msg_test_cell",
+        type: "message",
+        role: "assistant",
+        model: "claude-opus-5",
+        stop_reason: "end_turn",
+        content: [{ type: "text", text: JSON.stringify(answer) }],
+        usage: { input_tokens: 500, output_tokens: 80 },
+      });
+    },
+  };
+}
+
+test("W1: 左上からは従来どおり(1マス1フェッチ、ask を送らない)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  assert.equal(ctx.state.orderMode, "scan", "既定は左上から");
+
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "W1: fetch 待ち");
+  var entry = af.pending.shift();
+  var body = JSON.parse(entry.init.body);
+  assert.equal(body.ask, undefined, "scan モードで ask を送っている");
+  assert.ok(body.target, "target が無い(scan モードでは digit を聞くはず)");
+  entry.resolve(makeCorrectResponse(ctx, body.target.row, body.target.col, body.puzzle));
+
+  await waitFor(function () {
+    return Object.keys(ctx.state.values).length === 1;
+  }, "W1: commit 待ち");
+  assert.equal(af.pending.length, 0, "scan モードで余計な fetch が飛んでいる(マス選びをしていないはず)");
+  assert.equal(ctx.state.selecting, false);
+  assert.equal(ctx.state.cellProbs, null);
+});
+
+test("W2: 確信度順の1ステップは2フェッチ(マス選び→数字)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.setOrderMode("confidence");
+  assert.equal(ctx.state.orderMode, "confidence");
+
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "W2: マス選びの fetch 待ち");
+  assert.equal(ctx.state.selecting, true, "state.selecting が立っていない");
+  var selectEntry = af.pending.shift();
+  var selectBody = JSON.parse(selectEntry.init.body);
+  assert.equal(selectBody.ask, "cell", "1つ目のリクエストが ask:cell でない");
+  assert.equal(selectBody.target, undefined, "ask:cell では target を送らない");
+  // queue の全マス(1周目なので空マス全部 = TOTAL_EMPTY)が "." になっている
+  var emptyCount = selectBody.puzzle.join("").split("").filter(function (ch) {
+    return ch === ".";
+  }).length;
+  assert.equal(emptyCount, ctx.TOTAL_EMPTY, "queue の全マスが . になっていない");
+
+  var keys = ctx.selectionKeys();
+  assert.equal(keys.length, ctx.TOTAL_EMPTY);
+  var chosenKey = keys[0];
+  selectEntry.resolve(makeCellResponse(selectBody.puzzle, keys, chosenKey));
+
+  await waitFor(function () {
+    return ctx.state.selecting === false && af.pending.length === 1;
+  }, "W2: 数字判定の fetch 待ち");
+  assert.ok(ctx.state.cellProbs, "state.cellProbs が入っていない(ヒートマップ用)");
+  assert.equal(ctx.state.lastSelection.candidates, ctx.TOTAL_EMPTY);
+
+  var cm = /^r(\d)c(\d)$/.exec(chosenKey);
+  var chosenRow = Number(cm[1]);
+  var chosenCol = Number(cm[2]);
+  assert.equal(ctx.state.focusedKey, chosenRow + "-" + chosenCol, "選ばれたマスにフォーカスが立っていない");
+  assert.equal(ctx.queue.length, ctx.TOTAL_EMPTY - 1, "選ばれたマスが queue から取り除かれていない");
+
+  var digitEntry = af.pending.shift();
+  var digitBody = JSON.parse(digitEntry.init.body);
+  assert.equal(digitBody.ask, undefined, "2つ目のリクエストは digit(ask 省略)のはず");
+  assert.deepEqual(digitBody.target, { row: chosenRow, col: chosenCol }, "2つ目のリクエストの target が選ばれたマスでない");
+  assert.equal(digitBody.puzzle[chosenRow][chosenCol], ".", "対象マスが空になっていない");
+  // 1周目なので他の queue のマスにも前回の推測は無く、まだ全部空のまま
+  for (var i = 0; i < ctx.queue.length; i++) {
+    var qc = ctx.queue[i];
+    assert.equal(digitBody.puzzle[qc.r][qc.c], ".", "1周目なのに他の queue のマスが埋まっている");
+  }
+
+  digitEntry.resolve(makeCorrectResponse(ctx, chosenRow, chosenCol, digitBody.puzzle));
+  await waitFor(function () {
+    return ctx.state.values[chosenRow + "-" + chosenCol] !== undefined;
+  }, "W2: commit 待ち");
+  assert.equal(ctx.state.cellProbs, null, "commitFocused 後も cellProbs が残っている");
+});
+
+test("W3: マス選びの応答の cell が queue に無ければエラーで停止する", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.setOrderMode("confidence");
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "W3: fetch 待ち");
+  var entry = af.pending.shift();
+  var body = JSON.parse(entry.init.body);
+  var keys = ctx.selectionKeys();
+  var response = makeCellResponse(body.puzzle, keys, keys[0]);
+  var raw = await response.json();
+  // GIVEN で埋まっているマス(queue に無い)を choice として返す、壊れた応答を模す
+  raw.choice = "r0c0";
+  raw.cell = { row: 0, col: 0 };
+  entry.resolve({
+    ok: true,
+    json: async function () {
+      return raw;
+    },
+  });
+
+  await waitFor(function () {
+    return ctx.state.errorMessage !== null;
+  }, "W3: エラー表示待ち");
+  assert.ok(
+    ctx.state.errorMessage.indexOf("選ばれたマスが候補にありません") === 0,
+    "エラー文言が違う: " + ctx.state.errorMessage
+  );
+  assert.equal(ctx.state.running, false);
+  assert.equal(af.pending.length, 0, "エラー後に余計な fetch が残っている");
+});
+
+test("W4: マス選び中の stop() は queue の長さを変えず再開はマス選びからやり直す。数字判定中の停止は従来どおり再キュー", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.setOrderMode("confidence");
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "W4: マス選びの fetch 待ち");
+  var entry = af.pending.shift();
+  var queueLenBefore = ctx.queue.length;
+
+  ctx.stop();
+  assert.equal(entry.settled, true, "stop() で in-flight の fetch が abort されていない");
+  assert.equal(ctx.state.running, false);
+  assert.equal(ctx.state.selecting, false, "state.selecting がリセットされていない");
+  assert.equal(ctx.state.cellProbs, null, "state.cellProbs がリセットされていない");
+  assert.equal(ctx.queue.length, queueLenBefore, "マス選び中の停止で queue の長さが変わっている");
+
+  ctx.run(); // 再開: マス選びからやり直す
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "W4: 再開後のマス選びの fetch 待ち");
+  var resumedEntry = af.pending[0];
+  var resumedBody = JSON.parse(resumedEntry.init.body);
+  assert.equal(resumedBody.ask, "cell", "再開後もマス選びから始まっていない");
+  assert.equal(ctx.state.selecting, true);
+
+  // マス選びを解決して数字判定フェーズへ進み、そこで stop() すると従来どおり再キューされる
+  var keys = ctx.selectionKeys();
+  var chosenKey = keys[0];
+  resumedEntry.resolve(makeCellResponse(resumedBody.puzzle, keys, chosenKey));
+  await waitFor(function () {
+    return ctx.state.focusedKey !== null;
+  }, "W4: 数字判定フェーズ待ち");
+  var digitEntry = af.pending[0];
+  var beforeDigitQueueLen = ctx.queue.length;
+  var cm = /^r(\d)c(\d)$/.exec(chosenKey);
+
+  ctx.stop();
+  assert.equal(digitEntry.settled, true, "数字判定中の stop() で fetch が abort されていない");
+  assert.equal(ctx.queue.length, beforeDigitQueueLen + 1, "数字判定中の停止で queue の先頭に戻っていない");
+  assert.equal(ctx.queue[0].r, Number(cm[1]));
+  assert.equal(ctx.queue[0].c, Number(cm[2]));
+});
+
+test("W5: 2周目のマス選びの候補は不正解マスだけで、それらだけが空マスとして送られる", { timeout: 20000 }, async () => {
+  var ctx;
+  var wrongKey = "0-2"; // GIVEN[0] の最初の空マス(helpers.js の GIVEN と同一の固定問題)
+  var askedWrongOnce = false;
+  var selectCalls = [];
+  var fetchStub = async function (url, init) {
+    var body = JSON.parse(init.body);
+    if (body.ask === "cell") {
+      selectCalls.push(body);
+      var keys = ctx.selectionKeys();
+      return makeCellResponse(body.puzzle, keys, keys[0]);
+    }
+    var key = body.target.row + "-" + body.target.col;
+    if (key === wrongKey && !askedWrongOnce) {
+      askedWrongOnce = true;
+      var correctDigit = ctx.SOLUTION[body.target.row][body.target.col];
+      var wrongDigit = correctDigit === "1" ? "2" : "1";
+      var probabilities = {};
+      for (var d = 1; d <= 9; d++) probabilities[String(d)] = String(d) === wrongDigit ? 0.9 : 0.0125;
+      return {
+        ok: true,
+        json: async function () {
+          return { probabilities: probabilities, choice: wrongDigit, confidence: 0.5 };
+        },
+      };
+    }
+    return makeCorrectResponse(ctx, body.target.row, body.target.col, body.puzzle);
+  };
+  ctx = runScript(await getPageHtml(), { fetch: fetchStub });
+  ctx.setOrderMode("confidence");
+  ctx.setSpeed("fast");
+
+  ctx.run();
+  await waitFor(function () {
+    return ctx.state.done === true;
+  }, "W5: 完了待ち");
+
+  assert.equal(ctx.state.roundsToSolve, 2, "2周で完了したことになっていない");
+  assert.equal(selectCalls.length, ctx.TOTAL_EMPTY + 1, "マス選びの回数が想定(1周目51回+2周目1回)と違う: " + selectCalls.length);
+
+  var round2Select = selectCalls[ctx.TOTAL_EMPTY]; // 0-indexed: 1周目ぶんの次が2周目の1回
+  var dots = [];
+  for (var r = 0; r < 9; r++) {
+    for (var c = 0; c < 9; c++) {
+      if (round2Select.puzzle[r][c] === ".") dots.push(r + "-" + c);
+    }
+  }
+  assert.deepEqual(dots, [wrongKey], "2周目のマス選びの候補が不正解マスだけになっていない: " + JSON.stringify(dots));
+
+  // 周回ログの形式は従来どおり
+  assert.equal(ctx.state.roundLog.length, 2, "周回ログが2行でない");
+  assert.match(ctx.state.roundLog[0], /^1周目: 51中50正解 \(98%\)$/, "1周目のログ形式が違う: " + ctx.state.roundLog[0]);
+  assert.match(ctx.state.roundLog[1], /^2周目: 1中1正解 \(100%\)$/, "2周目のログ形式が違う: " + ctx.state.roundLog[1]);
+});
+
+test("W6: Claude 経路の確信度順マス選び(スキーマの候補キーと system の CELL_NOTE)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  assert.equal(ctx.saveAnthropicKey(TEST_KEY), true);
+  ctx.setModelMode("claude");
+  ctx.setOrderMode("confidence");
+
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "W6: マス選びの fetch 待ち");
+  var entry = af.pending.shift();
+  assert.equal(entry.url, ANTHROPIC_URL, "呼び先が api.anthropic.com でない");
+  var body = JSON.parse(entry.init.body);
+  var keys = ctx.selectionKeys();
+  // ctx.selectionKeys() は vm レルムの配列を返すので、host 側の配列に移し替えてから比較する
+  // (hostRows と同じ理由。test/page.test.js の runScript のコメント参照)。
+  var hostKeys = Array.prototype.slice.call(keys).map(String);
+  assert.deepStrictEqual(body.output_config.format.schema.properties.choice.enum, hostKeys, "スキーマの choice.enum が候補キーと一致しない");
+  assert.deepStrictEqual(body.output_config.format.schema.properties.probabilities.required, hostKeys, "スキーマの probabilities.required が候補キーと一致しない");
+  assert.ok(typeof body.system === "string" && body.system.indexOf("no target cell this time") !== -1, "system が CELL_NOTE を含んでいない");
+  var content = body.messages[0].content;
+  var sent = JSON.parse(content.slice(content.indexOf("\n") + 1));
+  assert.ok(!Object.prototype.hasOwnProperty.call(sent, "target"), "ask:cell 相当なのに target を送っている");
+  assert.deepStrictEqual(hostRows(sent.puzzle), hostRows(ctx.buildSelectionSnapshot()), "盤面が buildSelectionSnapshot() と一致しない");
+
+  var chosenKey = keys[0];
+  entry.resolve(makeClaudeCellResponse(keys, chosenKey));
+  await waitFor(function () {
+    return ctx.state.focusedKey !== null;
+  }, "W6: 選択後のフォーカス待ち");
+  var cm = /^r(\d)c(\d)$/.exec(chosenKey);
+  assert.equal(ctx.state.focusedKey, Number(cm[1]) + "-" + Number(cm[2]), "選ばれたマスにフォーカスが立っていない(Claude 経路)");
+});
+
+test("W7: 確信度順でヒートマップの背景と『マス選び: N候補中』がパネルに出る。順番トグルは実行中ロックされる", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.setOrderMode("confidence");
+
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "W7: マス選びの fetch 待ち");
+  var entry = af.pending.shift();
+  var body = JSON.parse(entry.init.body);
+  var keys = ctx.selectionKeys();
+  var chosenKey = keys[0];
+  entry.resolve(makeCellResponse(body.puzzle, keys, chosenKey));
+
+  await waitFor(function () {
+    return ctx.state.focusedKey !== null;
+  }, "W7: 選択後のフォーカス待ち");
+  ctx.render();
+  var html = ctx.appElement.innerHTML;
+  assert.ok(html.indexOf("rgba(125, 211, 252") !== -1, "ヒートマップの背景が出ていない");
+  assert.ok(html.indexOf("マス選び:") !== -1 && html.indexOf("候補") !== -1, "『マス選び: N候補中』がパネルに出ていない");
+  assert.ok(html.indexOf("背景の濃さ") !== -1, "凡例にヒートマップの説明が出ていない");
+
+  // 実行中は順番トグルが無効
+  var orderToggleMatch = html.match(/<div id="order-toggle">([\s\S]*?)<\/div>/);
+  assert.ok(orderToggleMatch, "order-toggle が描画されていない");
+  assert.ok(orderToggleMatch[1].indexOf("disabled") !== -1, "実行中に順番トグルが無効化されていない");
+});
