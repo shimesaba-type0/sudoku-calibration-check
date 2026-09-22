@@ -1034,6 +1034,16 @@ var PAGE_HTML = `<!doctype html>
     font-size: 13px;
   }
 
+  /* 一時的な失敗による停止(Issue #43)の理由。「停止中」の下に添える */
+  .pause-reason {
+    background: var(--error-bg);
+    color: var(--incorrect);
+    border-radius: 6px;
+    padding: 8px 10px;
+    margin: 6px 0;
+    font-size: 12px;
+  }
+
   .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
   .stat-card { background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: 8px; padding: 10px 12px; }
   .stat-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
@@ -1627,7 +1637,9 @@ var PAGE_HTML = `<!doctype html>
     selecting: false,         // 確信度順のマス選び中か
     cellProbs: null,          // 確信度順のヒートマップ用 { "r-c": p, ... }。マス選びの直後だけ持つ
     lastSelection: null,      // 直近のマス選び1件 { r, c, confidence, candidates, p }
-    lastCellRequest: null     // 直近のマス選びでモデルに送ったリクエスト(Jev なら request、Claude なら送ったボディ)
+    lastCellRequest: null,    // 直近のマス選びでモデルに送ったリクエスト(Jev なら request、Claude なら送ったボディ)
+    pauseReason: null         // 一時的な失敗による停止の理由文言(Issue #43)。手動 stop() では null のまま。
+                               // run() / reset() / newPuzzle() / stop() で null に戻る
   };
   // 描画に不要な進行管理はモジュール変数(docs/DESIGN.md 4.1)
   var queue = [];
@@ -1695,7 +1707,21 @@ var PAGE_HTML = `<!doctype html>
     if (data && data.request && typeof data.request === "object") {
       error.request = data.request;
     }
+    markJevTransientError(error, res);
     throw error;
+  }
+
+  // 一時的な失敗(Issue #43)。Jev 経路(Worker)の 429(レート制限)/ 503(カウンタ障害)は
+  // pauseForTransientError() の対象になる(それ以外の 400/502 は従来どおり showError())。
+  // 429 は Retry-After ヘッダーがあれば秒数を err.retryAfter に載せる
+  // (pauseForTransientError() が文言に使う)。
+  function markJevTransientError(error, res) {
+    if (res.status !== 429 && res.status !== 503) return;
+    error.transient = true;
+    if (res.status === 429 && res.headers && typeof res.headers.get === "function") {
+      var retryAfter = Number(res.headers.get("Retry-After"));
+      if (isFinite(retryAfter)) error.retryAfter = retryAfter;
+    }
   }
 
   // 確信度順モード(Issue #38)のマス選び1件。スナップショットはここで1回だけ作り
@@ -1727,6 +1753,7 @@ var PAGE_HTML = `<!doctype html>
     if (data && data.request && typeof data.request === "object") {
       error.request = data.request;
     }
+    markJevTransientError(error, res);
     throw error;
   }
 
@@ -1982,6 +2009,12 @@ var PAGE_HTML = `<!doctype html>
     return { answer: parsed };
   }
 
+  // 一時的な失敗(Issue #43)。Claude 経路の 429(レート制限)/ 529(過負荷)/ 5xx は
+  // pauseForTransientError() の対象になる(401 などそれ以外の非 2xx は従来どおり showError())。
+  function isTransientClaudeStatus(status) {
+    return status === 429 || status === 529 || (status >= 500 && status < 600);
+  }
+
   // ブラウザから api.anthropic.com を直接呼ぶ(CORS 対応。ブラウザからの直接呼び出しには
   // anthropic-dangerous-direct-browser-access ヘッダーが必要)。キーは x-api-key ヘッダーにだけ載せる。
   // 戻り値は judgeCellJev と同じ形 { probabilities, choice, confidence, request }。
@@ -2004,8 +2037,10 @@ var PAGE_HTML = `<!doctype html>
       });
     } catch (e) {
       if (e && e.name === "AbortError") throw e;
+      // ネットワーク失敗(fetch が reject)は一時的な失敗として扱う(Issue #43)。
       var netErr = new Error("Claude API に接続できません: " + (e && e.message ? e.message : String(e)));
       netErr.request = body;
+      netErr.transient = true;
       throw netErr;
     }
     var data = null;
@@ -2020,6 +2055,7 @@ var PAGE_HTML = `<!doctype html>
       if (data && data.error && typeof data.error.message === "string") message += ": " + data.error.message;
       var httpErr = new Error(message);
       httpErr.request = body;
+      if (isTransientClaudeStatus(res.status)) httpErr.transient = true;
       throw httpErr;
     }
     var parsed = parseClaudeAnswer(data);
@@ -2060,6 +2096,7 @@ var PAGE_HTML = `<!doctype html>
       if (e && e.name === "AbortError") throw e;
       var netErr = new Error("Claude API に接続できません: " + (e && e.message ? e.message : String(e)));
       netErr.request = body;
+      netErr.transient = true;
       throw netErr;
     }
     var data = null;
@@ -2074,6 +2111,7 @@ var PAGE_HTML = `<!doctype html>
       if (data && data.error && typeof data.error.message === "string") message += ": " + data.error.message;
       var httpErr = new Error(message);
       httpErr.request = body;
+      if (isTransientClaudeStatus(res.status)) httpErr.transient = true;
       throw httpErr;
     }
     var parsed = parseClaudeAnswer(data, keys);
@@ -2191,6 +2229,9 @@ var PAGE_HTML = `<!doctype html>
   function run() {
     if (state.running || state.done || state.errorMessage) return;
     state.running = true;
+    // 一時的な失敗による停止(Issue #43)からの再開。理由表示を消す
+    // (手動停止からの再開では元々 null なので無害)。
+    state.pauseReason = null;
     if (!started) {
       started = true;
       queue = [];
@@ -2285,6 +2326,12 @@ var PAGE_HTML = `<!doctype html>
       if (err && err.request && typeof err.request === "object") {
         state.lastCellRequest = err.request;
       }
+      // 一時的な失敗(Issue #43)は停止扱い(queue はマス選び中なので変えなくてよい。
+      // pauseForTransientError() が stop() 相当の後始末をする)。それ以外は従来どおり showError()。
+      if (err && err.transient) {
+        pauseForTransientError(err);
+        return;
+      }
       showError(err && err.message ? err.message : String(err));
     }).catch(function (err) {
       if (!isCurrent(token)) return;
@@ -2341,6 +2388,13 @@ var PAGE_HTML = `<!doctype html>
       if (err && err.request && typeof err.request === "object") {
         state.lastRequest = err.request;
         state.lastRequestFailed = true;
+      }
+      // 一時的な失敗(Issue #43、SPEC F5)は停止扱い(判定中のマスは queue の先頭に
+      // 戻り、記録には残らない。pauseForTransientError() が stop() 相当の後始末をする)。
+      // それ以外(400/401/415/502/形式不正など)は従来どおり showError()。
+      if (err && err.transient) {
+        pauseForTransientError(err);
+        return;
       }
       showError(err && err.message ? err.message : String(err));
     }).catch(function (err) {
@@ -2474,6 +2528,46 @@ var PAGE_HTML = `<!doctype html>
     // 再開(run())はマス選びからやり直す。
     state.selecting = false;
     state.cellProbs = null;
+    // 手動停止には理由が無い(一時的な失敗による停止(下記)と区別する。Issue #43)
+    state.pauseReason = null;
+    render();
+  }
+
+  /**
+   * 一時的な失敗による停止(Issue #43、SPEC F5)。Claude 経路の 429/529/5xx・
+   * ネットワーク失敗、Jev 経路(Worker)の 429(レート制限)/503(カウンタ障害)を
+   * `judgeCell*` / `askCell*` が `err.transient = true` で投げてきたときに使う。
+   * stop() と同じことをする(盤面・周回ログ・統計・queue は保ち、判定中(フォーカス中)
+   * のマスは queue の先頭に戻して記録に残さない)が、state.errorMessage は立てず
+   * state.pauseReason に理由文言を持つ点だけが違う(isPaused() が true になり、
+   * 実行ボタンは「再開」のまま)。確信度順のマス選び中の一時的な失敗も同じ扱い
+   * (queue は変えない。再開はマス選びからやり直す)。
+   */
+  function pauseForTransientError(err) {
+    // 世代を進めて、進行中の fetch / setTimeout のコールバックを無効化する
+    runToken += 1;
+    // in-flight の /api/judge があれば打ち切る(stop() と同じ、Issue #19)
+    if (inflightController) {
+      inflightController.abort();
+      inflightController = null;
+    }
+    state.running = false;
+    if (state.focusedKey) {
+      var parts = state.focusedKey.split("-");
+      queue.unshift({ r: Number(parts[0]), c: Number(parts[1]) });
+    }
+    pendingCommit = null;
+    state.focusedKey = null;
+    state.currentProbs = null;
+    state.selecting = false;
+    state.cellProbs = null;
+    var message = err && err.message ? err.message : String(err);
+    var reason = "一時的な失敗で停止しました: " + message;
+    if (err && typeof err.retryAfter === "number" && isFinite(err.retryAfter)) {
+      reason += "(" + err.retryAfter + "秒後に再試行できます)";
+    }
+    reason += " — 少し待って「再開」で続きから";
+    state.pauseReason = reason;
     render();
   }
 
@@ -2491,6 +2585,9 @@ var PAGE_HTML = `<!doctype html>
     state.currentProbs = null;
     state.selecting = false;
     state.cellProbs = null;
+    // errorMessage が立つとエラー停止が優先される(isPaused() は false)。以前の
+    // 一時的な失敗の理由を残さない(Issue #43)。
+    state.pauseReason = null;
     pendingCommit = null;
     render();
   }
@@ -2546,7 +2643,8 @@ var PAGE_HTML = `<!doctype html>
       selecting: false,
       cellProbs: null,
       lastSelection: null,
-      lastCellRequest: null
+      lastCellRequest: null,
+      pauseReason: null
     };
     queue = [];
     roundWrong = [];
@@ -2682,6 +2780,7 @@ var PAGE_HTML = `<!doctype html>
       remaining: queue.length,
       running: state.running,
       paused: isPaused(),
+      pauseReason: state.pauseReason,
       done: state.done,
       roundsToSolve: state.roundsToSolve,
       stoppedAtLimit: state.stoppedAtLimit,
@@ -2753,7 +2852,7 @@ var PAGE_HTML = `<!doctype html>
       return status.stoppedAtLimit ? "強制終了(" + MAX_ROUNDS + "周)" : "完了(" + status.roundsToSolve + "周)";
     }
     if (status.running) return "実行中";
-    if (status.paused) return "停止中";
+    if (status.paused) return status.pauseReason ? "停止中(一時的な失敗)" : "停止中";
     return "未実行";
   }
 
@@ -3180,6 +3279,11 @@ var PAGE_HTML = `<!doctype html>
     // 直前に確定した判定があれば、参考として下に残す。
     if (isPaused()) {
       var pausedBody = "<p class=\\"muted\\">停止中(残り " + queue.length + " マス)</p>";
+      // 一時的な失敗による停止(Issue #43)は理由を添える。手動停止(state.pauseReason
+      // が null のまま)では出ない。
+      if (state.pauseReason) {
+        pausedBody += "<div class=\\"pause-reason\\">" + escapeHtml(state.pauseReason) + "</div>";
+      }
       var pausedLast = state.lastJudgment;
       if (pausedLast && pausedLast.probs) {
         var pausedStatusText = pausedLast.status === "correct" ? "正解" : "不正解";

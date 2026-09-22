@@ -1945,7 +1945,9 @@ test("U4: 502 に付いた request は「このプロンプトで失敗」とし
   assert.ok(html.includes(expectedLabel + " の判定に使用(このプロンプトで失敗)"), "失敗の注記が出ていない");
   assert.ok(html.includes("&lt;") === false, "エスケープ対象の無い JSON に &lt; が出ている");
 
-  // request の無いエラー(429 相当)は直前の値をそのまま残す
+  // request の無いエラー(400 相当)は直前の値をそのまま残す。429/503 は Issue #43 で
+  // 停止扱いに変わった(showError にならない)ので、ここは非一時的な 400 で確認する
+  // (429/503 が停止扱いになることは Y3 で確認する)。
   ctx.reset();
   ctx.run();
   await waitFor(function () {
@@ -1964,9 +1966,9 @@ test("U4: 502 に付いた request は「このプロンプトで失敗」とし
   }, "U4: 3件目の fetch 待ち");
   af.pending.shift().resolve({
     ok: false,
-    status: 429,
+    status: 400,
     json: function () {
-      return Promise.resolve({ error: "レート制限" });
+      return Promise.resolve({ error: "入力が不正です" });
     },
   });
   await waitFor(function () {
@@ -2159,8 +2161,11 @@ test("V3: thinking の指定はモデルごとに変わる(Opus/Sonnet: adaptive
   assert.equal(ctx.currentModelId(), "typesafe/jev");
 });
 
-test("V4: Claude API のエラー(401 / refusal / JSON 不正)はエラーボックスに出て止まり、失敗したリクエストがパネルに残る", { timeout: 10000 }, async () => {
-  async function runOnce(respond) {
+test("V4: Claude API のエラー(401 / refusal / JSON 不正)はエラーボックスに出て止まり、失敗したリクエストがパネルに残る。ネットワーク失敗は一時的な失敗として停止扱い(Issue #43)", { timeout: 10000 }, async () => {
+  // opts.transient: true ならネットワーク失敗など一時的な失敗(Issue #43)として、
+  // showError() ではなく pauseForTransientError() での停止(isPaused())を待つ。
+  async function runOnce(respond, opts) {
+    var transient = opts && opts.transient;
     var af = makeAbortAwareFetch();
     var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
     ctx.saveAnthropicKey(TEST_KEY);
@@ -2172,9 +2177,16 @@ test("V4: Claude API のエラー(401 / refusal / JSON 不正)はエラーボッ
     var entry = af.pending.shift();
     var body = JSON.parse(entry.init.body);
     respond(entry, ctx, body);
-    await waitFor(function () {
-      return ctx.state.errorMessage !== null;
-    }, "V4: エラー表示待ち");
+    if (transient) {
+      await waitFor(function () {
+        return ctx.isPaused();
+      }, "V4: 一時的な失敗での停止待ち");
+      assert.equal(ctx.state.errorMessage, null, "一時的な失敗でエラーボックスが立った");
+    } else {
+      await waitFor(function () {
+        return ctx.state.errorMessage !== null;
+      }, "V4: エラー表示待ち");
+    }
     assert.equal(ctx.state.running, false);
     assert.equal(af.pending.length, 0, "エラー後に次の fetch が飛んだ");
     assert.deepStrictEqual(JSON.parse(JSON.stringify(ctx.state.lastRequest)), body, "失敗したリクエストが lastRequest に無い");
@@ -2182,7 +2194,7 @@ test("V4: Claude API のエラー(401 / refusal / JSON 不正)はエラーボッ
     ctx.render();
     assert.ok(ctx.appElement.innerHTML.includes("(このプロンプトで失敗)"));
     assert.ok(!ctx.appElement.innerHTML.includes(TEST_KEY));
-    return ctx.state.errorMessage;
+    return transient ? ctx.state.pauseReason : ctx.state.errorMessage;
   }
 
   var msg401 = await runOnce(function (entry) {
@@ -2216,10 +2228,12 @@ test("V4: Claude API のエラー(401 / refusal / JSON 不正)はエラーボッ
   });
   assert.ok(msgBad.includes("probabilities"), "形式不正の文言: " + msgBad);
 
+  // ネットワーク失敗(fetch が TypeError で reject)は一時的な失敗(Issue #43)。
   var msgNet = await runOnce(function (entry) {
     entry.reject(new TypeError("Failed to fetch"));
-  });
+  }, { transient: true });
   assert.ok(msgNet.includes("接続できません"), "ネットワークエラーの文言: " + msgNet);
+  assert.ok(msgNet.includes("一時的な失敗で停止しました"), "停止理由の文言になっていない: " + msgNet);
 });
 
 test("V5: モデル設定は実行中・停止中に変えられず、reset() をまたいで保持され、localStorage から復元される", { timeout: 10000 }, async () => {
