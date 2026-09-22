@@ -86,5 +86,6 @@ npm run dev                 # ローカル起動。AIバインディングはリ
 - 数独ジェネレーター/ソルバー(#5)は実装済み。「新しい問題」ボタンで毎回違う問題を出せる。これに伴い Worker 側の入力検証から固定問題(`GIVEN`)前提の項目を外した(`docs/DESIGN.md` 3.3)
 - 集計ビュー(信頼度較正図)(#6)は実装済み。判定結果を `localStorage`(`scc.records.v1`)に蓄積し、`pc` / `conf` それぞれの帯ごとの正解率を較正図として表示する。JSONエクスポート・記録の消去も可能
 - リセット/新しい問題/エラー時に in-flight の `/api/judge` を `AbortController` で中断する(Issue #19)。`docs/DESIGN.md` 4.2/4.3、`docs/SPEC.md` F5 を参照
-- 既知の未実装: 難易度(#21)。Playwright E2E スモーク(#17)は PR #24 でマージ済み(`npm run e2e`)
+- 難易度トグル(#21、やさしい36/ふつう30/むずかしい25ヒント)は `claude/issue-21-difficulty` ブランチで実装済み(未マージ)。`docs/SPEC.md` F1/F4'、`docs/DESIGN.md` 4.1/4.2/5章を参照
+- Playwright E2E スモーク(#17)は PR #24 でマージ済み(`npm run e2e`)
 - 要判断(オーナー): IP 単位のレート制限(30 回/時)の緩和可否は Issue #20 を参照。上限を緩める変更は作業ルール4によりオーナーの判断が必要
