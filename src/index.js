@@ -1276,7 +1276,7 @@ var PAGE_HTML = `<!doctype html>
   #round-log ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
   #round-log li { font-size: 12px; font-family: "IBM Plex Mono", monospace; color: var(--muted); }
 
-  .banner { border-radius: 8px; padding: 12px 14px; font-size: 14px; font-weight: 600; }
+  .banner { border-radius: 8px; padding: 12px 14px; font-size: 14px; font-weight: 600; margin-bottom: 14px; }
   .banner.success { background: var(--correct-bg); color: var(--correct); border: 1px solid var(--correct); }
   .banner.warning { background: var(--incorrect-bg); color: var(--incorrect); border: 1px solid var(--incorrect); }
 
@@ -3973,7 +3973,7 @@ var PAGE_HTML = `<!doctype html>
       return "<div id=\\"completion-banner\\" class=\\"banner success\\">" + state.roundsToSolve + "周ですべて正解しました</div>";
     }
     if (state.done && state.stoppedAtLimit) {
-      return "<div id=\\"completion-banner\\" class=\\"banner warning\\">" + MAX_ROUNDS + "周で強制終了しました(全マス正解には至りませんでした)</div>";
+      return "<div id=\\"completion-banner\\" class=\\"banner warning\\">" + MAX_ROUNDS + "周で強制終了しました(不正解 " + roundWrong.length + " マス。全マス正解には至りませんでした)</div>";
     }
     return "<div id=\\"completion-banner\\"></div>";
   }
@@ -4161,7 +4161,9 @@ var PAGE_HTML = `<!doctype html>
       // 埋め込みモード(比較シェルの iframe、Issue #46)。コントロール・Claude設定・
       // 較正図・プロンプト枠・見出しは描かず、グリッド・凡例・統計・現在の判定・
       // 周回ログ・エラーボックス・完了バナーだけを描く(SPEC F1)。
+      // 完了/強制終了のバナーは見逃されないよう一番上に出す(オーナー要望 2026-09-22)
       app.innerHTML =
+        renderBanner() +
         renderErrorBox() +
         "<div class=\\"layout\\">" +
         "<div class=\\"grid-panel\\">" + renderGrid() + renderLegend() + "</div>" +
@@ -4169,7 +4171,6 @@ var PAGE_HTML = `<!doctype html>
         renderStats() +
         renderCurrentPanel() +
         renderRoundLog() +
-        renderBanner() +
         "</div>" +
         "</div>";
     } else {
@@ -4177,6 +4178,8 @@ var PAGE_HTML = `<!doctype html>
         "<h1>数独キャリブレーションチェック</h1>" +
         "<p class=\\"subtitle\\">Jev (typesafe/jev) または Claude に1マスずつ数字を聞き、確率の較正を目で確かめる</p>" +
         "<p class=\\"compare-link\\"><a href=\\"/compare\\">比較モード(Jev / Claude を並べて実行)</a></p>" +
+        // 完了/強制終了のバナーは見逃されないよう見出しの直下(ページの一番上)に出す(オーナー要望 2026-09-22)
+        renderBanner() +
         renderErrorBox() +
         "<div class=\\"layout\\">" +
         "<div class=\\"grid-panel\\">" + renderGrid() + renderLegend() + "</div>" +
@@ -4188,7 +4191,6 @@ var PAGE_HTML = `<!doctype html>
         renderPromptPanel() +
         renderRoundLog() +
         renderCalibration() +
-        renderBanner() +
         "</div>" +
         "</div>";
     }
