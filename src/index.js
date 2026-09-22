@@ -636,14 +636,31 @@ function validateAnswer(answer, expectedKeys, messages) {
   return null;
 }
 
-/** ANSWER_MESSAGES.all.cell のテンプレートの {key} を、落ちたマスのキーに差し替える。 */
-function allCellMessages(key) {
-  var templates = ANSWER_MESSAGES.all.cell;
+/** マス単位の文言テンプレート(ANSWER_MESSAGES.all.cell)の {key} を、落ちたマスのキーに差し替える。 */
+function allCellMessages(templates, key) {
   var messages = {};
-  for (var name in templates) {
-    messages[name] = templates[name].replace("{key}", key);
+  var names = Object.keys(templates);
+  for (var i = 0; i < names.length; i++) {
+    messages[names[i]] = templates[names[i]].replace("{key}", key);
   }
   return messages;
+}
+
+/** digit / all の質問に共通の criteria(1〜9)を criteria に詰める。 */
+function fillDigitCriteria(criteria) {
+  for (var i = 0; i < DIGITS.length; i++) {
+    criteria[DIGITS[i]] = "the digit " + DIGITS[i];
+  }
+  return criteria;
+}
+
+/** answers のキー集合が expectedKeys とちょうど一致(個数と各キー)するか。ずれていれば message を返す。 */
+function checkAnswerKeys(answers, expectedKeys, message) {
+  if (Object.keys(answers).length !== expectedKeys.length) return message;
+  for (var i = 0; i < expectedKeys.length; i++) {
+    if (!Object.prototype.hasOwnProperty.call(answers, expectedKeys[i])) return message;
+  }
+  return null;
 }
 
 /**
@@ -654,16 +671,11 @@ function allCellMessages(key) {
  * 「どのマスで落ちたか」が分かる文言になる(ANSWER_MESSAGES.all)。
  */
 function validateAllAnswers(answers, expectedKeys, messages) {
-  var keys = Object.keys(answers);
-  if (keys.length !== expectedKeys.length) {
-    return messages.keys;
-  }
+  var badKeys = checkAnswerKeys(answers, expectedKeys, messages.keys);
+  if (badKeys !== null) return badKeys;
   for (var i = 0; i < expectedKeys.length; i++) {
     var expected = expectedKeys[i];
-    if (!Object.prototype.hasOwnProperty.call(answers, expected)) {
-      return messages.keys;
-    }
-    var bad = validateAnswer(answers[expected], DIGITS, allCellMessages(expected));
+    var bad = validateAnswer(answers[expected], DIGITS, allCellMessages(messages.cell, expected));
     if (bad !== null) return bad;
   }
   return null;
@@ -677,16 +689,10 @@ function validateAllAnswers(answers, expectedKeys, messages) {
  * 問題なければ null、不備があれば日本語の理由(ANSWER_MESSAGES.where)を返す。
  */
 function validateNoulAnswers(answers, expectedKeys, messages) {
-  var keys = Object.keys(answers);
-  if (keys.length !== expectedKeys.length) {
-    return messages.keys;
-  }
+  var badKeys = checkAnswerKeys(answers, expectedKeys, messages.keys);
+  if (badKeys !== null) return badKeys;
   for (var i = 0; i < expectedKeys.length; i++) {
-    var expected = expectedKeys[i];
-    if (!Object.prototype.hasOwnProperty.call(answers, expected)) {
-      return messages.keys;
-    }
-    var entry = answers[expected];
+    var entry = answers[expectedKeys[i]];
     if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
       return messages.values;
     }
@@ -820,13 +826,11 @@ async function handleJudge(request, env) {
     // 聞く(Issue #48)。criteria は digit 経路と同じ 1〜9 で、質問ごとに同じオブジェクトを
     // 使い回す(`request` にそのまま載るので JSON にできる形のまま)。
     // target は渡さない(残りの全マスに聞く質問なので、対象マスが存在しない)。
-    for (var di = 0; di < DIGITS.length; di++) {
-      criteria[DIGITS[di]] = "the digit " + DIGITS[di];
-    }
+    fillDigitCriteria(criteria);
     var allCells = emptyCells(body.puzzle);
     var allQuestions = {};
-    for (var ai = 0; ai < allCells.length; ai++) {
-      var allCell = allCells[ai];
+    for (var k = 0; k < allCells.length; k++) {
+      var allCell = allCells[k];
       allQuestions[allCell.key] = {
         type: "choice",
         instructions: allInstructions(allCell.row, allCell.col),
@@ -888,8 +892,8 @@ async function handleJudge(request, env) {
       },
     };
   } else if (ask === ASK_DIGIT) {
+    fillDigitCriteria(criteria);
     for (var i = 0; i < DIGITS.length; i++) {
-      criteria[DIGITS[i]] = "the digit " + DIGITS[i];
       expectedKeys.push(DIGITS[i]);
     }
     payload = {
@@ -935,19 +939,19 @@ async function handleJudge(request, env) {
   var answer = null;
   var badAnswer;
   if (ask === ASK_ALL) {
-    var extractedAllCells = extractAnswers(result);
-    if (extractedAllCells.error !== undefined) {
-      badAnswer = extractedAllCells.error;
-    } else {
-      answers = extractedAllCells.answers;
-      badAnswer = validateAllAnswers(answers, expectedKeys, ANSWER_MESSAGES[ask]);
-    }
-  } else if (ask === ASK_WHERE) {
     var extractedAll = extractAnswers(result);
     if (extractedAll.error !== undefined) {
       badAnswer = extractedAll.error;
     } else {
       answers = extractedAll.answers;
+      badAnswer = validateAllAnswers(answers, expectedKeys, ANSWER_MESSAGES[ask]);
+    }
+  } else if (ask === ASK_WHERE) {
+    var extractedWhere = extractAnswers(result);
+    if (extractedWhere.error !== undefined) {
+      badAnswer = extractedWhere.error;
+    } else {
+      answers = extractedWhere.answers;
       badAnswer = validateNoulAnswers(answers, expectedKeys, ANSWER_MESSAGES[ask]);
     }
   } else {

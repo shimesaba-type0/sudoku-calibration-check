@@ -313,6 +313,7 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 - 検証の順番は `ask` → `puzzle` が9要素の配列 → `target` 禁止 → `digit` 禁止 → 各行の形式 → 17個以上 → 空マスあり(`cell` / `where` に揃えてある)
 - Jev に渡す `questions` は **空マス1つにつき1問**(`type: "choice"`)。キーは `ask:"cell"` / `ask:"where"` と同じ `"r" + row + "c" + col` で、並びは行優先。各問の `instructions` は `ALL_INSTRUCTIONS_TEMPLATE`(`"Which digit from 1 to 9 belongs in the empty cell at row {row}, column {col} (zero-based)?"`)に座標を埋めたもの、`criteria` は `ask:"digit"` と同じ `{ "1": "the digit 1", …, "9": "the digit 9" }`
 - `state` は `{ puzzle, note }` のみ(`target` も `digit` も無く、`note` は専用の文面 `ALL_NOTE`)
+- 1回の呼び出しに入る質問は空マスの数だけ(埋まっているマスが17個以上という共通条件から **最大64問**、1問あたり criteria は9個)。実環境で確認済みなのは51問まで(2026-09-22、`docs/DESIGN.md` 3.4)で、64問は未検証
 - レート制限は `ask` によらず **1呼び出し = 1カウント**。1 周ぶんを1回で聞くので、周1つあたり1カウントで済む
 
 レスポンス(200):
