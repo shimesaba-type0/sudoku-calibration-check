@@ -100,7 +100,7 @@ Durable Object は同じ名前のインスタンスが世界に1つしか存在�
 0. `content-type` ヘッダーのメディアタイプ(`;` の前)が `application/json` と一致しなければ 415(`charset` 等のパラメータは無視。前方一致にしないのは `application/json-patch+json` のような別タイプを通さないため)(`{ "error": "content-type は application/json である必要があります" }`)。**レート制限より前**に行う。これは 7 章のクロスサイト対策の要なので外さない
 1. `checkRateLimit` を呼ぶ。`allowed:false` かつ `scope` が `"ip"` / `"global"` なら 429(`error` に理由、レスポンスヘッダーに `Retry-After` と `X-RateLimit-Scope`)、`scope` が `"counter"` なら 503(`error` に理由、`Retry-After: 60`)
 2. `request.json()` → 失敗なら 400
-3. 入力を検証し(`validateInput`)、不備なら 400 を返す。**質問の種類(`ask`)で分岐する**(Issue #38 / #45)。`ask` は `"digit"`(既定・省略時)/ `"cell"` / `"where"` のいずれかで、それ以外なら 400(`readAsk` が `null` を返す)。検証項目は次の通り
+3. 入力を検証し(`validateInput`)、不備なら 400 を返す。**質問の種類(`ask`)で分岐する**(Issue #38 / #45 / #48)。`ask` は `"digit"`(既定・省略時)/ `"cell"` / `"where"` / `"all"` のいずれかで、それ以外なら 400(`readAsk` が `null` を返す。文言は `ASK_ERROR` =「askはdigit・cell・where・allのいずれかである必要があります」)。検証項目は次の通り
    - **共通**
      - `puzzle` が長さ9の配列で、各要素が9文字の文字列。文字は `1`〜`9` と `.` のみ
      - `puzzle` の埋まっているマスが `MIN_FILLED_CELLS`(17)個以上。17 は一意解を持つ数独の最小ヒント数で、これ未満は数独として成立しない
@@ -117,11 +117,17 @@ Durable Object は同じ名前のインスタンスが世界に1つしか存在�
      - `digit` が `"1"`〜`"9"` の **文字列** であること。欠落・数値(`4`)・範囲外(`"0"` / `"10"`)は 400。criteria ではなく質問文にそのまま埋め込む値なので、曖昧なまま Jev に送らない
      - 空マス(`.`)が1つ以上あること(`cell` と同じ)
      - 検証の順番は `ask` → `puzzle` が9要素の配列 → `target` 禁止 → `digit` → 各行の形式 → 17個以上 → 空マスあり(`cell` に揃えてある)
+   - **`ask:"all"`(一括。Issue #48)**
+     - `target` が **付いていないこと**(`cell` / `where` と同じ理由。文言は「残りの全マスに聞くため」)
+     - `digit` が **付いていないこと**。付いていたら 400(`"ask:allではdigitを指定できません"`)。`all` は空マス全部にそれぞれ数字を聞く質問なので、特定の数字を指す `digit` は取らない。`where` と取り違えたリクエストを黙って別の質問として飛ばさないため
+     - 空マス(`.`)が1つ以上あること(`cell` / `where` と同じ)
+     - 検証の順番は `ask` → `puzzle` が9要素の配列 → `target` 禁止 → `digit` 禁止 → 各行の形式 → 17個以上 → 空マスあり(`cell` / `where` に揃えてある)
 4. `criteria` と「期待するキー集合」(`expectedKeys`)を `ask` ごとに生成する
    - `ask:"digit"`: `{ "1": "the digit 1", ..., "9": "the digit 9" }`。`expectedKeys` は `DIGITS`
    - `ask:"cell"`: `emptyCells(puzzle)` が返す空マスを **行優先の順** に並べ、`{ "r0c2": "row 0, column 2 (zero-based)", ... }`。キーは `"r" + row + "c" + col`。`expectedKeys` はそのキー配列。Jev の `choice` は選択肢を255個まで取れるので、空マスは最大64個(埋まっているマスが17個以上という共通条件のため)なので1回で聞ける
+   - `ask:"all"`: criteria は `ask:"digit"` と同じ 1〜9。`emptyCells(puzzle)` の各マスを **そのまま質問キー** にして `{ "r0c2": { type: "choice", instructions: ..., criteria: ... }, ... }` を組み立てる(行優先)。`expectedKeys` はそのキー配列(= `answers` に期待するキー集合。各マスの `probabilities` / `choice` に期待するのは `DIGITS` のほう)。`instructions` は `ALL_INSTRUCTIONS_TEMPLATE` に座標を埋めた文(`allInstructions(row, col)`)。`criteria` は質問ごとに **同じオブジェクトを使い回す**(`request` にそのまま載るので JSON 化できる形のまま。9個 × 空マス数を作り直す意味が無い)
    - `ask:"where"`: criteria は使わない。`emptyCells(puzzle)` の各マスを **そのまま質問キー** にして `{ "r0c2": { type: "noul", instructions: ... }, ... }` を組み立てる(行優先)。`expectedKeys` はそのキー配列。`instructions` は `WHERE_INSTRUCTIONS_TEMPLATE` に座標と `digit` を埋めた文(`whereInstructions(row, col, digit)`)。テンプレートを定数として持つのは、フロント(Claude 経路)が同じ文言を組み立てられるようにするため
-5. `env.AI.run("typesafe/jev", payload)`(`payload = { state, questions }`。質問キーは `ask:"digit"` / `ask:"cell"` では `ask` と同じ `digit` / `cell`、`ask:"where"` では空マスのキーがそのまま質問キーになる。`state` は `ask:"cell"` / `ask:"where"` のとき `target` を持たない。下記参照)を呼ぶ。例外は 502(`raw` に例外メッセージを200文字まで入れ、`console.error` でログを残す)。**この 502 にも `request: payload` を添える**(Issue #34。フロントが「何を送って失敗したか」を確認できるように)
+5. `env.AI.run("typesafe/jev", payload)`(`payload = { state, questions }`。質問キーは `ask:"digit"` / `ask:"cell"` では `ask` と同じ `digit` / `cell`、`ask:"where"` / `ask:"all"` では空マスのキーがそのまま質問キーになる。`state` は `ask:"cell"` / `ask:"where"` / `ask:"all"` のとき `target` を持たない。下記参照)を呼ぶ。例外は 502(`raw` に例外メッセージを200文字まで入れ、`console.error` でログを残す)。**この 502 にも `request: payload` を添える**(Issue #34。フロントが「何を送って失敗したか」を確認できるように)
 6. 返ってきたレスポンスから `answers[ask]` を取り出して検証し(`extractAnswer(result, key)` → `validateAnswer(answer, expectedKeys, messages)`。`ask:"where"` は質問が空マスの数だけあるので、代わりに `extractAnswers(result)` で **`answers` オブジェクトそのもの** を取り出して `validateNoulAnswers(answers, expectedKeys, messages)` にかける)、次のどれかを満たさなければ 502(`raw` に生レスポンスを、**`request: payload` も**添えて返す。デバッグ用・Issue #34)
    - レスポンスがオブジェクトである
    - `state` フィールドがある場合、その値が `"Completed"` である(AI Gateway のラッパー。3.4)。違えば中身を見ずに 502
@@ -131,10 +137,12 @@ Durable Object は同じ名前のインスタンスが世界に1つしか存在�
    - `choice` が文字列で、`expectedKeys` のいずれか
    - `confidence` が有限の数値。**値の妥当性は見ない**(Jev 独自の確信度で `probabilities[choice]` とは一致しないため。3.4 / SPEC 4章)
 
+   `ask:"all"`(Issue #48)の判定基準は次の通り。`extractAnswers(result)` で `answers` そのものを取り出し、`validateAllAnswers(answers, expectedKeys, ANSWER_MESSAGES.all)` にかける。`answers` のキー集合が `expectedKeys`(空マスのキー)と **ちょうど一致**(個数も各キーも)し、各マスの回答が **`ask:"digit"` とまったく同じ基準**(`validateAnswer(answer, DIGITS, ...)`)を満たすこと。マス単位の 502 の文言は「どのマスで落ちたか」が分かるよう `ANSWER_MESSAGES.all.cell` のテンプレート(`{key}` をマスのキーに差し替える。`allCellMessages`)を使う。このために `validateAnswer` は `messages.answer` / `messages.missing` / `messages.confidence` の差し替え口を持つが、**渡されなければ従来の固定文に落ちる**ので `digit` / `cell` の 502 の文言は1文字も変わらない。
+
    `ask:"where"`(Issue #45)の判定基準は次の通り。`answers` のキー集合が `expectedKeys`(空マスのキー)と **ちょうど一致**(個数も各キーも)し、各要素の `noul` が有限の数値であること。`type` は見ない。`choice` / `confidence` は `noul` の回答に存在しないので検証しない。
 
    `extractAnswer` は Issue #45 で `extractAnswers(response)`(ラッパーの有無を吸収して `answers` を取り出す)の上に組み直した。`answers[key]` を1つ取り出す従来の形はそのまま残っているので、`digit` / `cell` の挙動と 502 の文言は1文字も変わらない。`extractAnswer` / `validateAnswer` は Issue #38 で **質問キーと期待するキー集合を引数で受け取る形に一般化** した(以前は `answers.digit` と `DIGITS` に固定だった)。502 の理由の文面は質問の種類で変わる(`digit` は「1〜9」、`cell` は「候補マス」)ので、`ANSWER_MESSAGES[ask]` として外から渡す。**`digit` 側の文言は従来のまま**(既存のテストとフロントの表示を変えないため)。
-7. `{ probabilities, choice, confidence, request }` に絞って 200 で返す。`ask:"where"` のときだけは形が変わり、**`{ probabilities, digit, request }`**(`probabilities` は質問キー = 空マスごとの `noul`、`digit` は聞いた数字のエコー)を返す。`choice` / `confidence` / `cell` は付けない(`noul` の回答に無いため)。`ask:"cell"` のときは **`cell: { row, col }`**(`choice` の `"r0c2"` を座標に分解したもの)を加える。フロントが毎回パースしなくて済むようにするためで、`choice` は検証済み(必ず criteria のキーのいずれか)なので分解に失敗することはない。`confidence` は Jev の値をそのまま通す(`probabilities[choice]` に差し替えない)。`request` は **同じ `payload` をそのまま**渡す(別オブジェクトを組み立て直さない)。フロントの「モデルに送ったプロンプト」パネル(4.2 `renderPromptPanel`)がこれをそのまま表示する(Issue #34)。400/415/429/503 には `request` を付けない(まだ `payload` を組み立てていないため)
+7. `{ probabilities, choice, confidence, request }` に絞って 200 で返す。`ask:"all"` のときは **`{ cells, request }`**(`cells` は質問キー = 空マスごとの `{ choice, probabilities, confidence }`。`type` は落とす。並びは行優先)で、`choice` / `confidence` / `probabilities` / `cell` / `digit` はトップレベルに付けない。`ask:"where"` のときだけは形が変わり、**`{ probabilities, digit, request }`**(`probabilities` は質問キー = 空マスごとの `noul`、`digit` は聞いた数字のエコー)を返す。`choice` / `confidence` / `cell` は付けない(`noul` の回答に無いため)。`ask:"cell"` のときは **`cell: { row, col }`**(`choice` の `"r0c2"` を座標に分解したもの)を加える。フロントが毎回パースしなくて済むようにするためで、`choice` は検証済み(必ず criteria のキーのいずれか)なので分解に失敗することはない。`confidence` は Jev の値をそのまま通す(`probabilities[choice]` に差し替えない)。`request` は **同じ `payload` をそのまま**渡す(別オブジェクトを組み立て直さない)。フロントの「モデルに送ったプロンプト」パネル(4.2 `renderPromptPanel`)がこれをそのまま表示する(Issue #34)。400/415/429/503 には `request` を付けない(まだ `payload` を組み立てていないため)
 8. `X-RateLimit-Remaining-IP` / `X-RateLimit-Remaining-Global`(その時点の残り回数)は、**レート制限を通過したすべてのレスポンス** に付く(`RATE_LIMITER` バインディングがあるとき。無いフェイルオープン時は残数が存在しないので付かない)。200 だけでなく、その後の 400(入力不正)や 502(AI 失敗・形式不正)にも付く(どれも1回として数えているため)。レート制限より手前で止まる 415 と、制限に引っかかった 429 / 503 には付かない
 
 `state` はオブジェクトで渡す(Jev は string / object / array を受け付ける):
@@ -171,9 +179,22 @@ state: {
 }
 ````
 
-`questions` は空マス1つにつき1問で、キーは `"r0c2"` のようなマスのキー、中身は `{ type: "noul", instructions: <WHERE_INSTRUCTIONS_TEMPLATE に埋めた文> }`。`WHERE_INSTRUCTIONS_TEMPLATE` は `"Is the digit {digit} the one that belongs in the empty cell at row {row}, column {col} (zero-based)?"` で、**フロント(Claude 経路)が同じ文言を使えるように定数として `PAGE_HTML` より前に置いてある**。
+`ask:"all"`(Issue #48)の `state` は `target` も `digit` も持たない:
 
-`CELL_NOTE` / `CELL_INSTRUCTIONS` / `WHERE_NOTE` / `WHERE_INSTRUCTIONS_TEMPLATE` は `NOTE` / `INSTRUCTIONS` とは別の定数で、**`NOTE` の文面は変えない**(`ask` を省略したときの挙動を1文字も変えないため)。どちらの経路でも `state` に入るのは「今埋まっているマス」と固定の説明文だけで、`SOLUTION` 由来の情報は入らない(9 章 不変条件1。10 章のテストが `payload` の完全一致で機械的に確認する)。
+````javascript
+state: {
+  puzzle: puzzle,          // 9行の文字列配列。"." が未確定
+  note: ALL_NOTE,          // NOTE をベースに「target は無い。各質問は1つの空マスについて、
+                           // そこに入る数字を問う。既に置かれている数字が間違っていることもある」
+                           // に書き換えた固定文
+}
+````
+
+`questions` は空マス1つにつき1問で、キーは `"r0c2"` のようなマスのキー、中身は `{ type: "choice", instructions: <ALL_INSTRUCTIONS_TEMPLATE に埋めた文>, criteria: <digit と同じ 1〜9> }`。`ALL_INSTRUCTIONS_TEMPLATE` は `"Which digit from 1 to 9 belongs in the empty cell at row {row}, column {col} (zero-based)?"` で、`WHERE_INSTRUCTIONS_TEMPLATE` と同じく **フロント(Claude 経路)が同じ文言を使えるように定数として `PAGE_HTML` より前に置いてある**。
+
+`ask:"where"` の `questions` は空マス1つにつき1問で、キーは `"r0c2"` のようなマスのキー、中身は `{ type: "noul", instructions: <WHERE_INSTRUCTIONS_TEMPLATE に埋めた文> }`。`WHERE_INSTRUCTIONS_TEMPLATE` は `"Is the digit {digit} the one that belongs in the empty cell at row {row}, column {col} (zero-based)?"` で、**フロント(Claude 経路)が同じ文言を使えるように定数として `PAGE_HTML` より前に置いてある**。
+
+`CELL_NOTE` / `CELL_INSTRUCTIONS` / `WHERE_NOTE` / `WHERE_INSTRUCTIONS_TEMPLATE` / `ALL_NOTE` / `ALL_INSTRUCTIONS_TEMPLATE` は `NOTE` / `INSTRUCTIONS` とは別の定数で、**`NOTE` の文面は変えない**(`ask` を省略したときの挙動を1文字も変えないため)。どちらの経路でも `state` に入るのは「今埋まっているマス」と固定の説明文だけで、`SOLUTION` 由来の情報は入らない(9 章 不変条件1。10 章のテストが `payload` の完全一致で機械的に確認する)。
 
 ### 3.4 Jev のリクエスト/レスポンス形式(2026-09-21 実測)
 
@@ -237,7 +258,7 @@ await env.AI.run("typesafe/jev", {
 
 参考(将来の転用用):
 
-- `noul` のレスポンスは `{ "type": "noul", "noul": 0.98 }`(確率のみ。閾値判断はアプリ側)。**1回の呼び出しに複数の質問を入れられる**(2026-09-22 に、探り用の使い捨て Worker から `noul` の質問を51個まとめて1回で投げ、51件そのまま返ることを実環境で確認。215 ms、入力 1,948 / 出力 973 トークン。同日、`choice` の質問51個(各 1〜9 の criteria)でも 51 件返った: 1,097 ms、入力 9,483 / 出力 4,083 トークン)。`ask:"where"`(Issue #45)はこれを使っている。**この PR の payload そのもの(キー `r0c2`・`WHERE_NOTE`・`state.digit`)での疎通はマージ後に本番で `curl` 1 回で確認する**
+- `noul` のレスポンスは `{ "type": "noul", "noul": 0.98 }`(確率のみ。閾値判断はアプリ側)。**1回の呼び出しに複数の質問を入れられる**(2026-09-22 に、探り用の使い捨て Worker から `noul` の質問を51個まとめて1回で投げ、51件そのまま返ることを実環境で確認。215 ms、入力 1,948 / 出力 973 トークン。同日、`choice` の質問51個(各 1〜9 の criteria)でも 51 件返った: 1,097 ms、入力 9,483 / 出力 4,083 トークン)。`ask:"where"`(Issue #45)は `noul` 側を、`ask:"all"`(Issue #48)は `choice` 側を使っている。**いずれも探り用の使い捨て Worker からの実測で、本 PR の payload そのもの(`ask:"where"` はキー `r0c2`・`WHERE_NOTE`・`state.digit`、`ask:"all"` はキー `r0c2`・`ALL_NOTE`・質問ごとの 1〜9 の criteria)での疎通は、マージ後に本番で `curl` 1 回で確認する**
 - `score` は順序付きの段階から1つを選び、同様に確率を返す
 
 **この形式は変わり得る。** Jev は公開直後で頻繁に更新されており、ゲートウェイのラッパーも
@@ -716,6 +737,7 @@ new_sqlite_classes = ["RateLimitCounter"]
   - **不変条件7**: `src/index.js` のソースを読み、`PAGE_HTML` のテンプレートリテラルの外に `SOLUTION` という文字列が現れない。開きバッククォートは「**行頭の** `var PAGE_HTML = \`` の宣言」とし、その文字列がファイル中に1つしか無いことも確認する(コメント中の同じ文字列を拾って切り出し範囲がずれると検査が無効になるため)。閉じバッククォートは「ファイル最後のバッククォート」とし、その後ろが `;` と空白だけであること(= `PAGE_HTML` が最後の宣言であること。3.5)も併せて検査する
   - **`ask:"cell"`(Issue #38)**: `payload` が期待どおりのオブジェクトと完全に一致する(`state` に `target` が無い・`note` が `CELL_NOTE`・`criteria` のキーが空マスの一覧と行優先の順で一致・値の文言)。200 の形(`probabilities` / `choice` / `confidence` / `request` / `cell`)と `request` が `payload` そのものであること。400(`ask` が不正 / `target` 付き / 空マスなし / 埋まりが17個未満)、502(`answers.cell` が無い / `probabilities` のキーが criteria と一致しない / `choice` が criteria に無い)。レート制限が `ask` によらず1呼び出し=1カウントであること。**`ask` 省略時(`digit`)の挙動が文言も含めて従来どおりであること**
   - **`ask:"where"`(Issue #45)**: `payload` が期待どおりのオブジェクトと完全に一致する(`state` が `puzzle` / `digit` / `note` の3つだけ・`note` が `WHERE_NOTE`・質問キーが空マスの一覧と行優先の順で一致・各問が `type:"noul"` で `WHERE_INSTRUCTIONS_TEMPLATE` どおりの文言)。200 の形(`probabilities` / `digit` / `request` の3つだけで、`choice` / `confidence` / `cell` が付かない)と `request` が `payload` そのものであること。400(`target` 付き / `digit` の欠落・数値・`"0"` / `"10"` / 全部埋まった盤面 / 17個未満 / puzzle 形式)、502(`answers` が取り出せない / `state` が `"Completed"` でない / キーが質問と一致しない(余計・欠け・キー名違い)/ `noul` が有限の数値でない)。レート制限が1呼び出し=1カウントであること。不変条件1(`payload` の完全一致・未知キー非混入)。空マス1個の境界
+  - **`ask:"all"`(Issue #48)**: `payload` が期待どおりのオブジェクトと完全に一致する(`state` が `puzzle` / `note` の2つだけで `target` も `digit` も無い・`note` が `ALL_NOTE`・質問キーが空マスの一覧と行優先の順で一致・各問が `type:"choice"` で `ALL_INSTRUCTIONS_TEMPLATE` どおりの文言と `digit` と同じ 1〜9 の criteria)。200 の形(`cells` / `request` の2つだけで、`cells` の各値が `{ choice, probabilities, confidence }`(`type` は落とす)、トップレベルに `choice` / `confidence` / `probabilities` / `cell` / `digit` が付かない)と `request` が `payload` そのものであること。400(`ask` が不正(文言も)/ `target` 付き / `digit` 付き / 全部埋まった盤面 / 17個未満 / puzzle 形式)、502(`answers` が取り出せない / `state` が `"Completed"` でない / キーが質問と一致しない(余計・欠け・キー名違い)/ あるマスの `probabilities` が8キー・`choice` が `"0"`・`confidence` が文字列・値が非数値・`probabilities` ごと無い・回答がオブジェクトでない。いずれも **どのマスで落ちたか** が文言に出ること)。ラッパー無しでも 200。レート制限が1呼び出し=1カウントであること。不変条件1(`payload` の完全一致・未知キー非混入)。空マス1個・64個(17個埋まり)の境界。**`digit` / `cell` / `where` の挙動が従来どおりであること**
   - content-type: `text/plain` や content-type 無しのリクエストが 415 になり、`AI.run` もレート制限のカウンタも触られないこと
   - 入力検証: 3.3 の各項目について 400 になること(対象マスが空でない場合を含む)。正常入力で 200 と9キーの `probabilities` が返ること
   - レート制限: IP上限・全体上限それぞれの超過で 429 と `Retry-After` / `X-RateLimit-Scope` が返ること。全体超過時に全体を `peek` するだけで IP 側のインスタンスを呼ばないこと。`Retry-After` が `(bucket+1)*window - now` であること。`RATE_LIMITER` が無ければ通ること(フェイルオープン)。カウンタの呼び出しが例外を投げる / 500 を返せば 503 になり `AI.run` が呼ばれないこと(フェイルクローズ)。`[vars]` の値が反映され、紛らわしい表記が既定値に落ちること。残数ヘッダーが 200 / 400 / 502 に付き、429 / 503 には付かないこと
