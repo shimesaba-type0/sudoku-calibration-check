@@ -199,9 +199,43 @@ Cloudflare 側の都合で変わる。形が違っていたらこの節と `hand
 
 ### 3.5 `PAGE_HTML`
 
-バッククォート付きテンプレートリテラルにHTML全体を格納。中で `${...}` は使っていない(素のHTMLを埋めているだけ)ので、テンプレート内のJSで `${}` を書く必要が出たら `\${}` とエスケープすること。
+バッククォート付きテンプレートリテラルにHTML全体を格納。テンプレート内の `${...}` は **`NOTE` と `INSTRUCTIONS` を埋め込む 2 箇所だけ**(`var NOTE = ${JSON.stringify(NOTE)};` の形。Claude 経路が Jev と同じルール説明・質問文を使うため。3.6)。それ以外で `${}` を書く必要が出たら `\${}` とエスケープすること。
 
 `PAGE_HTML` は **`src/index.js` の最後の宣言に固定する**。不変条件7のテスト(10 章)は「行頭の `var PAGE_HTML = \`` = テンプレートの開き」「ファイル最後のバッククォート = テンプレートの閉じ」と見なして外側のソースを切り出し、その後ろに `;` と空白しか無いことも併せて検査する。ここに何かを足すと検査が無効になるので、新しいコードは `PAGE_HTML` より前に書く。`var PAGE_HTML = \`` という文字列はコメントを含めてファイル中に1つだけにする(テストで確認している)。
+
+### 3.6 Claude 経路(Issue #37、SPEC 7 章 拡張 3)
+
+**Worker は関与しない。** モデルトグルが「Claude」のとき、ブラウザの `judgeCellClaude()` が
+`https://api.anthropic.com/v1/messages` を直接呼ぶ(BYOK。キーは利用者のブラウザの
+`localStorage` にだけある)。Worker 側の AI 呼び出しは引き続き `env.AI.run("typesafe/jev")` のみ。
+
+- **なぜブラウザ直呼びか**: Worker でキーを中継すると、オーナーのキーで公開デモを動かすことになり
+  (コストの青天井)、レート制限をもう一段作る羽目になる。利用者自身のキーなら課金は利用者持ちで、
+  Worker はステートレスなまま。Anthropic API は CORS に対応しており、ブラウザからは
+  `anthropic-dangerous-direct-browser-access: true` ヘッダーを付ければ呼べる
+- **なぜ SDK でなく素の `fetch` か**: フロントは `PAGE_HTML` に埋めた素の JS でビルドステップが無く、
+  `@anthropic-ai/sdk` を読み込む手段が無い(CLAUDE.md の制約)。リクエストの形は SPEC 4 章に固定する
+- **確率の取り方**: structured outputs(`output_config.format` = `json_schema`)で
+  `{ choice, probabilities(1〜9), confidence }` を **自己申告** させる。Jev の `probabilities` と
+  同じ形なので、以降の処理(バー表示・採点・記録・較正図)は共通。較正されている保証は無く、
+  それを較正図で見るのが目的
+- **プロンプト**: `system` = Worker の `NOTE`(テンプレートに埋め込んだ同じ文字列)+ JSON で答える指示。
+  `messages[0].content` = Worker の `INSTRUCTIONS` + 改行 + `{ puzzle, target }`(`buildSnapshot()`。
+  対象マスは `.`)。Jev と比較条件を揃えるため、ルール説明と質問文は同一にする
+- **thinking**: `claudeThinkingConfig(model, on)`。Opus 5 / Sonnet 5 は `adaptive` / `disabled`、
+  Haiku 4.5 は `enabled` + `budget_tokens: 2048`(`max_tokens` に上乗せ)/ 省略。記録の `m` は
+  `<model>+think` / `<model>` で分ける
+- **キーの扱い**: `localStorage` の `scc.anthropic_key.v1`。`x-api-key` ヘッダーにだけ載せ、
+  リクエストボディ・`state.lastRequest`(プロンプトパネル)・記録・エクスポート・DOM のどこにも出さない
+  (画面は末尾 4 文字のヒントだけ)。`saveAnthropicKey` / `clearAnthropicKey` / `loadAnthropicKey`
+- **エラー**: 非 2xx は `Claude API HTTP <status>: <error.message>`、`stop_reason` が `refusal` /
+  `max_tokens`、テキストが JSON でない、検証(`validateClaudeAnswer`、Worker の `validateAnswer` と
+  同じ基準)に落ちる、ネットワーク失敗、いずれも `Error` に `request`(ボディ)を載せて投げ、
+  `focusNext` のエラー側で「(このプロンプトで失敗)」として残す(#34 と同じ経路)
+- **設定の保存**: `scc.claude_settings.v1` に `{ modelMode, model, thinking }`。`reset()` /
+  `newPuzzle()` をまたいで保持し、次回開いたときに `loadClaudeSettings()` で復元する
+- **不変条件**(9 章 1 の Claude 版): Claude に送るボディにも `SOLUTION` 由来の情報を入れない。
+  `judgeCell()` がスナップショットを 1 回だけ作って両経路に渡すので、盤面の作り方は共通
 
 ## 4. フロントエンド設計(`PAGE_HTML` 内の `<script>`)
 
@@ -227,8 +261,12 @@ var state = {
                        // レスポンスの request をそのまま保持。3.3 手順7)。「Jev に送った
                        // プロンプト」パネル(renderPromptPanel)が表示する。停止中・
                        // エラー時も消さず、reset() / newPuzzle() でだけ null に戻す(Issue #34)
-  lastRequestFailed: false // lastRequest が失敗した判定(502 の request)のものなら true。
+  lastRequestFailed: false, // lastRequest が失敗した判定(502 の request)のものなら true。
                        // 成功応答で false に戻り、パネルに「(このプロンプトで失敗)」を添える
+  modelMode: "jev",    // "jev" | "claude"。どのモデルに聞くか(3.6、Issue #37)。reset() で維持
+  claudeModel: "claude-opus-5", // Claude 経路のモデル ID(CLAUDE_MODELS のどれか)
+  claudeThinking: true, // Claude 経路で thinking を使うか
+  calibModelFilter: "all" // 較正図のモデルフィルタ("all" | 記録の m の値)。reset() で維持
 };
 // 描画に不要な進行管理はモジュール変数
 var queue = [];                 // この周でまだ判定していないマス [{r,c}]
@@ -274,9 +312,14 @@ var inflightController = null;  // in-flight の /api/judge 用 AbortController(
 | `shouldStop(round, incorrectCount)` | 周の終わりの判断を返す純粋関数。`"solved"`(不正解0)/ `"limit"`(`MAX_ROUNDS` に到達)/ `"continue"` |
 | `isCurrent(token)` | `state.running && token === runToken`。古い世代のコールバックを弾く(4.3) |
 | `isPaused()` | `started && !state.running && !state.done && !state.errorMessage`。「実行を始めた後、停止していて、完了もエラーもしていない」状態(SPEC F1、Issue #32)。`renderControls()` の「再開」ラベルと `renderCurrentPanel()` の「停止中」表示で使う |
-| `judgeCell(r,c,signal)` | `buildSnapshot()` を作って `/api/judge` を `fetch`(`signal` をそのまま渡す。`focusNext` が渡す `inflightController.signal`)。非2xxは `Error` にして投げる |
+| `judgeCell(r,c,signal)` | `buildSnapshot()` を **ここで 1 回だけ** 作り、`state.modelMode` に応じて `judgeCellJev` / `judgeCellClaude` に渡す(両経路で盤面の作り方を共通にする)。戻り値はどちらも `{ probabilities, choice, confidence, request }` |
+| `judgeCellJev(puzzle,r,c,signal)` | `/api/judge` を `fetch`(`signal` をそのまま渡す。`focusNext` が渡す `inflightController.signal`)。非2xxは `Error` にして投げる(502 の `request` は `err.request` に載せる) |
+| `judgeCellClaude(puzzle,r,c,signal)` | `loadAnthropicKey()` が無ければ即 `Error`。`buildClaudeRequest()` のボディで `api.anthropic.com` を直接 `fetch`(3.6)。非 2xx・`refusal`・形式不正・ネットワーク失敗は `Error` に `request`(ボディ)を載せて投げる |
+| `buildClaudeRequest(puzzle,r,c)` / `claudeThinkingConfig(model,on)` / `parseClaudeAnswer(data)` / `validateClaudeAnswer(answer)` | Claude 経路のリクエスト組み立て(3.6)、モデル別 thinking、応答からの JSON 取り出し、Worker の `validateAnswer` と同じ検証 |
+| `loadAnthropicKey()` / `saveAnthropicKey(key)` / `saveAnthropicKeyFromInput()` / `clearAnthropicKey()` / `anthropicKeyHint()` | キーの読み書き(`scc.anthropic_key.v1`)。画面には末尾 4 文字だけ |
+| `loadClaudeSettings()` / `saveClaudeSettings()` / `setModelMode(mode)` / `setClaudeModel(model)` / `setClaudeThinking(on)` / `modelSettingsLocked()` / `currentModelId()` | モデル設定(`scc.claude_settings.v1`)。実行中・停止中(`isPaused()`)はロックして切り替えない。`currentModelId()` は記録の `m` に入れる識別子 |
 | `focusNext()` | 先頭で `runToken` を捕まえ、`queue` から1つ取り出しフォーカス→(リクエストごとに新しい `AbortController` を `inflightController` に作って)`judgeCell`→バー表示・`result.request` があれば `state.lastRequest` に保存(Issue #34)→(待ち)→`commitFocused`→(待ち)→再帰。`queue` が空なら `finalizeRound`。`judgeCell` が `AbortError` で reject したときは(世代トークンの判定と同じ扱いで)無視して `return` し、`showError` には流さない(4.3、Issue #19)。それ以外の失敗で `err.request` があれば(`judgeCell` が 502 の `request` を載せる)`state.lastRequest` に保存して `lastRequestFailed=true` にしてから `showError`(Issue #34) |
-| `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong`/`state.lastJudgment` を更新。`pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない。正誤が確定するこの時点で `appendRecord()` を呼び、集計ビュー用の1件を記録する |
+| `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong`/`state.lastJudgment` を更新。`pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない。正誤が確定するこの時点で `appendRecord()` を呼び、集計ビュー用の1件(`m: currentModelId()` 付き)を記録する |
 | `finalizeRound()` | ログ追記→`shouldStop` の結果で完了 / 強制終了 / 次の周(`queue = nextQueue(roundWrong)`)。「次の周」のときは、between-round の `setTimeout` を張る**前**に `state.round` / `queue` / `roundSize` / `roundTally` を更新する。この順序のおかげで、待ち時間中に `stop()` されても次の周の状態が既に確定している(下記 `stop()`、Issue #32) |
 | `stop()` | 実行中の停止(SPEC F1、Issue #32)。`reset()` と同じく `runToken` を進めて in-flight の `/api/judge`(`inflightController.abort()`)と予約済みの `setTimeout` を無効化するが、`reset()` と違って **`state.values` / `state.round` / `state.roundLog` / `roundTally` / `roundSize` / `queue` / `started` は捨てない**。`state.focusedKey` があれば(= 判定中のマスがまだ `commitFocused()` されていない)、その結果を破棄して記録(`appendRecord`)にも残さず、`queue.unshift({r,c})` で queue の先頭に戻す(再開したら同じマスをもう一度聞く。SPEC F2)。周をまたぐ待ち時間中(`finalizeRound()` の between-round の `setTimeout` 待ち)に呼ばれた場合は、その時点で `focusedKey` は既に `null`(`commitFocused()` で消えている)なので何もすることがなく、次の周の先頭から再開する(`finalizeRound()` の更新順序による。SPEC F3)。`state.done` / `state.errorMessage` のときは何もしない(両者は常に `running=false` とセットで立つので `state.running` を見るだけで判定できる) |
 | `run()` | 初回のみ queue を全空マスで初期化し `focusNext` を開始。`started` が既に true なら(= `stop()` した後の再開)queue を作り直さず `focusNext()` を呼ぶだけなので、`stop()` が保った進行状態からそのまま続く |
@@ -285,7 +328,7 @@ var inflightController = null;  // in-flight の /api/judge 用 AbortController(
 | `setSpeed(mode)` | `state.speedMode` を切り替えて再描画。実行中でも切り替えられる(4.4) |
 | `setDifficulty(mode)` | `state.difficulty`(`"easy"` / `"normal"` / `"hard"`)を切り替えて再描画。変えただけでは盤面は変わらず、次の `newPuzzle()` の目標ヒント数に効く(Issue #21) |
 | `render()` | `state` から DOM(グリッド・統計・バー・ログ・集計パネル・バナー・ボタン)を **全部 innerHTML で再生成**。周回ログのスクロール位置だけは引き継ぐ |
-| `render*()` | `renderGrid` / `renderLegend` / `renderControls` / `renderErrorBox` / `renderStats`(+`statCard`)/ `renderCurrentPanel`(+`coordLabel` / `renderBars`)/ `renderPromptPanel` / `renderRoundLog` / `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`。それぞれHTML文字列を返すだけで、DOMには触らない |
+| `render*()` | `renderGrid` / `renderLegend` / `renderControls`(モデルトグル含む)/ `renderClaudeSettings`(Claude のときだけ)/ `renderErrorBox` / `renderStats`(+`statCard`)/ `renderCurrentPanel`(+`coordLabel` / `renderBars`)/ `renderPromptPanel` / `renderRoundLog` / `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`。それぞれHTML文字列を返すだけで、DOMには触らない |
 | `renderPromptPanel()` | 「現在の判定」パネルの直下の「Jev に送ったプロンプト」枠(SPEC F1、Issue #34)。`state.lastRequest` があれば `coordLabel`(`lastRequest.state.target` の座標。`lastRequestFailed` なら「(このプロンプトで失敗)」を添える)と、`JSON.stringify(lastRequest, null, 2)` を `escapeHtml` して `<pre class="prompt-json">` に表示する。`null` なら「まだ判定していません」。Worker の `handleJudge` が返す `request` をそのまま表示するだけで、フロント側でペイロードを組み立て直さない(二重管理を避けるため) |
 | `buildCellStyle()` | マスの状態(given/pending/correct/incorrect + focused)からインラインstyle文字列を返す |
 | `escapeHtml(text)` | `innerHTML` に入れる前に `& < > " '` を実体参照にする |
@@ -295,7 +338,7 @@ var inflightController = null;  // in-flight の /api/judge 用 AbortController(
 | `getRecords()` | `render()` / `exportRecords()` が読む窓口。モジュールスコープの `recordsCache`(初期値 `null`)が無ければ `loadRecords()` で読んで(`ok:true` のときだけ)キャッシュを作り、以後はキャッシュをそのまま返す。読み直しのコストを避けるための追加(PR #25 レビュー指摘 should-fix 2。以前は `render()` のたびに全件 `JSON.parse` していた) |
 | `appendRecord(rec)` | 1件追記する。キャッシュが無ければ初回だけ `loadRecords()` を読むが、`ok:false`(読めなかった)なら **このレコードを黙って捨てて保存しない**(読めなかった状態を「空」と取り違えて上書きし、既存の記録を全消しにしないため。should-fix 1)。上限 `RECORDS_MAX`(既定 5,000。テストでは `ctx.RECORDS_MAX` を差し替えて境界だけ検証する)を超えたら古いものから捨てる |
 | `binRecords(records, key)` | `records` を `key`(`"pc"` または `"conf"`)の値で10%刻み10帯に分ける純粋関数。帯は `Math.min(9, Math.floor(v * 10))`(`v=1.0` は最後の帯)。数値でない/有限でない値、および 0〜1 の範囲外の値は除外。戻り値は長さ10の配列 `{ lo, hi, n, correct, rate }`(`rate` は `n===0` なら `null`) |
-| `renderCalibration()` / `renderCalibrationChart(bins, title)` | 集計パネル(見出し「較正図」)。`getRecords()` を読み、合計件数・全体正解率・記録している問題数(`p` のユニーク数)を出したあと、`binRecords` の結果(記録数と最終追記時刻が前回と同じなら再計算しない軽いキャッシュ付き)を `pc` / `conf` 各10帯のインラインSVGの棒グラフ(対角線は理想の較正線)として横並びで描く。件数0の帯は棒を描かない。件数>0だが正解率0%の帯は高さ1pxの台座を描き、件数0の帯と見分けられるようにする(should-fix 2 / nit)。色は CSS 変数(`--accent` / `--muted` / `--border`)をそのまま使う |
+| `renderCalibration()` / `renderCalibrationChart(bins, title)` / `setCalibModelFilter(v)` / `recordModelId(rec)` | 集計パネル(見出し「較正図」)。`getRecords()` を読み、`state.calibModelFilter` でモデル(`rec.m`。無ければ `typesafe/jev`)を絞り込んでから(記録に無いモデルは「すべて」扱い)、合計件数・全体正解率・記録している問題数(`p` のユニーク数)を出したあと、`binRecords` の結果(記録数と最終追記時刻が前回と同じなら再計算しない軽いキャッシュ付き)を `pc` / `conf` 各10帯のインラインSVGの棒グラフ(対角線は理想の較正線)として横並びで描く。件数0の帯は棒を描かない。件数>0だが正解率0%の帯は高さ1pxの台座を描き、件数0の帯と見分けられるようにする(should-fix 2 / nit)。色は CSS 変数(`--accent` / `--muted` / `--border`)をそのまま使う |
 | `exportRecords()` | `getRecords()` の内容を `{ version:1, exported_at, records }` として `Blob` + `<a download>` でダウンロードさせる。ファイル名 `sudoku-calibration-YYYYMMDD-HHMMSS.json`(ローカル時刻) |
 | `clearRecords()` | `confirm()` で確認したうえで `saveRecords([])` し、再描画する |
 
@@ -444,6 +487,7 @@ new_sqlite_classes = ["RateLimitCounter"]
 - `/api/judge` には CORS ヘッダーを付けない。加えて **`content-type` のメディアタイプが `application/json` でないリクエストは 415 で弾く**(`handleJudge` の最初、レート制限より前)。この2つはセットで意味を持つ: `application/json` の POST はブラウザで必ずプリフライトが必要になり、CORS ヘッダーを返していないのでプリフライトが通らず、他サイトのページからは呼べない。一方 `text/plain` などプリフライト不要の content-type はフォーム送信等でクロスサイトに投げられてしまうため、415 で入口を閉じる(第三者のサイトに埋め込まれて Workers AI のコストを消費される経路を塞ぐ)。`curl` 等からの直接アクセスはレート制限で頭打ちにする
 - `GET /` のレスポンスには `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、`Content-Security-Policy: frame-ancestors 'none'` を付ける(クリックジャッキング対策。インラインスクリプトを使うため、それ以上の CSP はかけない)
 - 3.3 の検証を通った盤面文字列だけが Jev に渡る(形式・対象マスが空であること・埋まっているマスが17個以上であることまで見る)
+- Claude 経路(3.6)の API キーは利用者のブラウザの `localStorage` にだけあり、`x-api-key` ヘッダーで `api.anthropic.com` にだけ送る。Worker・リポジトリ・記録・エクスポート・プロンプト表示・DOM のどこにも出ない(テスト V2 / V4 で確認)。公開ページに他人のキーを入れる行為自体のリスク(端末の共有・XSS)は利用者の判断に委ね、画面にその旨を書く
 - `SOLUTION` は Wikipedia の例題の答えなので秘密ではない。守るべきは「Jev に渡る `state` に `SOLUTION` が混ざらないこと」であり、そのために `SOLUTION` をブラウザ用スクリプトの中にだけ置き、Worker の判定コードから構造的に隔離する(8 章)
 
 ## 8. 設計上の判断と理由
@@ -463,11 +507,13 @@ new_sqlite_classes = ["RateLimitCounter"]
 | Durable Object を `fetch` ハンドラ方式に(RPC にしない) | RPC を使うには `cloudflare:workers` の `DurableObject` を継承する必要があるが、そのモジュールは `node:test` から import できず、`src/index.js` をモックの `env` で直接呼ぶテスト方針(10 章)が使えなくなる。素のクラス + `fetch` なら Workers でもそのまま動く |
 | レート制限をフェイルオープンに | `RATE_LIMITER` バインディングが無い環境(ローカルdevなど)でアプリ自体が止まらないようにするため。本番では必ずバインディングを設定する前提 |
 | 採点をブラウザ側で行い、`SOLUTION` を Worker の判定コードから隔離 | `SOLUTION` は秘密ではなく、守るべきは「Jev に渡さないこと」。Worker 側で採点すると `SOLUTION` と Jev 呼び出しが同じ関数の近くに並び、将来の変更で `state` に混ざる事故が起きやすい。ブラウザ用スクリプトの中にだけ置けば、`handleJudge` からは参照のしようがなく、テストで機械的に検証できる(10 章) |
+| Claude はブラウザから直接呼ぶ(BYOK)。Worker で中継しない | Worker で中継するとオーナーのキーで公開デモを動かすことになりコストの青天井、かつレート制限をもう一段作る羽目になる。利用者自身のキーなら課金は利用者持ちで Worker はステートレスなまま(3.6)。SDK を使わないのはビルドステップが無いため |
+| Claude の確率は structured outputs で自己申告させる | Claude には Jev のような確率出力が無い。JSON スキーマで `probabilities` を強制し、Jev と同じ形に揃えて以降の処理(バー・採点・記録・較正図)を共通化する。較正されている保証が無いことは実験の前提 |
 | Cloudflare 公式のテストツールでなく `node:test` | 単一ファイルの Module Worker をモックの `env` で直接呼ぶだけなら Node 22 の標準機能で足りる。依存を増やさず、Cloudflare の認証なしで CI が回る |
 
 ## 9. 変更時の不変条件
 
-1. Jev に渡す `state` に `SOLUTION` 由来の情報を入れない
+1. Jev に渡す `state`、および Claude に渡すリクエストボディに `SOLUTION` 由来の情報を入れない(どちらも `judgeCell()` が作る同じスナップショット)
 2. 正解したマスは以後の周で再判定しない
 3. `probabilities` は必ず `"1"`〜`"9"` の順で表示する(確率順に並べ替えない。見比べやすさ優先)
 4. エラー時は必ず `running=false` にして止める(無限ループ・無駄な課金を防ぐ)

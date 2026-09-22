@@ -723,9 +723,22 @@ var PAGE_HTML = `<!doctype html>
   button:hover:not(:disabled) { border-color: var(--accent); }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   #run-btn { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600; }
-  #speed-toggle, #difficulty-toggle { display: inline-flex; border: 1px solid var(--panel-border); border-radius: 6px; overflow: hidden; }
-  .speed-btn, .difficulty-btn { border: none; border-radius: 0; background: var(--panel-bg); }
-  .speed-btn.active, .difficulty-btn.active { background: var(--accent); color: #0b1220; }
+  #speed-toggle, #difficulty-toggle, #model-toggle, #thinking-toggle { display: inline-flex; border: 1px solid var(--panel-border); border-radius: 6px; overflow: hidden; }
+  .speed-btn, .difficulty-btn, .model-btn, .thinking-btn { border: none; border-radius: 0; background: var(--panel-bg); }
+  .speed-btn.active, .difficulty-btn.active, .model-btn.active, .thinking-btn.active { background: var(--accent); color: #0b1220; }
+  .claude-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 8px; }
+  .claude-row label { font-size: 13px; color: var(--muted); }
+  input[type="password"], select {
+    font-family: inherit;
+    font-size: 13px;
+    color: var(--text);
+    background: var(--bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+    padding: 7px 10px;
+  }
+  input[type="password"] { min-width: 220px; }
+  #calib-model-filter { font-size: 12px; padding: 3px 6px; }
 
   #error-box.error {
     background: var(--error-bg);
@@ -1140,6 +1153,45 @@ var PAGE_HTML = `<!doctype html>
   // データ・状態(docs/DESIGN.md 4.1 / 5章)
   // -------------------------------------------------------------------
   var DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
+  // -------------------------------------------------------------------
+  // Claude(Anthropic API)経路(Issue #37、SPEC 7 章 拡張 3、docs/DESIGN.md 3.6)。
+  // BYOK: 利用者自身の API キーをこのブラウザの localStorage にだけ置き、
+  // api.anthropic.com への呼び出し以外には送らない。Worker は一切関与しない
+  // (Worker 側の AI 呼び出しは env.AI.run("typesafe/jev") のまま)。
+  // -------------------------------------------------------------------
+  var ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
+  var ANTHROPIC_VERSION = "2023-06-01";
+  var ANTHROPIC_KEY_STORAGE_KEY = "scc.anthropic_key.v1";
+  var CLAUDE_SETTINGS_STORAGE_KEY = "scc.claude_settings.v1";
+  var CLAUDE_MODELS = ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
+  var DEFAULT_CLAUDE_MODEL = "claude-opus-5";
+  var CLAUDE_HAIKU_THINKING_BUDGET = 2048; // Haiku 4.5 は budget_tokens 方式(adaptive 非対応)
+  var CLAUDE_MAX_TOKENS = 1024;            // JSON 1 件ぶん。思考ぶんは budget_tokens を上乗せする
+  var JEV_MODEL_ID = "typesafe/jev";
+  // Worker が Jev に渡すのと同じルール説明・質問文(比較条件を揃える)。Worker 側の
+  // 定数をテンプレートに埋め込んでいるので、二重管理にならない。
+  var NOTE = ${JSON.stringify(NOTE)};
+  var INSTRUCTIONS = ${JSON.stringify(INSTRUCTIONS)};
+  var CLAUDE_SYSTEM = NOTE + " Answer with JSON only, matching the given schema: " +
+    "\\"choice\\" is the digit you pick, \\"probabilities\\" gives your calibrated probability for each digit 1-9 " +
+    "(they should sum to 1), and \\"confidence\\" is your overall confidence (0-1) that \\"choice\\" is correct.";
+  // structured outputs(output_config.format = json_schema)のスキーマ。Worker の
+  // validateAnswer と同じ形(choice は 1〜9、probabilities は 1〜9 の 9 キー、confidence は数値)。
+  var CLAUDE_OUTPUT_SCHEMA = (function () {
+    var probProps = {};
+    for (var i = 0; i < DIGITS.length; i++) probProps[DIGITS[i]] = { type: "number" };
+    return {
+      type: "object",
+      properties: {
+        choice: { type: "string", enum: DIGITS.slice() },
+        probabilities: { type: "object", properties: probProps, required: DIGITS.slice(), additionalProperties: false },
+        confidence: { type: "number" }
+      },
+      required: ["choice", "probabilities", "confidence"],
+      additionalProperties: false
+    };
+  })();
   var DIGIT_NUMBERS = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 
   // ジェネレーターが目指す「与えられた数字」の数。下限を割り込むほどは削らない
@@ -1194,7 +1246,11 @@ var PAGE_HTML = `<!doctype html>
     stoppedAtLimit: false,
     lastJudgment: null, // 直前に確定した1件(最速モードでも結果が見えるように残す)
     lastRequest: null, // 直近の判定で Worker が Jev に渡したペイロード(request、Issue #34)
-    lastRequestFailed: false // lastRequest が失敗した判定(502)のものなら true(Issue #34)
+    lastRequestFailed: false, // lastRequest が失敗した判定(502)のものなら true(Issue #34)
+    modelMode: "jev",         // "jev" | "claude"。どのモデルに聞くか(Issue #37)。reset() で維持
+    claudeModel: DEFAULT_CLAUDE_MODEL, // Claude 経路のモデル ID(CLAUDE_MODELS のどれか)
+    claudeThinking: true,     // Claude 経路で思考(extended thinking)を使うか
+    calibModelFilter: "all"   // 較正図のモデルフィルタ("all" | モデル識別子)
   };
   // 描画に不要な進行管理はモジュール変数(docs/DESIGN.md 4.1)
   var queue = [];
@@ -1218,8 +1274,15 @@ var PAGE_HTML = `<!doctype html>
   // -------------------------------------------------------------------
   // API呼び出し
   // -------------------------------------------------------------------
-  async function judgeCell(r, c, signal) {
+  // 判定 1 件。スナップショットはここで 1 回だけ作り(フォーカス確定後、SPEC F3)、
+  // モデルトグルに応じて Jev(Worker 経由)か Claude(ブラウザ直呼び)に渡す。
+  function judgeCell(r, c, signal) {
     var puzzle = buildSnapshot();
+    if (state.modelMode === "claude") return judgeCellClaude(puzzle, r, c, signal);
+    return judgeCellJev(puzzle, r, c, signal);
+  }
+
+  async function judgeCellJev(puzzle, r, c, signal) {
     var res = await fetch("/api/judge", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -1242,6 +1305,246 @@ var PAGE_HTML = `<!doctype html>
       error.request = data.request;
     }
     throw error;
+  }
+
+  // -------------------------------------------------------------------
+  // Claude 経路(Issue #37、docs/DESIGN.md 3.6)。キー・設定は localStorage。
+  // -------------------------------------------------------------------
+  function loadAnthropicKey() {
+    try {
+      var key = localStorage.getItem(ANTHROPIC_KEY_STORAGE_KEY);
+      return typeof key === "string" && key.length > 0 ? key : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function saveAnthropicKey(key) {
+    var trimmed = String(key || "").trim();
+    if (!trimmed) return false;
+    try {
+      localStorage.setItem(ANTHROPIC_KEY_STORAGE_KEY, trimmed);
+    } catch (e) {
+      showError("API キーを保存できません(localStorage が使えません)");
+      return false;
+    }
+    render();
+    return true;
+  }
+
+  function saveAnthropicKeyFromInput() {
+    var el = document.getElementById("anthropic-key-input");
+    if (!el) return;
+    if (saveAnthropicKey(el.value)) el.value = "";
+  }
+
+  function clearAnthropicKey() {
+    try {
+      localStorage.removeItem(ANTHROPIC_KEY_STORAGE_KEY);
+    } catch (e) {
+      // 読めない・消せない localStorage は「未設定」と同じ扱い
+    }
+    render();
+  }
+
+  // 画面に出すのは末尾 4 文字だけ。キー全体は DOM にも state にも置かない。
+  function anthropicKeyHint() {
+    var key = loadAnthropicKey();
+    if (!key) return "未設定";
+    return "保存済み(末尾 …" + key.slice(-4) + ")";
+  }
+
+  function loadClaudeSettings() {
+    try {
+      var raw = localStorage.getItem(CLAUDE_SETTINGS_STORAGE_KEY);
+      if (!raw) return;
+      var parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return;
+      if (parsed.modelMode === "claude" || parsed.modelMode === "jev") state.modelMode = parsed.modelMode;
+      if (CLAUDE_MODELS.indexOf(parsed.model) !== -1) state.claudeModel = parsed.model;
+      if (typeof parsed.thinking === "boolean") state.claudeThinking = parsed.thinking;
+    } catch (e) {
+      // 壊れた設定は既定値のまま
+    }
+  }
+
+  function saveClaudeSettings() {
+    try {
+      localStorage.setItem(CLAUDE_SETTINGS_STORAGE_KEY, JSON.stringify({
+        modelMode: state.modelMode,
+        model: state.claudeModel,
+        thinking: state.claudeThinking
+      }));
+    } catch (e) {
+      // 保存できなくても動作には影響しない(次回開いたときに既定値に戻るだけ)
+    }
+  }
+
+  // モデルの切り替えは実行中・停止中(周の途中)には行わない。1 周の中で
+  // モデルが混ざると周回ログの意味が崩れるため。
+  function modelSettingsLocked() {
+    return state.running || isPaused();
+  }
+
+  function setModelMode(mode) {
+    if (mode !== "jev" && mode !== "claude") return;
+    if (modelSettingsLocked()) return;
+    state.modelMode = mode;
+    saveClaudeSettings();
+    render();
+  }
+
+  function setClaudeModel(model) {
+    if (CLAUDE_MODELS.indexOf(model) === -1) return;
+    if (modelSettingsLocked()) return;
+    state.claudeModel = model;
+    saveClaudeSettings();
+    render();
+  }
+
+  function setClaudeThinking(on) {
+    if (modelSettingsLocked()) return;
+    state.claudeThinking = !!on;
+    saveClaudeSettings();
+    render();
+  }
+
+  // 記録(scc.records.v1)の m に入れるモデル識別子。Claude は思考の有無で分ける。
+  function currentModelId() {
+    if (state.modelMode === "claude") return state.claudeModel + (state.claudeThinking ? "+think" : "");
+    return JEV_MODEL_ID;
+  }
+
+  // モデルごとの thinking 指定。Opus 5 / Sonnet 5 は adaptive / disabled、
+  // Haiku 4.5 は enabled + budget_tokens(adaptive 非対応)。null なら thinking を送らない。
+  function claudeThinkingConfig(model, on) {
+    if (model === "claude-haiku-4-5") {
+      return on ? { type: "enabled", budget_tokens: CLAUDE_HAIKU_THINKING_BUDGET } : null;
+    }
+    return { type: on ? "adaptive" : "disabled" };
+  }
+
+  // Claude に送るリクエストボディ。ヘッダー(キー)は含めない。これがそのまま
+  // state.lastRequest(「モデルに送ったプロンプト」パネル)になる。
+  // 盤面は Jev と同じ buildSnapshot()(対象マスは "."、SOLUTION 由来の情報なし)。
+  function buildClaudeRequest(puzzle, r, c) {
+    var body = {
+      model: state.claudeModel,
+      max_tokens: CLAUDE_MAX_TOKENS,
+      system: CLAUDE_SYSTEM,
+      messages: [
+        {
+          role: "user",
+          content: INSTRUCTIONS + "\\n" + JSON.stringify({ puzzle: puzzle, target: { row: r, col: c } })
+        }
+      ],
+      output_config: { format: { type: "json_schema", schema: CLAUDE_OUTPUT_SCHEMA } }
+    };
+    var thinking = claudeThinkingConfig(state.claudeModel, state.claudeThinking);
+    if (thinking) {
+      body.thinking = thinking;
+      if (typeof thinking.budget_tokens === "number") body.max_tokens = thinking.budget_tokens + CLAUDE_MAX_TOKENS;
+    }
+    return body;
+  }
+
+  // Worker の validateAnswer と同じ基準で Claude の JSON を検証する。
+  function validateClaudeAnswer(answer) {
+    if (!answer || typeof answer !== "object") return "Claude の応答が JSON オブジェクトではありません";
+    var probabilities = answer.probabilities;
+    if (probabilities === null || typeof probabilities !== "object" || Array.isArray(probabilities)) {
+      return "Claude の応答に probabilities がありません";
+    }
+    var keys = Object.keys(probabilities);
+    if (keys.length !== DIGITS.length) return "Claude の応答の probabilities が 1〜9 の 9 キーになっていません";
+    for (var i = 0; i < DIGITS.length; i++) {
+      var d = DIGITS[i];
+      if (!Object.prototype.hasOwnProperty.call(probabilities, d)) return "Claude の応答の probabilities が 1〜9 の 9 キーになっていません";
+      if (typeof probabilities[d] !== "number" || !isFinite(probabilities[d])) return "Claude の応答の probabilities に数値でない値が含まれています";
+    }
+    if (typeof answer.choice !== "string" || DIGITS.indexOf(answer.choice) === -1) return "Claude の応答の choice が 1〜9 のいずれかではありません";
+    if (typeof answer.confidence !== "number" || !isFinite(answer.confidence)) return "Claude の応答の confidence が数値ではありません";
+    return null;
+  }
+
+  // Messages API の応答から JSON 回答を取り出す。{ answer } か { error }。
+  function parseClaudeAnswer(data) {
+    if (!data || typeof data !== "object") return { error: "Claude の応答が JSON ではありません" };
+    if (data.stop_reason === "refusal") return { error: "Claude が応答を拒否しました(stop_reason: refusal)" };
+    if (data.stop_reason === "max_tokens") return { error: "Claude の応答が max_tokens で途切れました" };
+    var text = null;
+    if (Array.isArray(data.content)) {
+      for (var i = 0; i < data.content.length; i++) {
+        var block = data.content[i];
+        if (block && block.type === "text" && typeof block.text === "string") {
+          text = block.text;
+          break;
+        }
+      }
+    }
+    if (text === null) return { error: "Claude の応答にテキストがありません" };
+    var parsed;
+    try {
+      parsed = JSON.parse(text);
+    } catch (e) {
+      return { error: "Claude の応答を JSON として解釈できません" };
+    }
+    var bad = validateClaudeAnswer(parsed);
+    if (bad !== null) return { error: bad };
+    return { answer: parsed };
+  }
+
+  // ブラウザから api.anthropic.com を直接呼ぶ(CORS 対応。ブラウザからの直接呼び出しには
+  // anthropic-dangerous-direct-browser-access ヘッダーが必要)。キーは x-api-key ヘッダーにだけ載せる。
+  // 戻り値は judgeCellJev と同じ形 { probabilities, choice, confidence, request }。
+  async function judgeCellClaude(puzzle, r, c, signal) {
+    var key = loadAnthropicKey();
+    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」でキーを保存してください)");
+    var body = buildClaudeRequest(puzzle, r, c);
+    var res;
+    try {
+      res = await fetch(ANTHROPIC_MESSAGES_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": key,
+          "anthropic-version": ANTHROPIC_VERSION,
+          "anthropic-dangerous-direct-browser-access": "true"
+        },
+        body: JSON.stringify(body),
+        signal: signal
+      });
+    } catch (e) {
+      if (e && e.name === "AbortError") throw e;
+      var netErr = new Error("Claude API に接続できません: " + (e && e.message ? e.message : String(e)));
+      netErr.request = body;
+      throw netErr;
+    }
+    var data = null;
+    try {
+      data = await res.json();
+    } catch (e) {
+      data = null;
+    }
+    if (!res.ok) {
+      var message = "Claude API HTTP " + res.status;
+      if (data && data.error && typeof data.error.message === "string") message += ": " + data.error.message;
+      var httpErr = new Error(message);
+      httpErr.request = body;
+      throw httpErr;
+    }
+    var parsed = parseClaudeAnswer(data);
+    if (parsed.error) {
+      var formatErr = new Error(parsed.error);
+      formatErr.request = body;
+      throw formatErr;
+    }
+    return {
+      probabilities: parsed.answer.probabilities,
+      choice: parsed.answer.choice,
+      confidence: parsed.answer.confidence,
+      request: body
+    };
   }
 
   // -------------------------------------------------------------------
@@ -1441,7 +1744,8 @@ var PAGE_HTML = `<!doctype html>
       choice: pendingCommit.choice,
       pc: pc,
       conf: conf,
-      ok: correct
+      ok: correct,
+      m: currentModelId() // どのモデルの判定か(Issue #37)。無い記録は Jev 扱い
     });
     // 次の結果が来るまで表示に残す(最速モードでも判定が見えるように)
     state.lastJudgment = {
@@ -1569,6 +1873,10 @@ var PAGE_HTML = `<!doctype html>
     }
     var keepSpeed = state.speedMode;
     var keepDifficulty = state.difficulty;
+    var keepModelMode = state.modelMode;
+    var keepClaudeModel = state.claudeModel;
+    var keepClaudeThinking = state.claudeThinking;
+    var keepCalibFilter = state.calibModelFilter;
     state = {
       round: 1,
       values: {},
@@ -1584,7 +1892,11 @@ var PAGE_HTML = `<!doctype html>
       stoppedAtLimit: false,
       lastJudgment: null,
       lastRequest: null,
-      lastRequestFailed: false
+      lastRequestFailed: false,
+      modelMode: keepModelMode,
+      claudeModel: keepClaudeModel,
+      claudeThinking: keepClaudeThinking,
+      calibModelFilter: keepCalibFilter
     };
     queue = [];
     roundWrong = [];
@@ -1715,6 +2027,9 @@ var PAGE_HTML = `<!doctype html>
     var easyActive = state.difficulty === "easy" ? " active" : "";
     var normalActive = state.difficulty === "normal" ? " active" : "";
     var hardActive = state.difficulty === "hard" ? " active" : "";
+    var jevActive = state.modelMode === "jev" ? " active" : "";
+    var claudeActive = state.modelMode === "claude" ? " active" : "";
+    var modelDisabled = modelSettingsLocked() ? "disabled" : "";
     return "<div class=\\"controls\\">" +
       "<button id=\\"run-btn\\" onclick=\\"" + runOnclick + "\\" " + runDisabled + ">" + runLabel + "</button>" +
       "<button id=\\"reset-btn\\" onclick=\\"reset()\\" " + resetDisabled + ">リセット</button>" +
@@ -1727,6 +2042,43 @@ var PAGE_HTML = `<!doctype html>
       "<button class=\\"difficulty-btn" + easyActive + "\\" aria-pressed=\\"" + (state.difficulty === "easy") + "\\" onclick=\\"setDifficulty('easy')\\">やさしい</button>" +
       "<button class=\\"difficulty-btn" + normalActive + "\\" aria-pressed=\\"" + (state.difficulty === "normal") + "\\" onclick=\\"setDifficulty('normal')\\">ふつう</button>" +
       "<button class=\\"difficulty-btn" + hardActive + "\\" aria-pressed=\\"" + (state.difficulty === "hard") + "\\" onclick=\\"setDifficulty('hard')\\">むずかしい</button>" +
+      "</div>" +
+      "<div id=\\"model-toggle\\">" +
+      "<button class=\\"model-btn" + jevActive + "\\" aria-pressed=\\"" + (state.modelMode === "jev") + "\\" onclick=\\"setModelMode('jev')\\" " + modelDisabled + ">Jev</button>" +
+      "<button class=\\"model-btn" + claudeActive + "\\" aria-pressed=\\"" + (state.modelMode === "claude") + "\\" onclick=\\"setModelMode('claude')\\" " + modelDisabled + ">Claude</button>" +
+      "</div>" +
+      "</div>";
+  }
+
+  // Claude の設定パネル(Issue #37)。モデルトグルが Claude のときだけ出す。
+  // キーの値そのものは DOM に出さない(末尾 4 文字のヒントだけ)。
+  function renderClaudeSettings() {
+    if (state.modelMode !== "claude") return "";
+    var locked = modelSettingsLocked() ? "disabled" : "";
+    var hasKey = loadAnthropicKey() !== null;
+    var options = "";
+    for (var i = 0; i < CLAUDE_MODELS.length; i++) {
+      options += "<option value=\\"" + CLAUDE_MODELS[i] + "\\"" + (state.claudeModel === CLAUDE_MODELS[i] ? " selected" : "") + ">" + CLAUDE_MODELS[i] + "</option>";
+    }
+    var thinkOn = state.claudeThinking ? " active" : "";
+    var thinkOff = state.claudeThinking ? "" : " active";
+    return "<div id=\\"claude-settings\\" class=\\"panel\\">" +
+      "<p class=\\"panel-title\\">Claude の設定(BYOK)</p>" +
+      "<div class=\\"claude-row\\">" +
+      "<label for=\\"anthropic-key-input\\">API キー</label>" +
+      "<input id=\\"anthropic-key-input\\" type=\\"password\\" placeholder=\\"sk-ant-…\\" autocomplete=\\"off\\" spellcheck=\\"false\\">" +
+      "<button id=\\"save-key-btn\\" onclick=\\"saveAnthropicKeyFromInput()\\">保存</button>" +
+      "<button id=\\"clear-key-btn\\" onclick=\\"clearAnthropicKey()\\" " + (hasKey ? "" : "disabled") + ">キーを消す</button>" +
+      "<span class=\\"muted\\">" + escapeHtml(anthropicKeyHint()) + "</span>" +
+      "</div>" +
+      "<p class=\\"muted\\">キーはこのブラウザの localStorage にだけ保存し、api.anthropic.com への呼び出し以外には送りません(この Worker には渡りません)。利用料は自分の Anthropic アカウントに課金されます。</p>" +
+      "<div class=\\"claude-row\\">" +
+      "<label for=\\"claude-model\\">モデル</label>" +
+      "<select id=\\"claude-model\\" onchange=\\"setClaudeModel(this.value)\\" " + locked + ">" + options + "</select>" +
+      "<div id=\\"thinking-toggle\\">" +
+      "<button class=\\"thinking-btn" + thinkOn + "\\" aria-pressed=\\"" + state.claudeThinking + "\\" onclick=\\"setClaudeThinking(true)\\" " + locked + ">思考あり</button>" +
+      "<button class=\\"thinking-btn" + thinkOff + "\\" aria-pressed=\\"" + !state.claudeThinking + "\\" onclick=\\"setClaudeThinking(false)\\" " + locked + ">思考なし</button>" +
+      "</div>" +
       "</div>" +
       "</div>";
   }
@@ -1781,7 +2133,7 @@ var PAGE_HTML = `<!doctype html>
       var pausedLast = state.lastJudgment;
       if (pausedLast && pausedLast.probs) {
         var pausedStatusText = pausedLast.status === "correct" ? "正解" : "不正解";
-        var pausedConfidence = typeof pausedLast.confidence === "number" ? " / Jev confidence " + Math.round(pausedLast.confidence * 100) + "%" : "";
+        var pausedConfidence = typeof pausedLast.confidence === "number" ? " / confidence " + Math.round(pausedLast.confidence * 100) + "%" : "";
         pausedBody += "<div class=\\"coords\\"><span class=\\"confidence\\">直前: " + coordLabel(pausedLast.r, pausedLast.c) +
           " → " + escapeHtml(pausedLast.choice) + "(" + pausedStatusText + ")" + pausedConfidence + "</span></div>" +
           "<div class=\\"bars\\">" + renderBars(pausedLast.probs) + "</div>";
@@ -1794,7 +2146,7 @@ var PAGE_HTML = `<!doctype html>
       var parts = state.focusedKey.split("-");
       var confidenceText = "";
       if (pendingCommit && typeof pendingCommit.confidence === "number") {
-        confidenceText = "<span class=\\"confidence\\">Jev confidence " + Math.round(pendingCommit.confidence * 100) + "%</span>";
+        confidenceText = "<span class=\\"confidence\\">confidence " + Math.round(pendingCommit.confidence * 100) + "%</span>";
       }
       return head +
         "<div class=\\"coords\\">" + coordLabel(Number(parts[0]), Number(parts[1])) + confidenceText + "</div>" +
@@ -1812,7 +2164,7 @@ var PAGE_HTML = `<!doctype html>
     var last = state.lastJudgment;
     if (last && last.probs) {
       var statusText = last.status === "correct" ? "正解" : "不正解";
-      var lastConfidence = typeof last.confidence === "number" ? " / Jev confidence " + Math.round(last.confidence * 100) + "%" : "";
+      var lastConfidence = typeof last.confidence === "number" ? " / confidence " + Math.round(last.confidence * 100) + "%" : "";
       body += "<div class=\\"coords\\"><span class=\\"confidence\\">直前: " + coordLabel(last.r, last.c) +
         " → " + escapeHtml(last.choice) + "(" + statusText + ")" + lastConfidence + "</span></div>" +
         "<div class=\\"bars\\">" + renderBars(last.probs) + "</div>";
@@ -1826,7 +2178,7 @@ var PAGE_HTML = `<!doctype html>
   // ペイロード(request)をそのまま JSON で表示する。フロント側で組み立て直さない
   // (handleJudge と二重管理にしないため)。停止中・エラー時も直近の値を残す。
   function renderPromptPanel() {
-    var head = "<div id=\\"prompt-panel\\" class=\\"panel\\"><p class=\\"panel-title\\">Jev に送ったプロンプト</p>";
+    var head = "<div id=\\"prompt-panel\\" class=\\"panel\\"><p class=\\"panel-title\\">モデルに送ったプロンプト</p>";
     var tail = "</div>";
     var req = state.lastRequest;
     if (!req) {
@@ -1918,15 +2270,16 @@ var PAGE_HTML = `<!doctype html>
   // 使い回す軽いキャッシュ(PR #25 レビュー指摘 should-fix 2)。records は毎回
   // getRecords() から渡ってくるので、記録が増減・追記されていなければ計算し直さない。
   var calibBinCache = null; // { n, lastT, pcBins, confBins }
-  function computeCalibBins(records) {
+  function computeCalibBins(records, filter) {
     var n = records.length;
     var lastT = n > 0 ? records[n - 1].t : null;
-    if (calibBinCache && calibBinCache.n === n && calibBinCache.lastT === lastT) {
+    if (calibBinCache && calibBinCache.n === n && calibBinCache.lastT === lastT && calibBinCache.filter === filter) {
       return calibBinCache;
     }
     calibBinCache = {
       n: n,
       lastT: lastT,
+      filter: filter,
       pcBins: binRecords(records, "pc"),
       confBins: binRecords(records, "conf")
     };
@@ -1935,8 +2288,32 @@ var PAGE_HTML = `<!doctype html>
 
   // 集計パネル(SPEC F1 拡張2)。records は state ではなく localStorage 由来なので、
   // getRecords()(初回だけ localStorage を読み、以後はキャッシュを使う)経由で読む。
+  function recordModelId(rec) {
+    return typeof rec.m === "string" && rec.m ? rec.m : JEV_MODEL_ID;
+  }
+
+  function setCalibModelFilter(value) {
+    state.calibModelFilter = typeof value === "string" && value ? value : "all";
+    render();
+  }
+
   function renderCalibration() {
-    var records = getRecords();
+    var allRecords = getRecords();
+    // 記録に現れるモデルの一覧(フィルタの選択肢)。m の無い古い記録は Jev 扱い。
+    var modelSet = {};
+    for (var k = 0; k < allRecords.length; k++) {
+      if (allRecords[k]) modelSet[recordModelId(allRecords[k])] = true;
+    }
+    var models = Object.keys(modelSet).sort();
+    var filter = state.calibModelFilter;
+    if (filter !== "all" && !modelSet[filter]) filter = "all"; // 記録に無いモデルは「すべて」扱い
+    var records = allRecords;
+    if (filter !== "all") {
+      records = [];
+      for (var j = 0; j < allRecords.length; j++) {
+        if (allRecords[j] && recordModelId(allRecords[j]) === filter) records.push(allRecords[j]);
+      }
+    }
     var total = records.length;
     var correctCount = 0;
     var puzzles = {};
@@ -1949,16 +2326,22 @@ var PAGE_HTML = `<!doctype html>
     var puzzleCount = Object.keys(puzzles).length;
     var pct = total === 0 ? 0 : Math.round((correctCount / total) * 100);
 
-    var calibBins = computeCalibBins(records);
+    var calibBins = computeCalibBins(records, filter);
     var pcBins = calibBins.pcBins;
     var confBins = calibBins.confBins;
 
+    var options = "<option value=\\"all\\"" + (filter === "all" ? " selected" : "") + ">すべて</option>";
+    for (var m = 0; m < models.length; m++) {
+      options += "<option value=\\"" + escapeHtml(models[m]) + "\\"" + (filter === models[m] ? " selected" : "") + ">" + escapeHtml(models[m]) + "</option>";
+    }
+
     return "<div id=\\"calibration-panel\\" class=\\"panel\\">" +
       "<p class=\\"panel-title\\">較正図</p>" +
-      "<p class=\\"calib-summary\\">合計 " + total + " 件 / 全体正解率 " + pct + "% / 記録している問題数 " + puzzleCount + "</p>" +
+      "<p class=\\"calib-summary\\">合計 " + total + " 件 / 全体正解率 " + pct + "% / 記録している問題数 " + puzzleCount +
+      " / モデル <select id=\\"calib-model-filter\\" onchange=\\"setCalibModelFilter(this.value)\\">" + options + "</select></p>" +
       "<div class=\\"calib-charts\\">" +
       renderCalibrationChart(pcBins, "choiceの確率(pc)による較正") +
-      renderCalibrationChart(confBins, "Jevのconfidenceによる較正") +
+      renderCalibrationChart(confBins, "モデルのconfidenceによる較正") +
       "</div>" +
       "<div class=\\"calib-actions\\">" +
       "<button id=\\"export-records-btn\\" onclick=\\"exportRecords()\\">JSONエクスポート</button>" +
@@ -2006,12 +2389,13 @@ var PAGE_HTML = `<!doctype html>
     var wasAtBottom = oldLog ? oldLog.scrollHeight - oldLog.scrollTop - oldLog.clientHeight < 4 : true;
     app.innerHTML =
       "<h1>数独キャリブレーションチェック</h1>" +
-      "<p class=\\"subtitle\\">Jev (typesafe/jev) に1マスずつ数字を聞き、確率の較正を目で確かめる</p>" +
+      "<p class=\\"subtitle\\">Jev (typesafe/jev) または Claude に1マスずつ数字を聞き、確率の較正を目で確かめる</p>" +
       renderErrorBox() +
       "<div class=\\"layout\\">" +
       "<div class=\\"grid-panel\\">" + renderGrid() + renderLegend() + "</div>" +
       "<div class=\\"side-panel\\">" +
       renderControls() +
+      renderClaudeSettings() +
       renderStats() +
       renderCurrentPanel() +
       renderPromptPanel() +
@@ -2025,6 +2409,7 @@ var PAGE_HTML = `<!doctype html>
     if (newLog) newLog.scrollTop = wasAtBottom ? newLog.scrollHeight : savedScroll;
   }
 
+  loadClaudeSettings();
   render();
 </script>
 </body>

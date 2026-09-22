@@ -29,6 +29,8 @@ TypeSafe AI の **Jev** は「文章を生成せず、型付きの判断を較�
 
 - **速度切り替え**: 「じっくり確認」「最速」の2択トグル。実行中でも切り替え可能
 - **難易度切り替え**: 「やさしい」「ふつう」「むずかしい」の3択トグル(既定「ふつう」)。ヒント数(与えられた数字の数)を切り替える。変えただけでは盤面は変わらず、次の「新しい問題」から効く
+- **モデル切り替え**: 「Jev」「Claude」の2択トグル(既定「Jev」)。実行中・停止中(周の途中)は切り替えられない(1周の中でモデルが混ざると周回ログの意味が崩れるため)。選択は `localStorage`(`scc.claude_settings.v1`)に保存され、次回開いたときも同じ
+- **Claude の設定パネル**(モデルが「Claude」のときだけ表示。7章 拡張3、Issue #37): API キーの入力欄(`type=password`)と「保存」「キーを消す」ボタン、保存状態(未設定 / 保存済み(末尾 4 文字))、モデル選択(`claude-opus-5`(既定)/ `claude-sonnet-5` / `claude-haiku-4-5`)、思考(extended thinking)の「思考あり」「思考なし」トグル。キーは **このブラウザの `localStorage`(`scc.anthropic_key.v1`)にだけ保存し、`api.anthropic.com` への呼び出し以外には送らない**(Worker には渡らない)。キーの値そのものは画面に出さない
 - **実行 / リセット / 新しい問題** ボタン
   - 「実行」ボタン(`id="run-btn"`)は実行中だけ**「停止」に切り替わる**(押すと止まる)。停止中(実行を始めた後、止めていて、完了もエラーもしていない状態)は**「再開」**になり、押すと続きから動く(F2/F3)。「リセット」「新しい問題」は停止中も押せる
   - 「リセット」は **現在の問題をやり直す**(盤面・周回ログ・統計を捨てて1周目の最初から)
@@ -41,12 +43,13 @@ TypeSafe AI の **Jev** は「文章を生成せず、型付きの判断を較�
   - 不正解: 赤の数字と薄い赤背景
 - **統計カード**(4つ): 現在の周 / 残りマス / 累計正解 / この周の進捗
 - **現在の判定パネル**: 判定中マスの座標(「3行目 6列目」形式)と、1〜9の横棒グラフ(確率%)。`choice` の棒だけアクセント色(`choice` は必ずしも argmax ではない。`docs/DESIGN.md` 3.4)。結果を待っている間・確定直後は、直前に確定した判定(座標・選んだ数字・正誤・確率バー)を次の結果が来るまで残す(最速モードでも見えるように)。**停止中は「停止中(残り N マス)」を表示し、フォーカスの枠線は消える**(F2)
-- **Jev に送ったプロンプト**: 直近の判定で Worker が Jev に渡したペイロード(`request`)を JSON で表示し、対象マス(「N行目 M列目 の判定に使用」)を添える。判定が 502 で失敗したときはその `request` を「(このプロンプトで失敗)」付きで表示する。まだ無ければその旨。停止中・エラー中も残り、リセット/新しい問題で消える
+- **モデルに送ったプロンプト**: 直近の判定で Worker が Jev に渡したペイロード(`request`)、または Claude 経路ならブラウザが `api.anthropic.com` に送ったリクエストボディ(ヘッダーは含めない = キーは出ない)を JSON で表示し、対象マス(「N行目 M列目 の判定に使用」)を添える。判定が 502 で失敗したときはその `request` を「(このプロンプトで失敗)」付きで表示する。まだ無ければその旨。停止中・エラー中も残り、リセット/新しい問題で消える
 - **凡例**: 正解・不正解・判定中の色の意味
 - **周回ログ**: 「N周目: M中K正解 (P%)」を周ごとに追記
 - **集計パネル(較正図)**: 周回ログの下に、これまでの判定結果(複数問題・複数回の実行をまたいでブラウザの `localStorage` に蓄積したもの)を集計して表示する(7章 拡張2)
   - 上部に合計件数・全体正解率・記録している問題数(ユニークな問題ID)
-  - `pc`(`choice` の確率)と `conf`(Jev の `confidence`)それぞれで10%刻み10帯に分けた較正図(インラインSVGの棒グラフ、横並び。理想は対角線)を並べる。帯ごとに件数と実際の正解率を示す
+  - `pc`(`choice` の確率)と `conf`(モデルの `confidence`)それぞれで10%刻み10帯に分けた較正図(インラインSVGの棒グラフ、横並び。理想は対角線)を並べる。帯ごとに件数と実際の正解率を示す
+  - **モデルのフィルタ**(`<select>`): 「すべて」か、記録に現れるモデル識別子(`typesafe/jev` / `claude-opus-5+think` など。記録の `m`。`m` の無い古い記録は `typesafe/jev` 扱い)を選び、そのモデルの記録だけを集計する(Jev と Claude の較正を並べて比べるため。Issue #37)
   - 「JSONエクスポート」ボタン: 蓄積した記録一式を `sudoku-calibration-YYYYMMDD-HHMMSS.json` としてダウンロードする
   - 「記録を消す」ボタン: 確認ダイアログのあと、蓄積した記録をすべて削除する
 - **完了バナー**: 全マス正解時に「N周ですべて正解しました」
@@ -56,7 +59,7 @@ TypeSafe AI の **Jev** は「文章を生成せず、型付きの判断を較�
 ### F2. 1マスの判定フロー
 
 1. 対象マスをフォーカス表示し、確率バーを空にする
-2. `POST /api/judge` にスナップショットと対象座標を送る
+2. モデルが「Jev」なら `POST /api/judge` にスナップショットと対象座標を送る。「Claude」なら **ブラウザから `https://api.anthropic.com/v1/messages` を直接呼ぶ**(BYOK。4章「Claude 経路」)。どちらも同じスナップショット(対象マスは `.`)を渡し、返ってくる形も同じ `{ probabilities, choice, confidence, request }` に揃える
 3. 返ってきた `probabilities` を1〜9の順に並べてバー表示。`choice` の棒を強調
 4. `choice` の数字をマスに入れる
 5. 正解(`SOLUTION`)と比較し、緑/赤で色付け
@@ -212,10 +215,33 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 
 フロントエンド一式(HTML)を `text/html; charset=utf-8` で返す。それ以外のパスは 404。CORS ヘッダーは付けない(他サイトから `/api/judge` を呼ばせない)。
 
+### Claude 経路(ブラウザ → `https://api.anthropic.com/v1/messages`、Worker は関与しない)
+
+モデルが「Claude」のときの 1 判定。Worker を経由せず、ブラウザが Anthropic Messages API を直接呼ぶ(7章 拡張3、Issue #37。`docs/DESIGN.md` 3.6)。
+
+- ヘッダー: `content-type: application/json` / `x-api-key: <利用者のキー>` / `anthropic-version: 2023-06-01` / `anthropic-dangerous-direct-browser-access: true`(ブラウザからの直接呼び出しに必要)
+- ボディ(= 画面の「モデルに送ったプロンプト」に出るもの。キーは含まれない):
+
+````json
+{
+  "model": "claude-opus-5",
+  "max_tokens": 1024,
+  "system": "<Jev と同じ NOTE> Answer with JSON only, matching the given schema: ...",
+  "messages": [{ "role": "user", "content": "Which digit from 1 to 9 belongs in the target cell of this Sudoku grid?\n{\"puzzle\":[...9行...],\"target\":{\"row\":0,\"col\":2}}" }],
+  "output_config": { "format": { "type": "json_schema", "schema": { "...": "choice(1〜9) / probabilities(1〜9 の 9 キー) / confidence" } } },
+  "thinking": { "type": "adaptive" }
+}
+````
+
+- `thinking`: 思考ありなら `claude-opus-5` / `claude-sonnet-5` は `{ "type": "adaptive" }`、`claude-haiku-4-5` は `{ "type": "enabled", "budget_tokens": 2048 }`(このとき `max_tokens` は 2048 + 1024)。思考なしなら Opus / Sonnet は `{ "type": "disabled" }`、Haiku は `thinking` を送らない
+- 応答: `content` の最初の `text` ブロックが structured outputs の JSON(`{ "choice": "4", "probabilities": { "1": 0.03, ... }, "confidence": 0.7 }`)。検証は `/api/judge` の 200 と同じ基準(9 キー・有限数・`choice` が 1〜9・`confidence` が数値)。`stop_reason` が `refusal` / `max_tokens`、HTTP が非 2xx(401 キー不正、429、529 など)、ネットワーク失敗は F5 のエラー扱い(理由をエラーボックスに出して停止)
+- `probabilities` / `confidence` は **Claude の自己申告**であり較正されている保証はない。それを Jev の値と同じ較正図で比べるのがこの拡張の目的
+- レート制限(F6)は関与しない(利用者自身のキーと課金)
+
 ## 5. 非機能要件
 
 - **1ファイル**: Worker本体・フロントを `src/index.js` 1つに収める。ビルド不要
-- **秘密情報を持たない**: APIトークン等はリポジトリに含めない。Workers AI の認証はバインディング経由
+- **秘密情報を持たない**: APIトークン等はリポジトリに含めない。Workers AI の認証はバインディング経由。Claude 経路の API キーは利用者のブラウザ(`localStorage`)にだけあり、Worker にもリポジトリにも無い(4章「Claude 経路」)
 - **コスト**: Jev は入力$0.042/100万トークン・出力無料。**Workers AI のニューロンではなく AI Gateway のクレジットで課金される**(`typesafe/jev` は AI Gateway 経由で提供されている。`docs/DESIGN.md` 3.4)。1問51マス×数周で誤差程度
 - **レイテンシ**: Jev 公称 100ms 前後だが、**Worker 経由の実測は 1.0〜1.7 秒**(2026-09-21)。AI Gateway を挟む分の往復が乗る。最速モードで体感できるのはこの実測値のほう
 - **認証なし・レート制限あり**: 公開デモとして誰でもアクセス可。ログイン等は無いが、F6のレート制限でコストの上限を確保する
@@ -246,6 +272,6 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 
 1. ~~**数独ジェネレーター + ソルバー**~~: **実装済み**(Issue #5)。「新しい問題」ボタンで毎回違う問題を出す。ソルバー(`solveCount`)で一意解を確認してから出題する
 2. ~~**集計ビュー**~~: **実装済み**(Issue #6)。判定結果を `localStorage` に蓄積し、`pc`(choiceの確率)/ `conf`(Jevのconfidence)それぞれの帯ごとの実際の正解率を較正図として表示する。JSONエクスポート・記録の消去も可能(3章 F1)
-3. **Claude API連携**: Jevに続く比較対象として、Anthropic Claude APIを追加する。モデル選択と、reasoning(拡張思考)のon/offを切り替えられるようにする。BYOK方式(利用者自身のAPIキーをブラウザのlocalStorageに保存し、ブラウザから直接Claude APIを呼ぶ。ClaudeはCORS対応済みなのでサーバー側でのキー中継が不要)。OpenAI・Grok等への対応は現時点では対象外(必要になったら誰かがフォークして追加すればよい。MITライセンス)
+3. ~~**Claude API連携**~~: **実装済み**(Issue #37)。Jevに続く比較対象として Anthropic Claude API を追加。モデル選択(`claude-opus-5` / `claude-sonnet-5` / `claude-haiku-4-5`)と思考の on/off を切り替えられる。BYOK方式(利用者自身のAPIキーをブラウザのlocalStorageに保存し、ブラウザから直接Claude APIを呼ぶ。ClaudeはCORS対応済みなのでサーバー側でのキー中継が不要)。確率は structured outputs で自己申告させる(4章「Claude 経路」)。OpenAI・Grok等への対応は現時点では対象外(必要になったら誰かがフォークして追加すればよい。MITライセンス)
 4. **ログ異常検知への転用**: `digit` の Choice を `is_anomaly` の Noul などに差し替え、ホームラボのログを流す
 5. **管理用の簡易ダッシュボード**: 直近のレート制限ヒット状況や残り回数を確認できる画面。**最小版として `GET /api/status`(残り回数を読むだけで返す。4章)を実装済み**(Issue #18)。画面(ヒット状況の履歴やグラフ)は未実装で、現状は `/api/status`・`X-RateLimit-Remaining-*` ヘッダー・Cloudflare ダッシュボードの Durable Object 参照で代用
