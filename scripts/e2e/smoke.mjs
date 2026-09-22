@@ -128,6 +128,46 @@ async function startMockServer(mode) {
           return;
         }
 
+        // ask:"cell"(確信度順のマス選び、Issue #38)。body.puzzle の空マスから先頭
+        // (行優先で最初)を選び、probabilities を空マス全体に配って返す。
+        if (body && body.ask === "cell") {
+          var emptyCells = [];
+          for (var er = 0; er < 9; er++) {
+            for (var ec = 0; ec < 9; ec++) {
+              if (body.puzzle && body.puzzle[er] && body.puzzle[er][ec] === ".") {
+                emptyCells.push({ key: "r" + er + "c" + ec, row: er, col: ec });
+              }
+            }
+          }
+          if (emptyCells.length === 0) {
+            res.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+            res.end(JSON.stringify({ error: "空マスがありません(モック)" }));
+            return;
+          }
+          var chosenCell = emptyCells[0];
+          var cellProbabilities = {};
+          emptyCells.forEach(function (cell) {
+            cellProbabilities[cell.key] = cell.key === chosenCell.key ? 0.5 : 0.5 / Math.max(1, emptyCells.length - 1);
+          });
+          var cellCriteria = {};
+          emptyCells.forEach(function (cell) {
+            cellCriteria[cell.key] = "row " + cell.row + ", column " + cell.col + " (zero-based)";
+          });
+          var cellRequest = {
+            state: { puzzle: body.puzzle, note: "puzzle is a 9x9 Sudoku grid, no target this time (mock)" },
+            questions: { cell: { type: "choice", instructions: "Which empty cell of this Sudoku grid can be filled in with the most certainty?", criteria: cellCriteria } },
+          };
+          res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({
+            probabilities: cellProbabilities,
+            choice: chosenCell.key,
+            confidence: 0.4,
+            cell: { row: chosenCell.row, col: chosenCell.col },
+            request: cellRequest,
+          }));
+          return;
+        }
+
         if (!body || !body.target || typeof body.target.row !== "number" || typeof body.target.col !== "number") {
           res.writeHead(400, { "content-type": "application/json; charset=utf-8" });
           res.end(JSON.stringify({ error: "target が不正です(モック)" }));
@@ -325,6 +365,41 @@ async function runMockMode(chromium, executablePath, mode) {
 
       await page.click("#reset-btn");
       return "bars=" + barCount;
+    });
+
+    // [7] 確信度順モード(Issue #38)。順番トグルを切り替えて最速で実行し、1周目の
+    // ログが出ること・/api/judge の呼び出し数が空マス数のちょうど2倍(マス選び+数字)
+    // であることを確認する。ratelimit モードは3件目で429になり呼び出し数を検証できない
+    // ため対象外(本番モードはこのチェック自体が呼ばれない。runMockMode 専用)。
+    await runCheck(7, "確信度順で1周目のログが出る(/api/judge が空マス数の2倍)", async function () {
+      if (mode === "ratelimit") {
+        throw new Skip("ratelimit モードは3件目で429になり呼び出し数を検証できない");
+      }
+      var judgeCount = 0;
+      var counter = function (req) {
+        if (req.url().indexOf("/api/judge") !== -1) judgeCount += 1;
+      };
+      page.on("request", counter);
+      try {
+        var orderToggle = page.locator("#order-toggle button", { hasText: "確信度順" });
+        var orderCount = await orderToggle.count();
+        if (orderCount === 0) {
+          throw new Skip("順番トグルが無い(Issue #38 のフロントマージ前)");
+        }
+        await orderToggle.click();
+        await page.locator("#speed-toggle button", { hasText: "最速" }).click();
+        await page.click("#run-btn");
+        var logItem = page.locator("#round-log li").first();
+        await logItem.waitFor({ state: "visible", timeout: 30000 });
+        var text = await logItem.textContent();
+        assert.match(text, /^1周目:/, "1行目が「1周目:」で始まらない: " + text);
+        assert.equal(judgeCount, TOTAL_EMPTY * 2, "/api/judge のリクエスト数が空マス数の2倍でない: " + judgeCount);
+        await page.screenshot({ path: path.join(outDir, mode + "-07-confidence-order.png") });
+        return text + " / judge calls=" + judgeCount;
+      } finally {
+        page.off("request", counter);
+        await page.click("#reset-btn");
+      }
     });
 
     // [6] 「新しい問題」ボタン(#5 マージ前は無い)
