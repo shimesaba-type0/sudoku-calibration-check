@@ -61,7 +61,7 @@ npm run dev                 # ローカル起動。AIバインディングはリ
 
 `wrangler.toml` の `[vars]` にコミットされているもの(レート制限。秘密情報ではないので平文でよい):
 
-- `RATE_LIMIT_PER_IP_MAX`(既定 `30`)/ `RATE_LIMIT_GLOBAL_MAX`(既定 `500`)/ `RATE_LIMIT_WINDOW_SECONDS`(既定 `3600`)
+- `RATE_LIMIT_PER_IP_MAX`(現在 `120`。コード側のフォールバックは `30`)/ `RATE_LIMIT_GLOBAL_MAX`(`500`)/ `RATE_LIMIT_WINDOW_SECONDS`(`3600`)
 - 調整は `wrangler.toml` の値を書き換えるだけ。`src/index.js` は触らない
 
 ## 作業ルール
@@ -88,4 +88,4 @@ npm run dev                 # ローカル起動。AIバインディングはリ
 - リセット/新しい問題/エラー時に in-flight の `/api/judge` を `AbortController` で中断する(#19)。周回ロジックの振る舞いテスト(S1〜S4)あり
 - Playwright E2E スモーク(#17): `npm run e2e`(モック)/ `npm run e2e -- --url <URL>`(本番、最大 3 判定)。プロキシ環境では `E2E_PROXY` / `E2E_IGNORE_HTTPS_ERRORS=1`
 - 既知の未実装: なし(SPEC 7 章の拡張 3(Claude API)と 4(ログ異常検知への転用)は依頼があるまで着手しない)
-- 要判断(オーナー): IP 単位のレート制限(30 回/時)の緩和可否は Issue #20 を参照。上限を緩める変更は作業ルール4によりオーナーの判断が必要
+- IP 単位のレート制限は 2026-09-22 にオーナー判断(Issue #20)で 30 → 120 回/時に緩和済み(1 問 ≈ 78 判定を 1 時間で完走できるように)。全体 500 回/時は据え置き

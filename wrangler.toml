@@ -21,10 +21,12 @@ new_sqlite_classes = ["RateLimitCounter"]
 
 # レート制限の唯一の調整つまみ。ここの値を書き換えて再デプロイするだけで
 # 上限が変わる(src/index.js は触らない)。数値は文字列として Worker に渡り、
-# 10進整数として読めない値は既定値(30 / 500 / 3600)に落ちる。
+# 10進整数として読めない値はコード側の既定値(30 / 500 / 3600)に落ちる。
+# IP 単位は 2026-09-22 にオーナー判断(Issue #20)で 30 → 120 に緩めた。数独 1 問 ≈ 78 判定を
+# 1 時間で完走できるようにするため。全体上限 500 は据え置き。
 # これが Workers AI のコストを頭打ちにする唯一の砦なので、理由なく緩めないこと
 # (docs/DESIGN.md 7章 / CLAUDE.md 作業ルール4)。
 [vars]
-RATE_LIMIT_PER_IP_MAX = "30"
+RATE_LIMIT_PER_IP_MAX = "120"
 RATE_LIMIT_GLOBAL_MAX = "500"
 RATE_LIMIT_WINDOW_SECONDS = "3600"
