@@ -769,6 +769,7 @@ function extractAnswer(response, key) {
  * `usage` はあくまで参考情報なので、欠けていても・壊れていても **判定結果の検証には
  * 影響させない**(502 にはしない)。片方のフィールドだけ数値、のような半端な形も
  * 単純に丸ごと省略する。
+ * レート制限の使用率を返す usageOf() とは無関係(あちらは回数、こちらはトークン数)。
  */
 function extractUsage(response) {
   if (response === null || typeof response !== "object" || Array.isArray(response)) {
@@ -781,10 +782,11 @@ function extractUsage(response) {
 
   var usage = container.usage;
   if (usage === null || typeof usage !== "object" || Array.isArray(usage)) return undefined;
-  if (typeof usage.input_tokens !== "number" || !Number.isFinite(usage.input_tokens)) {
+  // 負値も「壊れている」扱いで丸ごと省略する(参考値なので有限かつ 0 以上だけ通す)
+  if (typeof usage.input_tokens !== "number" || !Number.isFinite(usage.input_tokens) || usage.input_tokens < 0) {
     return undefined;
   }
-  if (typeof usage.output_tokens !== "number" || !Number.isFinite(usage.output_tokens)) {
+  if (typeof usage.output_tokens !== "number" || !Number.isFinite(usage.output_tokens) || usage.output_tokens < 0) {
     return undefined;
   }
 

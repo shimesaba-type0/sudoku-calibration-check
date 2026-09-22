@@ -246,7 +246,8 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
   "request": {
     "state": { "puzzle": ["53..7....", "..."], "note": "..." },
     "questions": { "cell": { "type": "choice", "instructions": "...", "criteria": { "r0c2": "row 0, column 2 (zero-based)", "...": "..." } } }
-  }
+  },
+  "usage": { "input_tokens": 700, "output_tokens": 90 }
 }
 ````
 
@@ -287,7 +288,8 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
   "request": {
     "state": { "puzzle": ["53..7....", "..."], "digit": "4", "note": "..." },
     "questions": { "r0c2": { "type": "noul", "instructions": "Is the digit 4 the one that belongs in the empty cell at row 0, column 2 (zero-based)?" } }
-  }
+  },
+  "usage": { "input_tokens": 1948, "output_tokens": 973 }
 }
 ````
 
@@ -333,7 +335,8 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
     "questions": {
       "r0c2": { "type": "choice", "instructions": "...", "criteria": { "1": "the digit 1", "...": "..." } }
     }
-  }
+  },
+  "usage": { "input_tokens": 9483, "output_tokens": 4083 }
 }
 ````
 

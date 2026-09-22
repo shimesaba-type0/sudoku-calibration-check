@@ -288,14 +288,18 @@ test("502: AI.run が例外を投げる", async () => {
   assert.ok(String(body.raw).includes("upstream exploded"));
   // 502(AI呼び出し失敗)にも request が付く(Issue #34)。
   assert.deepStrictEqual(body.request, env.aiCalls[0].payload);
+  // usage は 200 にだけ付く(Issue #56)
+  assert.equal("usage" in body, false, "502 に usage が付いている");
 });
 
 test("502: 応答の形が不正なときも request が付く(Issue #34)", async () => {
-  var env = makeEnv({ aiResult: { answers: {} } });
+  var env = makeEnv({ aiResult: { answers: {}, usage: { input_tokens: 665, output_tokens: 80 } } });
   var res = await worker.fetch(judgeRequest(validBody()), env);
   assert.equal(res.status, 502);
   var body = await res.json();
   assert.deepStrictEqual(body.request, env.aiCalls[0].payload);
+  // 応答に usage があっても 502 には付けない(Issue #56)
+  assert.equal("usage" in body, false, "502 に usage が付いている");
 });
 
 test("400 には request が付かない(Issue #34、まだ payload を組み立てていない)", async () => {
@@ -1561,6 +1565,8 @@ test("usage が無い・形がおかしいときは usage ごと省略する(200
     // 片方だけ数値でも、有限な方だけを載せたりせず丸ごと省略する(単純さを優先)
     "output_tokens が NaN": { input_tokens: 665, output_tokens: NaN },
     "input_tokens が Infinity": { input_tokens: Infinity, output_tokens: 80 },
+    "input_tokens が負値": { input_tokens: -5, output_tokens: 80 },
+    "output_tokens が負値": { input_tokens: 665, output_tokens: -1 },
   };
 
   for (var label in cases) {
@@ -1580,4 +1586,13 @@ test("usage が無い・形がおかしいときは usage ごと省略する(200
       label
     );
   }
+
+  // ラッパーがあるときはトップレベルの usage にフォールバックしない(取り出し元は
+  // extractAnswers と同じく result の中だけ)
+  var wrapped = jevResponse();
+  delete wrapped.result.usage;
+  wrapped.usage = { input_tokens: 665, output_tokens: 80 };
+  var out2 = await judge(validBody(), { aiResult: wrapped });
+  assert.equal(out2.res.status, 200);
+  assert.equal("usage" in out2.body, false, "ラッパーの外の usage を読んでいる");
 });
