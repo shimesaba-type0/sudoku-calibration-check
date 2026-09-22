@@ -525,7 +525,7 @@ async function runProductionMode(chromium, executablePath, targetUrl) {
       var headers = response.headers();
       assert.equal(headers["x-content-type-options"], "nosniff", "X-Content-Type-Options が無い/違う");
       assert.equal(headers["referrer-policy"], "no-referrer", "Referrer-Policy が無い/違う");
-      assert.equal(headers["content-security-policy"], "frame-ancestors 'none'", "Content-Security-Policy が無い/違う");
+      assert.equal(headers["content-security-policy"], "frame-ancestors 'self'", "Content-Security-Policy が無い/違う");
       return "ok";
     });
 
