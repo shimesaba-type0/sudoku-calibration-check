@@ -411,10 +411,12 @@ test("純粋関数 shouldStop: 不正解0なら solved、上限に達したら l
   assert.equal(shouldStop(16, 1), "limit");
 });
 
-test("focusNext は判定を投げる前に state.focusedKey を立てる(対象マスを空にして送る)", async () => {
+test("focusCellForDigit は判定を投げる前に state.focusedKey を立てる(対象マスを空にして送る)", async () => {
+  // 1マスの数字判定は focusCellForDigit(cell, token) が担う(Issue #38。focusNext は
+  // scan モードでそのまま、confidence モードでは selectNextCell 経由でここに渡す)。
   var html = await getPageHtml();
   var script = extractScript(html);
-  var src = stripLineComments(extractFunctionSource(script, "focusNext"));
+  var src = stripLineComments(extractFunctionSource(script, "focusCellForDigit"));
 
   var focusAssign = src.indexOf("state.focusedKey =");
   var judgeCall = src.indexOf("judgeCell(");
@@ -429,6 +431,10 @@ test("focusNext は判定を投げる前に state.focusedKey を立てる(対象
   assert.ok(!/buildSnapshot\(\)/.test(src.slice(0, focusAssign)), "フォーカス確定前に buildSnapshot() を呼んでいる");
   var judgeSrc = extractFunctionSource(script, "judgeCell");
   assert.ok(judgeSrc.includes("buildSnapshot()"), "judgeCell が buildSnapshot() を使っていない");
+
+  // focusNext() は scan モードで、queue から取り出したセルをそのまま focusCellForDigit に渡す
+  var focusNextSrc = extractFunctionSource(script, "focusNext");
+  assert.ok(focusNextSrc.includes("focusCellForDigit("), "focusNext が focusCellForDigit を呼んでいない");
 });
 
 test("実行世代トークン: runToken を定義し、reset と showError が進める", async () => {
@@ -456,22 +462,30 @@ test("純粋関数 isCurrent: 実行中かつ同じ世代のときだけ true", 
   assert.equal(make(false, 3)(3), false, "停止中は続行してはいけない");
 });
 
-test("focusNext と finalizeRound の非同期コールバックはすべて世代トークンで守られている", async () => {
+test("focusNext / focusCellForDigit / finalizeRound の非同期コールバックはすべて世代トークンで守られている", async () => {
   var html = await getPageHtml();
   var script = extractScript(html);
 
   var focusSrc = extractFunctionSource(script, "focusNext");
   assert.ok(/var token = runToken;/.test(focusSrc), "focusNext が世代を捕まえていない");
-  // then(成功)・then(失敗)・commit前 setTimeout・commit後 setTimeout の4か所
-  var guards = focusSrc.match(/if \(!isCurrent\(token\)\) return;/g) || [];
-  assert.ok(guards.length >= 4, "focusNext の世代ガードが足りない: " + guards.length);
-  assert.ok(!/if \(!state\.running\) return;\s*\n\s*var probs/.test(focusSrc), "state.running だけのチェックが残っている");
+
+  // 数字判定の非同期コールバック(then 成功・then 失敗・commit前 setTimeout・commit後
+  // setTimeout の4か所)は focusCellForDigit にある(Issue #38 で focusNext から分離)。
+  var digitSrc = extractFunctionSource(script, "focusCellForDigit");
+  var guards = digitSrc.match(/if \(!isCurrent\(token\)\) return;/g) || [];
+  assert.ok(guards.length >= 4, "focusCellForDigit の世代ガードが足りない: " + guards.length);
+  assert.ok(!/if \(!state\.running\) return;\s*\n\s*var probs/.test(digitSrc), "state.running だけのチェックが残っている");
   // setTimeout のコールバックは必ず先頭でガードする
-  var timeoutBodies = focusSrc.match(/setTimeout\(function \(\) \{\s*([^\n]*)/g) || [];
+  var timeoutBodies = digitSrc.match(/setTimeout\(function \(\) \{\s*([^\n]*)/g) || [];
   assert.ok(timeoutBodies.length >= 2, "setTimeout が2か所ない");
   timeoutBodies.forEach(function (body) {
     assert.ok(body.includes("if (!isCurrent(token)) return;"), "setTimeout の先頭に世代ガードが無い: " + body);
   });
+
+  // マス選び(selectNextCell、Issue #38)も同じ流儀で世代ガードされている
+  var selectSrc = extractFunctionSource(script, "selectNextCell");
+  var selectGuards = selectSrc.match(/if \(!isCurrent\(token\)\) return;/g) || [];
+  assert.ok(selectGuards.length >= 2, "selectNextCell の世代ガードが足りない: " + selectGuards.length);
 
   var finalizeSrc = extractFunctionSource(script, "finalizeRound");
   assert.ok(/var token = runToken;/.test(finalizeSrc), "finalizeRound が世代を捕まえていない");

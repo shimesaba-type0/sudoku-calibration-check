@@ -852,9 +852,9 @@ var PAGE_HTML = `<!doctype html>
   button:hover:not(:disabled) { border-color: var(--accent); }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   #run-btn { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600; }
-  #speed-toggle, #difficulty-toggle, #model-toggle, #thinking-toggle { display: inline-flex; border: 1px solid var(--panel-border); border-radius: 6px; overflow: hidden; }
-  .speed-btn, .difficulty-btn, .model-btn, .thinking-btn { border: none; border-radius: 0; background: var(--panel-bg); }
-  .speed-btn.active, .difficulty-btn.active, .model-btn.active, .thinking-btn.active { background: var(--accent); color: #0b1220; }
+  #speed-toggle, #difficulty-toggle, #model-toggle, #thinking-toggle, #order-toggle { display: inline-flex; border: 1px solid var(--panel-border); border-radius: 6px; overflow: hidden; }
+  .speed-btn, .difficulty-btn, .model-btn, .thinking-btn, .order-btn { border: none; border-radius: 0; background: var(--panel-bg); }
+  .speed-btn.active, .difficulty-btn.active, .model-btn.active, .thinking-btn.active, .order-btn.active { background: var(--accent); color: #0b1220; }
   .claude-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 8px; }
   .claude-row label { font-size: 13px; color: var(--muted); }
   input[type="password"], select {
@@ -963,6 +963,51 @@ var PAGE_HTML = `<!doctype html>
       rows.push(line);
     }
     return rows;
+  }
+
+  // 確信度順モード(Issue #38)のマス選びに送るスナップショット。buildSnapshot() と
+  // 同じ組み立て方だが、state.focusedKey ではなく queue に入っている全マスを "." にする。
+  // こうすると Worker(/api/judge の ask:"cell")が列挙する「空マス」が、この周でまだ
+  // 確定していないマスとちょうど一致する(2周目以降は前の周の不正解の推測が残っているので、
+  // これを消さないと候補として挙がらない。SPEC F3)。
+  function buildSelectionSnapshot() {
+    var emptySet = {};
+    for (var qi = 0; qi < queue.length; qi++) {
+      emptySet[queue[qi].r + "-" + queue[qi].c] = true;
+    }
+    var rows = [];
+    for (var r = 0; r < 9; r++) {
+      var line = "";
+      for (var c = 0; c < 9; c++) {
+        var key = r + "-" + c;
+        if (emptySet[key]) {
+          line += ".";
+          continue;
+        }
+        var given = GIVEN[r][c];
+        if (given !== ".") {
+          line += given;
+          continue;
+        }
+        var cell = state.values[key];
+        line += cell ? cell.value : ".";
+      }
+      rows.push(line);
+    }
+    return rows;
+  }
+
+  // queue のマスを "r<row>c<col>" にしたもの、行優先の順(Issue #38)。Claude 経路の
+  // マス選びのスキーマ(choice の enum / probabilities の required)に使う。Jev 経路は
+  // Worker 側(emptyCells)が puzzle から同じ集合を同じ順序で作るので、フロントでは
+  // 使わない(request の criteria をそのまま信じる)。
+  function selectionKeys() {
+    var cells = queue.slice().sort(function (a, b) {
+      return a.r - b.r || a.c - b.c;
+    });
+    return cells.map(function (cell) {
+      return "r" + cell.r + "c" + cell.c;
+    });
   }
 
   // 周回ログの1行(「N周目: M中K正解 (P%)」)を組み立てる純粋関数。
@@ -1305,9 +1350,18 @@ var PAGE_HTML = `<!doctype html>
   // 定数をテンプレートに埋め込んでいるので、二重管理にならない。
   var NOTE = ${JSON.stringify(NOTE)};
   var INSTRUCTIONS = ${JSON.stringify(INSTRUCTIONS)};
+  // 確信度順モード(Issue #38)のマス選びで使う、Worker と同じ固定文。NOTE / INSTRUCTIONS と
+  // 同じやり方でテンプレートに埋め込む(docs/DESIGN.md 3.5)。
+  var CELL_NOTE = ${JSON.stringify(CELL_NOTE)};
+  var CELL_INSTRUCTIONS = ${JSON.stringify(CELL_INSTRUCTIONS)};
   var CLAUDE_SYSTEM = NOTE + " Answer with JSON only, matching the given schema: " +
     "\\"choice\\" is the digit you pick, \\"probabilities\\" gives your calibrated probability for each digit 1-9 " +
     "(they should sum to 1), and \\"confidence\\" is your overall confidence (0-1) that \\"choice\\" is correct.";
+  // 確信度順のマス選び(Claude 経路)の system。CELL_NOTE をベースにした同種の文言。
+  var CLAUDE_CELL_SYSTEM = CELL_NOTE + " Answer with JSON only, matching the given schema: " +
+    "\\"choice\\" is the cell you pick (its key, such as \\"r0c2\\"), \\"probabilities\\" gives your calibrated " +
+    "probability that each candidate cell is the one you would pick (they should sum to 1), and \\"confidence\\" " +
+    "is your overall confidence (0-1) that \\"choice\\" is correct.";
   // structured outputs(output_config.format = json_schema)のスキーマ。Worker の
   // validateAnswer と同じ形(choice は 1〜9、probabilities は 1〜9 の 9 キー、confidence は数値)。
   var CLAUDE_OUTPUT_SCHEMA = (function () {
@@ -1325,6 +1379,24 @@ var PAGE_HTML = `<!doctype html>
     };
   })();
   var DIGIT_NUMBERS = [1, 2, 3, 4, 5, 6, 7, 8, 9];
+
+  // 確信度順モード(Issue #38)のマス選び用スキーマ。choice / probabilities のキーは
+  // その時点の queue のマス("r<row>c<col>")。DIGITS 固定の CLAUDE_OUTPUT_SCHEMA と違い、
+  // 呼び出しごとに候補が変わるので毎回組み立てる。
+  function buildClaudeCellSchema(keys) {
+    var probProps = {};
+    for (var i = 0; i < keys.length; i++) probProps[keys[i]] = { type: "number" };
+    return {
+      type: "object",
+      properties: {
+        choice: { type: "string", enum: keys.slice() },
+        probabilities: { type: "object", properties: probProps, required: keys.slice(), additionalProperties: false },
+        confidence: { type: "number" }
+      },
+      required: ["choice", "probabilities", "confidence"],
+      additionalProperties: false
+    };
+  }
 
   // ジェネレーターが目指す「与えられた数字」の数。下限を割り込むほどは削らない
   // (削るほど生成に時間がかかり、実験としても手がかりが減りすぎる)。
@@ -1382,7 +1454,12 @@ var PAGE_HTML = `<!doctype html>
     modelMode: "jev",         // "jev" | "claude"。どのモデルに聞くか(Issue #37)。reset() で維持
     claudeModel: DEFAULT_CLAUDE_MODEL, // Claude 経路のモデル ID(CLAUDE_MODELS のどれか)
     claudeThinking: true,     // Claude 経路で思考(extended thinking)を使うか
-    calibModelFilter: "all"   // 較正図のモデルフィルタ("all" | モデル識別子)
+    calibModelFilter: "all",  // 較正図のモデルフィルタ("all" | モデル識別子)
+    orderMode: "scan",        // "scan"(左上から) | "confidence"(確信度順、Issue #38)。reset() で維持
+    selecting: false,         // 確信度順のマス選び中か
+    cellProbs: null,          // 確信度順のヒートマップ用 { "r-c": p, ... }。マス選びの直後だけ持つ
+    lastSelection: null,      // 直近のマス選び1件 { r, c, confidence, candidates, p }
+    lastCellRequest: null     // 直近のマス選びでモデルに送ったリクエスト(Jev なら request、Claude なら送ったボディ)
   };
   // 描画に不要な進行管理はモジュール変数(docs/DESIGN.md 4.1)
   var queue = [];
@@ -1433,6 +1510,38 @@ var PAGE_HTML = `<!doctype html>
     var error = new Error(message);
     // 502 には Worker が Jev に渡したペイロード(request)が付く(Issue #34)。
     // 「何を送って失敗したか」をパネルに出せるよう、エラーに載せて呼び出し元へ渡す。
+    if (data && data.request && typeof data.request === "object") {
+      error.request = data.request;
+    }
+    throw error;
+  }
+
+  // 確信度順モード(Issue #38)のマス選び1件。スナップショットはここで1回だけ作り
+  // (buildSelectionSnapshot()。queue の全マスを "." にしたもの)、モデルトグルに応じて
+  // Jev / Claude に渡す。戻り値は { probabilities, choice, confidence, request, cell }。
+  async function askCell(signal) {
+    var puzzle = buildSelectionSnapshot();
+    if (state.modelMode === "claude") return askCellClaude(puzzle, signal);
+    return askCellJev(puzzle, signal);
+  }
+
+  async function askCellJev(puzzle, signal) {
+    var res = await fetch("/api/judge", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ puzzle: puzzle, ask: "cell" }),
+      signal: signal
+    });
+    if (res.ok) return res.json();
+    var message = "HTTP " + res.status;
+    var data = null;
+    try {
+      data = await res.json();
+      if (data && typeof data.error === "string") message = data.error;
+    } catch (e) {
+      // JSONでないボディはそのまま HTTP <status> にフォールバック
+    }
+    var error = new Error(message);
     if (data && data.request && typeof data.request === "object") {
       error.request = data.request;
     }
@@ -1555,6 +1664,16 @@ var PAGE_HTML = `<!doctype html>
     render();
   }
 
+  // 順番トグル(左上から / 確信度順、Issue #38)。モデルトグルと同じ条件でロックする
+  // (周の途中で切り替えると、選び方が混ざって周回ログの意味が崩れるため)。
+  // localStorage には保存しない(reset() / newPuzzle() をまたいで state だけで保持する)。
+  function setOrderMode(mode) {
+    if (mode !== "scan" && mode !== "confidence") return;
+    if (modelSettingsLocked()) return;
+    state.orderMode = mode;
+    render();
+  }
+
   // 記録(scc.records.v1)の m に入れるモデル識別子。Claude は思考の有無で分ける。
   function currentModelId() {
     if (state.modelMode === "claude") return state.claudeModel + (state.claudeThinking ? "+think" : "");
@@ -1597,27 +1716,58 @@ var PAGE_HTML = `<!doctype html>
     return body;
   }
 
-  // Worker の validateAnswer と同じ基準で Claude の JSON を検証する。
-  function validateClaudeAnswer(answer) {
+  // 確信度順モード(Issue #38)のマス選び(Claude 経路)のリクエストボディ。
+  // buildClaudeRequest と同じ組み立て方だが、system が CLAUDE_CELL_SYSTEM、
+  // messages[0].content が CELL_INSTRUCTIONS + 改行 + { puzzle }(target は無い)、
+  // スキーマの choice / probabilities のキーが keys(queue のマス、行優先)になる。
+  function buildClaudeCellRequest(puzzle, keys) {
+    var body = {
+      model: state.claudeModel,
+      max_tokens: CLAUDE_ANSWER_MAX_TOKENS,
+      system: CLAUDE_CELL_SYSTEM,
+      messages: [
+        {
+          role: "user",
+          content: CELL_INSTRUCTIONS + "\\n" + JSON.stringify({ puzzle: puzzle })
+        }
+      ],
+      output_config: { format: { type: "json_schema", schema: buildClaudeCellSchema(keys) } }
+    };
+    var thinking = claudeThinkingConfig(state.claudeModel, state.claudeThinking);
+    if (thinking) {
+      body.thinking = thinking;
+      if (thinking.type === "adaptive") body.max_tokens = CLAUDE_ADAPTIVE_MAX_TOKENS;
+      if (typeof thinking.budget_tokens === "number") body.max_tokens = thinking.budget_tokens + CLAUDE_ANSWER_MAX_TOKENS;
+    }
+    return body;
+  }
+
+  // Worker の validateAnswer と同じ基準で Claude の JSON を検証する。expectedKeys は
+  // choice / probabilities が取りうるキーの集合(省略時は DIGITS。確信度順のマス選び
+  // (Issue #38)では queue のマスのキーを渡す)。Worker の validateAnswer と同じく
+  // 一般化してある(3.3 と同じ考え方)。
+  function validateClaudeAnswer(answer, expectedKeys) {
+    var keys2 = expectedKeys || DIGITS;
     if (!answer || typeof answer !== "object") return "Claude の応答が JSON オブジェクトではありません";
     var probabilities = answer.probabilities;
     if (probabilities === null || typeof probabilities !== "object" || Array.isArray(probabilities)) {
       return "Claude の応答に probabilities がありません";
     }
     var keys = Object.keys(probabilities);
-    if (keys.length !== DIGITS.length) return "Claude の応答の probabilities が 1〜9 の 9 キーになっていません";
-    for (var i = 0; i < DIGITS.length; i++) {
-      var d = DIGITS[i];
-      if (!Object.prototype.hasOwnProperty.call(probabilities, d)) return "Claude の応答の probabilities が 1〜9 の 9 キーになっていません";
-      if (typeof probabilities[d] !== "number" || !isFinite(probabilities[d])) return "Claude の応答の probabilities に数値でない値が含まれています";
+    if (keys.length !== keys2.length) return "Claude の応答の probabilities が期待するキーと一致していません";
+    for (var i = 0; i < keys2.length; i++) {
+      var k = keys2[i];
+      if (!Object.prototype.hasOwnProperty.call(probabilities, k)) return "Claude の応答の probabilities が期待するキーと一致していません";
+      if (typeof probabilities[k] !== "number" || !isFinite(probabilities[k])) return "Claude の応答の probabilities に数値でない値が含まれています";
     }
-    if (typeof answer.choice !== "string" || DIGITS.indexOf(answer.choice) === -1) return "Claude の応答の choice が 1〜9 のいずれかではありません";
+    if (typeof answer.choice !== "string" || keys2.indexOf(answer.choice) === -1) return "Claude の応答の choice が期待する候補のいずれかではありません";
     if (typeof answer.confidence !== "number" || !isFinite(answer.confidence)) return "Claude の応答の confidence が数値ではありません";
     return null;
   }
 
   // Messages API の応答から JSON 回答を取り出す。{ answer } か { error }。
-  function parseClaudeAnswer(data) {
+  // expectedKeys は validateClaudeAnswer にそのまま渡す(省略時は DIGITS)。
+  function parseClaudeAnswer(data, expectedKeys) {
     if (!data || typeof data !== "object") return { error: "Claude の応答が JSON ではありません" };
     if (data.stop_reason === "refusal") return { error: "Claude が応答を拒否しました(stop_reason: refusal)" };
     if (data.stop_reason === "max_tokens") return { error: "Claude の応答が max_tokens で途切れました" };
@@ -1638,7 +1788,7 @@ var PAGE_HTML = `<!doctype html>
     } catch (e) {
       return { error: "Claude の応答を JSON として解釈できません" };
     }
-    var bad = validateClaudeAnswer(parsed);
+    var bad = validateClaudeAnswer(parsed, expectedKeys);
     if (bad !== null) return { error: bad };
     return { answer: parsed };
   }
@@ -1694,6 +1844,68 @@ var PAGE_HTML = `<!doctype html>
       choice: parsed.answer.choice,
       confidence: parsed.answer.confidence,
       request: body
+    };
+  }
+
+  // 確信度順モード(Issue #38)のマス選び(Claude 経路)。judgeCellClaude と同じ組み立て。
+  // 戻り値は askCellJev と同じ形 { probabilities, choice, confidence, request, cell }。
+  async function askCellClaude(puzzle, signal) {
+    var key = loadAnthropicKey();
+    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」でキーを保存してください)");
+    var keys = selectionKeys();
+    var body = buildClaudeCellRequest(puzzle, keys);
+    var res;
+    try {
+      res = await fetch(ANTHROPIC_MESSAGES_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": key,
+          "anthropic-version": ANTHROPIC_VERSION,
+          "anthropic-dangerous-direct-browser-access": "true"
+        },
+        body: JSON.stringify(body),
+        signal: signal
+      });
+    } catch (e) {
+      if (e && e.name === "AbortError") throw e;
+      var netErr = new Error("Claude API に接続できません: " + (e && e.message ? e.message : String(e)));
+      netErr.request = body;
+      throw netErr;
+    }
+    var data = null;
+    try {
+      data = await res.json();
+    } catch (e) {
+      if (e && e.name === "AbortError") throw e;
+      data = null;
+    }
+    if (!res.ok) {
+      var message = "Claude API HTTP " + res.status;
+      if (data && data.error && typeof data.error.message === "string") message += ": " + data.error.message;
+      var httpErr = new Error(message);
+      httpErr.request = body;
+      throw httpErr;
+    }
+    var parsed = parseClaudeAnswer(data, keys);
+    if (parsed.error) {
+      var formatErr = new Error(parsed.error);
+      formatErr.request = body;
+      throw formatErr;
+    }
+    var choice = parsed.answer.choice;
+    var m = /^r(\\d)c(\\d)$/.exec(choice);
+    if (!m) {
+      var shapeErr = new Error("選ばれたマスが候補にありません: " + choice);
+      shapeErr.request = body;
+      throw shapeErr;
+    }
+    return {
+      probabilities: parsed.answer.probabilities,
+      choice: choice,
+      confidence: parsed.answer.confidence,
+      request: body,
+      cell: { row: Number(m[1]), col: Number(m[2]) }
     };
   }
 
@@ -1810,7 +2022,85 @@ var PAGE_HTML = `<!doctype html>
       finalizeRound();
       return;
     }
+    // 確信度順モード(Issue #38): まずマス選び(1回目の呼び出し)。選ばれたマスが
+    // queue から取り除かれてから数字判定(focusCellForDigit)に進む。
+    if (state.orderMode === "confidence") {
+      selectNextCell(token);
+      return;
+    }
     var cell = queue.shift();
+    focusCellForDigit(cell, token);
+  }
+
+  // 確信度順モード(Issue #38)のマス選び。queue の全マスを候補にして askCell() を呼び、
+  // 選ばれたマスを queue から取り除いてから focusCellForDigit() に渡す(1ステップ = 2回の判定)。
+  function selectNextCell(token) {
+    state.selecting = true;
+    state.focusedKey = null;
+    state.currentProbs = null;
+    state.cellProbs = null;
+    pendingCommit = null;
+    render();
+
+    inflightController = new AbortController();
+    askCell(inflightController.signal).then(function (result) {
+      if (!isCurrent(token)) return;
+      if (result.request && typeof result.request === "object") {
+        state.lastCellRequest = result.request;
+      }
+      var chosen = result.cell;
+      var idx = -1;
+      if (chosen && typeof chosen.row === "number" && typeof chosen.col === "number") {
+        for (var i = 0; i < queue.length; i++) {
+          if (queue[i].r === chosen.row && queue[i].c === chosen.col) {
+            idx = i;
+            break;
+          }
+        }
+      }
+      if (idx === -1) {
+        showError("選ばれたマスが候補にありません: " + JSON.stringify(result.choice));
+        return;
+      }
+      // ヒートマップ用: "r0c2" 形式のキーを "r-c" 形式に変換する。
+      var probs = result.probabilities || {};
+      var cellProbs = {};
+      var probKeys = Object.keys(probs);
+      for (var k = 0; k < probKeys.length; k++) {
+        var m = /^r(\\d)c(\\d)$/.exec(probKeys[k]);
+        if (!m) continue;
+        var v = probs[probKeys[k]];
+        if (typeof v !== "number" || !isFinite(v)) continue;
+        cellProbs[m[1] + "-" + m[2]] = v;
+      }
+      state.cellProbs = cellProbs;
+      state.lastSelection = {
+        r: chosen.row,
+        c: chosen.col,
+        confidence: result.confidence,
+        candidates: probKeys.length,
+        p: typeof probs[result.choice] === "number" ? probs[result.choice] : null
+      };
+      var cell = queue.splice(idx, 1)[0];
+      state.selecting = false;
+      render();
+      focusCellForDigit(cell, token);
+    }, function (err) {
+      if (!isCurrent(token)) return;
+      if (err && err.name === "AbortError") return;
+      if (err && err.request && typeof err.request === "object") {
+        state.lastCellRequest = err.request;
+      }
+      showError(err && err.message ? err.message : String(err));
+    }).catch(function (err) {
+      if (!isCurrent(token)) return;
+      showError("画面の更新に失敗しました: " + (err && err.message ? err.message : String(err)));
+    });
+  }
+
+  // 1マスの数字判定(従来の focusNext() の本体そのもの)。cell を queue から取り出す
+  // 部分だけが呼び出し元(focusNext / selectNextCell)側に分かれている。
+  function focusCellForDigit(cell, token) {
     // 先にフォーカスを立てる。buildSnapshot() は state.focusedKey のマスを "." に
     // するので、この順序が「対象マスを空にして送る」不変条件そのもの(SPEC F3)。
     state.focusedKey = cell.r + "-" + cell.c;
@@ -1908,6 +2198,9 @@ var PAGE_HTML = `<!doctype html>
     };
     state.focusedKey = null;
     state.currentProbs = null;
+    // 確信度順(Issue #38)のヒートマップは、このマスが確定したら消す
+    // (次のマス選びまでヒートマップは出さない)。
+    state.cellProbs = null;
     pendingCommit = null;
     render();
   }
@@ -1982,6 +2275,11 @@ var PAGE_HTML = `<!doctype html>
     pendingCommit = null;
     state.focusedKey = null;
     state.currentProbs = null;
+    // 確信度順(Issue #38)のマス選び中に止めた場合: 選ばれたマスはまだ queue から
+    // 取り除いていない(選び終わって初めて queue.splice する)ので再キューは不要。
+    // 再開(run())はマス選びからやり直す。
+    state.selecting = false;
+    state.cellProbs = null;
     render();
   }
 
@@ -1997,6 +2295,8 @@ var PAGE_HTML = `<!doctype html>
     state.running = false;
     state.focusedKey = null;
     state.currentProbs = null;
+    state.selecting = false;
+    state.cellProbs = null;
     pendingCommit = null;
     render();
   }
@@ -2027,6 +2327,7 @@ var PAGE_HTML = `<!doctype html>
     var keepClaudeModel = state.claudeModel;
     var keepClaudeThinking = state.claudeThinking;
     var keepCalibFilter = state.calibModelFilter;
+    var keepOrderMode = state.orderMode;
     state = {
       round: 1,
       values: {},
@@ -2046,7 +2347,12 @@ var PAGE_HTML = `<!doctype html>
       modelMode: keepModelMode,
       claudeModel: keepClaudeModel,
       claudeThinking: keepClaudeThinking,
-      calibModelFilter: keepCalibFilter
+      calibModelFilter: keepCalibFilter,
+      orderMode: keepOrderMode,
+      selecting: false,
+      cellProbs: null,
+      lastSelection: null,
+      lastCellRequest: null
     };
     queue = [];
     roundWrong = [];
@@ -2117,6 +2423,17 @@ var PAGE_HTML = `<!doctype html>
         color = "var(--incorrect)";
         bg = "var(--incorrect-bg)";
       }
+    } else if (!isFocused && state.cellProbs && Object.prototype.hasOwnProperty.call(state.cellProbs, key)) {
+      // 確信度順モード(Issue #38)のヒートマップ: マス選びの確率が高いほど背景を濃くする。
+      // 判定済み(cell あり)・フォーカス中のマスは対象外(上の分岐で既に確定しているため)。
+      var pmax = 0;
+      for (var pk in state.cellProbs) {
+        if (Object.prototype.hasOwnProperty.call(state.cellProbs, pk) && state.cellProbs[pk] > pmax) pmax = state.cellProbs[pk];
+      }
+      if (pmax > 0) {
+        var alpha = 0.08 + 0.6 * (state.cellProbs[key] / pmax);
+        bg = "rgba(125, 211, 252, " + alpha.toFixed(3) + ")";
+      }
     }
 
     var borderTop = r % 3 === 0 ? "3px solid var(--thick-border)" : "1px solid var(--border)";
@@ -2151,11 +2468,15 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function renderLegend() {
-    return "<div id=\\"legend\\" class=\\"legend\\">" +
+    var items =
       "<span class=\\"legend-item\\"><span class=\\"swatch swatch-correct\\"></span>正解</span>" +
       "<span class=\\"legend-item\\"><span class=\\"swatch swatch-incorrect\\"></span>不正解</span>" +
-      "<span class=\\"legend-item\\"><span class=\\"swatch swatch-focus\\"></span>判定中</span>" +
-      "</div>";
+      "<span class=\\"legend-item\\"><span class=\\"swatch swatch-focus\\"></span>判定中</span>";
+    // 確信度順モード(Issue #38)のときだけヒートマップの凡例を足す。
+    if (state.orderMode === "confidence") {
+      items += "<span class=\\"legend-item\\">背景の濃さ = マス選びの確率</span>";
+    }
+    return "<div id=\\"legend\\" class=\\"legend\\">" + items + "</div>";
   }
 
   function renderControls() {
@@ -2180,6 +2501,10 @@ var PAGE_HTML = `<!doctype html>
     var jevActive = state.modelMode === "jev" ? " active" : "";
     var claudeActive = state.modelMode === "claude" ? " active" : "";
     var modelDisabled = modelSettingsLocked() ? "disabled" : "";
+    // 順番トグル(左上から / 確信度順、Issue #38)。モデルトグルと同じ条件でロックする。
+    var scanActive = state.orderMode === "scan" ? " active" : "";
+    var confidenceActive = state.orderMode === "confidence" ? " active" : "";
+    var orderDisabled = modelSettingsLocked() ? "disabled" : "";
     return "<div class=\\"controls\\">" +
       "<button id=\\"run-btn\\" onclick=\\"" + runOnclick + "\\" " + runDisabled + ">" + runLabel + "</button>" +
       "<button id=\\"reset-btn\\" onclick=\\"reset()\\" " + resetDisabled + ">リセット</button>" +
@@ -2196,6 +2521,10 @@ var PAGE_HTML = `<!doctype html>
       "<div id=\\"model-toggle\\">" +
       "<button class=\\"model-btn" + jevActive + "\\" aria-pressed=\\"" + (state.modelMode === "jev") + "\\" onclick=\\"setModelMode('jev')\\" " + modelDisabled + ">Jev</button>" +
       "<button class=\\"model-btn" + claudeActive + "\\" aria-pressed=\\"" + (state.modelMode === "claude") + "\\" onclick=\\"setModelMode('claude')\\" " + modelDisabled + ">Claude</button>" +
+      "</div>" +
+      "<div id=\\"order-toggle\\">" +
+      "<button class=\\"order-btn" + scanActive + "\\" aria-pressed=\\"" + (state.orderMode === "scan") + "\\" onclick=\\"setOrderMode('scan')\\" " + orderDisabled + ">左上から</button>" +
+      "<button class=\\"order-btn" + confidenceActive + "\\" aria-pressed=\\"" + (state.orderMode === "confidence") + "\\" onclick=\\"setOrderMode('confidence')\\" " + orderDisabled + ">確信度順</button>" +
       "</div>" +
       "</div>";
   }
@@ -2272,6 +2601,17 @@ var PAGE_HTML = `<!doctype html>
     }).join("");
   }
 
+  // 確信度順モード(Issue #38)の「マス選び: N 候補中 r行c列(p%)/ confidence q%」行。
+  // state.lastSelection が無ければ何も出さない(まだ一度もマス選びをしていない)。
+  function renderSelectionLine() {
+    var sel = state.lastSelection;
+    if (!sel) return "";
+    var pctText = typeof sel.p === "number" ? Math.round(sel.p * 100) + "%" : "?";
+    var confText = typeof sel.confidence === "number" ? Math.round(sel.confidence * 100) + "%" : "?";
+    return "<div class=\\"coords\\">マス選び: " + sel.candidates + " 候補中 " + coordLabel(sel.r, sel.c) +
+      "(" + pctText + ") / confidence " + confText + "</div>";
+  }
+
   function renderCurrentPanel() {
     var head = "<div id=\\"current-panel\\" class=\\"panel\\"><p class=\\"panel-title\\">現在の判定</p>";
     var tail = "</div>";
@@ -2292,6 +2632,11 @@ var PAGE_HTML = `<!doctype html>
       return head + pausedBody + tail;
     }
 
+    // 確信度順モード(Issue #38)のマス選び中: マス選びの結果が届くまでは座標もバーも無い。
+    if (state.selecting) {
+      return head + "<p class=\\"muted\\">マス選び中…(候補 " + queue.length + " マス)</p>" + tail;
+    }
+
     // 結果が届いている最中のマス: 座標とバーをそのまま出す
     if (state.focusedKey && state.currentProbs) {
       var parts = state.focusedKey.split("-");
@@ -2299,7 +2644,8 @@ var PAGE_HTML = `<!doctype html>
       if (pendingCommit && typeof pendingCommit.confidence === "number") {
         confidenceText = "<span class=\\"confidence\\">confidence " + Math.round(pendingCommit.confidence * 100) + "%</span>";
       }
-      return head +
+      var selLine1 = state.orderMode === "confidence" ? renderSelectionLine() : "";
+      return head + selLine1 +
         "<div class=\\"coords\\">" + coordLabel(Number(parts[0]), Number(parts[1])) + confidenceText + "</div>" +
         "<div class=\\"bars\\">" + renderBars(state.currentProbs) + "</div>" + tail;
     }
@@ -2308,6 +2654,7 @@ var PAGE_HTML = `<!doctype html>
     // 最速モードでも結果が一瞬で消えないようにするため(DESIGN 4.4)。
     var body = "";
     if (state.focusedKey) {
+      if (state.orderMode === "confidence") body += renderSelectionLine();
       var p2 = state.focusedKey.split("-");
       body += "<div class=\\"coords\\">" + coordLabel(Number(p2[0]), Number(p2[1])) +
         "<span class=\\"confidence\\">判定中…</span></div>";
@@ -2325,26 +2672,51 @@ var PAGE_HTML = `<!doctype html>
     return head + "<p class=\\"muted\\">待機中</p>" + tail;
   }
 
-  // 「モデルに送ったプロンプト」パネル(Issue #34、#37)。Jev なら Worker が env.AI.run に渡した
-  // ペイロード(request)をそのまま JSON で表示する。フロント側で組み立て直さない
-  // (handleJudge と二重管理にしないため)。停止中・エラー時も直近の値を残す。
-  function renderPromptPanel() {
-    var head = "<div id=\\"prompt-panel\\" class=\\"panel\\"><p class=\\"panel-title\\">モデルに送ったプロンプト</p>";
-    var tail = "</div>";
-    var req = state.lastRequest;
-    if (!req) {
-      return head + "<p class=\\"muted\\">まだ判定していません(実行すると直近の判定に使ったプロンプトが表示されます)</p>" + tail;
-    }
+  // req(request 相当のオブジェクト)1件ぶんの表示ブロック。target があれば座標を、
+  // failed なら「(このプロンプトで失敗)」を添え、heading があれば見出しを出す
+  // (確信度順モードの「マス選び」/「数字」の2段、Issue #38)。
+  function renderRequestBlock(req, failed, heading) {
     var target = req.state && req.state.target;
     var usedFor = "";
-    var failedNote = state.lastRequestFailed ? "(このプロンプトで失敗)" : "";
+    var failedNote = failed ? "(このプロンプトで失敗)" : "";
     if (target && typeof target.row === "number" && typeof target.col === "number") {
       usedFor = "<p class=\\"muted\\">" + escapeHtml(coordLabel(target.row, target.col)) + " の判定に使用" + failedNote + "</p>";
     } else if (failedNote) {
       usedFor = "<p class=\\"muted\\">" + failedNote + "</p>";
     }
-    return head + usedFor +
-      "<pre class=\\"prompt-json\\">" + escapeHtml(JSON.stringify(req, null, 2)) + "</pre>" + tail;
+    var headingHtml = heading ? "<p class=\\"muted\\">" + escapeHtml(heading) + "</p>" : "";
+    return headingHtml + usedFor +
+      "<pre class=\\"prompt-json\\">" + escapeHtml(JSON.stringify(req, null, 2)) + "</pre>";
+  }
+
+  // 「モデルに送ったプロンプト」パネル(Issue #34、#37、#38)。Jev なら Worker が env.AI.run に渡した
+  // ペイロード(request)をそのまま JSON で表示する。フロント側で組み立て直さない
+  // (handleJudge と二重管理にしないため)。停止中・エラー時も直近の値を残す。
+  // 確信度順モードでは、マス選び(state.lastCellRequest)と数字(state.lastRequest)を
+  // 見出し付きで2段に並べる。左上からのときは従来どおり数字のリクエスト1つだけ。
+  function renderPromptPanel() {
+    var head = "<div id=\\"prompt-panel\\" class=\\"panel\\"><p class=\\"panel-title\\">モデルに送ったプロンプト</p>";
+    var tail = "</div>";
+
+    if (state.orderMode !== "confidence") {
+      var req = state.lastRequest;
+      if (!req) {
+        return head + "<p class=\\"muted\\">まだ判定していません(実行すると直近の判定に使ったプロンプトが表示されます)</p>" + tail;
+      }
+      return head + renderRequestBlock(req, state.lastRequestFailed, null) + tail;
+    }
+
+    if (!state.lastCellRequest && !state.lastRequest) {
+      return head + "<p class=\\"muted\\">まだ判定していません(実行すると直近の判定に使ったプロンプトが表示されます)</p>" + tail;
+    }
+    var body = "";
+    if (state.lastCellRequest) {
+      body += renderRequestBlock(state.lastCellRequest, false, "マス選び");
+    }
+    if (state.lastRequest) {
+      body += renderRequestBlock(state.lastRequest, state.lastRequestFailed, "数字");
+    }
+    return head + body + tail;
   }
 
   function renderRoundLog() {
