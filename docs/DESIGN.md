@@ -232,6 +232,7 @@ var generating = false;         // 問題を生成している最中か(4.2 newP
 var started = false;
 var pendingCommit = null;       // API結果を受けて確定待ちの1件
 var runToken = 0;               // 実行の世代。reset() / showError() で +1 する(4.3)
+var inflightController = null;  // in-flight の /api/judge 用 AbortController(4.3、Issue #19)
 ````
 
 **集計ビューの記録は `state` に持たない。** 判定結果の記録(SPEC F1 拡張2、Issue #6)は
@@ -257,20 +258,20 @@ var runToken = 0;               // 実行の世代。reset() / showError() で +
 | `solveCount(grid, limit, found)` | 解の個数を数えるソルバー。`limit` 個見つけたら打ち切る(一意解の判定は `limit=2` で足りる)。候補の少ないマスから埋める(MRV)+ 行・列・箱のビットマスクでのバックトラッキング。`found` に配列を渡すと見つけた解を9行の文字列配列で受け取れる。置かれている数字がすでに矛盾していれば 0 |
 | `generateSolvedGrid()` | 空盤面に対し、各マスの候補をシャッフルしながらバックトラッキングして完成盤を1つ作る純粋関数(乱数のみ外部依存) |
 | `generatePuzzle(targetGivens)` | 完成盤からマスをランダム順に消し、消すたびに `solveCount(grid, 2) === 1` を確認する(2 になるなら戻す)。与えられた数字が `targetGivens`(既定 `DEFAULT_TARGET_GIVENS` = 30、下限 `MIN_TARGET_GIVENS` = 24)になったら打ち切る。戻り値 `{ given, solution }`(どちらも9行の文字列配列) |
-| `newPuzzle()` | 「新しい問題」ボタン。`generating` を立てて `reset()`(= 世代トークンを進めて進行中のループを無効化)し、`setTimeout(…, 0)` で生成してから `GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize` を差し替えて再描画。生成は同期で概ね 10 ms 以下(実測: 中央値 4ms、最大 10ms、100回) |
+| `newPuzzle()` | 「新しい問題」ボタン。`generating` を立てて `reset()`(= 世代トークンを進めて進行中のループを無効化し、in-flight の `/api/judge` も `abort()` する。Issue #19)し、`setTimeout(…, 0)` で生成してから `GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize` を差し替えて再描画。生成は同期で概ね 10 ms 以下(実測: 中央値 4ms、最大 10ms、100回) |
 | `countEmpty(grid)` / `boxIndex` / `gridToCells` / `cellsToGrid` / `shuffled` | 上記の下請け。盤面の2つの表現(9行の文字列配列 ⇔ 81要素の数値配列。0 が空)の変換と、Fisher-Yates シャッフル |
 | `buildSnapshot()` | `GIVEN` + `state.values`(正誤問わず)から9行の文字列配列を作る。未確定は `.`。**判定対象のマスだけは `.` にして送る(他のマスの過去の推測は正誤問わず残す)**。Worker 側も 3.3 でこれを検証する |
 | `formatRoundSummary(round, correct, total)` | 周回ログの1行「N周目: M中K正解 (P%)」を組み立てる純粋関数。`total` が0でも割り算しない |
 | `nextQueue(roundWrong)` | 次の周の `queue` を作る純粋関数。配列も要素も複製して返す(`roundWrong = []` の影響を受けないため) |
 | `shouldStop(round, incorrectCount)` | 周の終わりの判断を返す純粋関数。`"solved"`(不正解0)/ `"limit"`(`MAX_ROUNDS` に到達)/ `"continue"` |
 | `isCurrent(token)` | `state.running && token === runToken`。古い世代のコールバックを弾く(4.3) |
-| `judgeCell(r,c)` | `buildSnapshot()` を作って `/api/judge` を `fetch`。非2xxは `Error` にして投げる |
-| `focusNext()` | 先頭で `runToken` を捕まえ、`queue` から1つ取り出しフォーカス→`judgeCell`→バー表示→(待ち)→`commitFocused`→(待ち)→再帰。`queue` が空なら `finalizeRound` |
+| `judgeCell(r,c,signal)` | `buildSnapshot()` を作って `/api/judge` を `fetch`(`signal` をそのまま渡す。`focusNext` が渡す `inflightController.signal`)。非2xxは `Error` にして投げる |
+| `focusNext()` | 先頭で `runToken` を捕まえ、`queue` から1つ取り出しフォーカス→(リクエストごとに新しい `AbortController` を `inflightController` に作って)`judgeCell`→バー表示→(待ち)→`commitFocused`→(待ち)→再帰。`queue` が空なら `finalizeRound`。`judgeCell` が `AbortError` で reject したときは(世代トークンの判定と同じ扱いで)無視して `return` し、`showError` には流さない(4.3、Issue #19) |
 | `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong`/`state.lastJudgment` を更新。`pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない。正誤が確定するこの時点で `appendRecord()` を呼び、集計ビュー用の1件を記録する |
 | `finalizeRound()` | ログ追記→`shouldStop` の結果で完了 / 強制終了 / 次の周(`queue = nextQueue(roundWrong)`) |
 | `run()` | 初回のみ queue を全空マスで初期化し `focusNext` を開始 |
-| `reset()` | `runToken` を進め、進行管理と `state` を初期化(`speedMode` は維持) |
-| `showError(message)` | `runToken` を進めて `state.errorMessage` を立て、`running=false` で止める(不変条件4) |
+| `reset()` | `runToken` を進め、`inflightController` があれば `abort()` して in-flight の `/api/judge` を打ち切り、進行管理と `state` を初期化(`speedMode` は維持)(Issue #19) |
+| `showError(message)` | `runToken` を進め、`inflightController` があれば `abort()` して `state.errorMessage` を立て、`running=false` で止める(不変条件4、Issue #19) |
 | `setSpeed(mode)` | `state.speedMode` を切り替えて再描画。実行中でも切り替えられる(4.4) |
 | `render()` | `state` から DOM(グリッド・統計・バー・ログ・集計パネル・バナー・ボタン)を **全部 innerHTML で再生成**。周回ログのスクロール位置だけは引き継ぐ |
 | `render*()` | `renderGrid` / `renderLegend` / `renderControls` / `renderErrorBox` / `renderStats`(+`statCard`)/ `renderCurrentPanel`(+`coordLabel` / `renderBars`)/ `renderRoundLog` / `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`。それぞれHTML文字列を返すだけで、DOMには触らない |
@@ -318,9 +319,16 @@ idle ──run()──▶ focusNext()
 世代トークンはこれを一箇所で断ち切るための仕組みなので、非同期のコールバックを足すときは
 必ず同じガードを付ける。
 
+**in-flight の abort(Issue #19)。** `runToken` は「古い世代の結果を無視する」だけで、
+Jev への問い合わせそのものは止めない。リセット/新しい問題(`newPuzzle()` は内部で
+`reset()` を呼ぶ)/エラーでは、`runToken` を進めるのと同じタイミングで `inflightController.abort()`
+も呼び、in-flight の `/api/judge` を実際に打ち切る(無駄な待ち時間とレート制限消費を防ぐ)。
+
 なお API 失敗は `then(onOk, onErr)` の第2引数で受け、成功ハンドラ側で投げた例外は後ろの
 `catch` で別の文言(「画面の更新に失敗しました」)にする。描画のバグを API エラーとして
-報告しないため。
+報告しないため。abort による `AbortError`(`err.name === "AbortError"`)は、世代トークンの
+判定と同じ「古い世代は無視する」扱いで `showError` に流さない(そもそも abort は古い世代
+にしか起きない設計だが、明示的にガードしている)。
 
 ### 4.4 描画方針
 
@@ -432,12 +440,18 @@ new_sqlite_classes = ["RateLimitCounter"]
   - `AI.run` が例外を投げる / `answers.digit` が無い(ラッパーの有無どちらでも)/ `state` が `"Completed"` でない / `answers.digit` の形が 3.3 の条件を満たさない場合に 502 になること
   - ラッパー付き(3.4 の実測形式)とラッパー無し(素の `{ model, answers, usage }`)の **どちらでも** 200 になること。`confidence` は Jev の値がそのまま返り、`probabilities[choice]` に差し替えられていないこと
   - `GET /` が `text/html; charset=utf-8` と 7 章のセキュリティヘッダーを返し、それ以外のパスが 404 であること
-  - **ジェネレーター / ソルバー**(`test/page.test.js`)。`PAGE_HTML` の `<script>` を取り出し、`node:vm` のコンテキストで丸ごと評価する harness を使う(`document` は `#app` だけ、`setTimeout` は待たずに即実行、`fetch` は呼び出しを記録するスタブ)。スクリプト直下の `var` / 関数宣言はコンテキストのプロパティになるので、`ctx.generatePuzzle` のように直接呼べる
+  - **ジェネレーター / ソルバー**(`test/page.test.js`)。`PAGE_HTML` の `<script>` を取り出し、`node:vm` のコンテキストで丸ごと評価する harness を使う(`document` は `#app` だけ、`setTimeout` は待たずに即実行、`fetch` は呼び出しを記録するスタブ、`AbortController` は Node のグローバルをそのまま渡す。`focusNext()` の `new AbortController()` が vm コンテキストからも見えるようにするため)。スクリプト直下の `var` / 関数宣言はコンテキストのプロパティになるので、`ctx.generatePuzzle` のように直接呼べる
     - `solveCount` が固定問題で 1 を返し、その解が既知の正解(DESIGN 5 章の `SOLUTION`)と一致すること。空盤面は `limit` で打ち切られ、矛盾した盤面は 0 になること
     - `generatePuzzle` を **20回** 呼び、毎回 `solveCount(given, 2) === 1`、`solveCount` が見つける解が `solution` と一致、与えられた数字が 17〜40 個、`solution` が数独として正しい(行・列・箱に1〜9が1回ずつ)こと。乱数を使うので所要時間の上限も見る(実測: 20回で 160ms 前後)
     - `newPuzzle()` で `GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize` が差し替わり、周回・統計が初期化されること。初期表示は固定問題のままであること
     - 「新しい問題」の後に `run()` すると、**新しい `GIVEN` の空マスだけを行優先の順で** `/api/judge` に問い合わせること(回数と座標の両方を見る。空マスの「数」は固定問題と同じ51になりうるため)
     - vm のコンテキストで作った配列は host とは別レルムなので、`deepStrictEqual` の前に host 側の配列へ移し替える(`hostRows`)
+  - **周回ロジックの振る舞い: in-flight の abort**(`test/page.test.js` S1〜S4、Issue #19)。これまでの世代トークンの検査は正規表現によるソース検査だけだったが、`runScript` harness で `run()` / `reset()` / `newPuzzle()` を実際に走らせて振る舞いを検証する。`fetch` モックは resolve/reject を外側から制御できる「宙吊り」な `Promise` を返し、`init.signal` に `addEventListener("abort", ...)` を仕込んで `inflightController.abort()` を再現する(`makeAbortAwareFetch`)
+    - S1: `run()` → 1件目の fetch を宙吊り → `reset()` → `run()` → 宙吊りを解決 → 全部流す。fetch 総数が51以下(abort により宙吊り分が再送されない)、commit 51、空マス0、`state.done === true` であること
+    - S2: in-flight で `reset()` のみ。commit 0、`state.values` が空、`state.running === false`、記録(`getRecords()`)も増えないこと
+    - S3: in-flight で `newPuzzle()`。古い結果が新しい盤面に commit されないこと
+    - S4: `reset()` で fetch が `AbortError` で reject されても `showError` されない(エラーボックスが出ない)こと
+    - 修正前(AbortController 導入前)のコードに当てると、S1〜S4 はいずれも「in-flight の fetch が abort されていない」で落ちることを確認済み
   - **集計ビュー**(`test/page.test.js`、Issue #6)。`runScript` の harness に `localStorage` / `confirm` / `Blob` / `URL` / `document.createElement` / `document.body` のモックを足してある(`makeLocalStorage()` は `Map` ベース、`makeThrowingLocalStorage()` は必ず例外を投げる)
     - `binRecords`: 境界(`0.0`→帯0、`0.1`→帯1、`0.95`・`1.0`→帯9。`1.0` は最後の帯に入る)、帯ごとの `n`/`correct`/`rate`(`n===0` なら `rate=null`)の計算、数値でない/`NaN`/0〜1の範囲外(`1.5`・`-0.5`)の値の除外、`"pc"` と `"conf"` を独立に集計すること(pc が範囲外でも conf は数えること)
     - `appendRecord`: 上限(`RECORDS_MAX` は既定5,000だが、テストでは `ctx.RECORDS_MAX = 5` のように vm コンテキストのプロパティとして差し替えて境界だけ検証する。既定値5,000であることは別途1行で確認する)を超えたら最古から捨てて上限件数のまま保たれること

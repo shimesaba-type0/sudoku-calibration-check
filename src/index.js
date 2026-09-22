@@ -1144,16 +1144,23 @@ var PAGE_HTML = `<!doctype html>
   // 実行の世代。reset() / showError() のたびに進める。進行中の fetch や
   // setTimeout のコールバックは、捕まえた世代と一致するときだけ続行する。
   var runToken = 0;
+  // 現在 in-flight の /api/judge 用 AbortController。focusNext() がリクエストの
+  // たびに新しく作り直す。reset() / showError()(newPuzzle() は内部で reset() を
+  // 呼ぶので実質同じ)で abort() し、リセット後に古いリクエストの結果が届いても
+  // Jev への問い合わせ自体を打ち切る(runToken だけだと「結果を無視する」に留まり、
+  // Worker 側は最後まで判定してしまう。Issue #19)。
+  var inflightController = null;
 
   // -------------------------------------------------------------------
   // API呼び出し
   // -------------------------------------------------------------------
-  async function judgeCell(r, c) {
+  async function judgeCell(r, c, signal) {
     var puzzle = buildSnapshot();
     var res = await fetch("/api/judge", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ puzzle: puzzle, target: { row: r, col: c } })
+      body: JSON.stringify({ puzzle: puzzle, target: { row: r, col: c } }),
+      signal: signal
     });
     if (res.ok) return res.json();
     var message = "HTTP " + res.status;
@@ -1287,7 +1294,10 @@ var PAGE_HTML = `<!doctype html>
     pendingCommit = null;
     render();
 
-    judgeCell(cell.r, cell.c).then(function (result) {
+    // このリクエスト専用の AbortController。reset() / showError() が abort() すると
+    // 下の fetch が AbortError で reject される(Issue #19)。
+    inflightController = new AbortController();
+    judgeCell(cell.r, cell.c, inflightController.signal).then(function (result) {
       if (!isCurrent(token)) return; // リセット後などの古い世代は捨てる
       var probs = DIGITS.map(function (d) {
         var p = result.probabilities ? result.probabilities[d] : 0;
@@ -1309,6 +1319,9 @@ var PAGE_HTML = `<!doctype html>
     }, function (err) {
       // API 側の失敗だけをここで扱う(成功ハンドラ内の例外と混ぜない)
       if (!isCurrent(token)) return;
+      // reset() / showError() による abort() が原因の AbortError はユーザーへの
+      // エラー表示にしない。世代トークンの判定と同じ「古い世代は無視する」扱い(Issue #19)。
+      if (err && err.name === "AbortError") return;
       showError(err && err.message ? err.message : String(err));
     }).catch(function (err) {
       // 成功ハンドラ(render など)が投げた場合。API エラーとは区別して表示する。
@@ -1396,6 +1409,11 @@ var PAGE_HTML = `<!doctype html>
   function showError(message) {
     // 世代を進めて、進行中の fetch / setTimeout のコールバックを無効化する
     runToken += 1;
+    // in-flight の /api/judge があれば打ち切る(Issue #19)
+    if (inflightController) {
+      inflightController.abort();
+      inflightController = null;
+    }
     state.errorMessage = message;
     state.running = false;
     state.focusedKey = null;
@@ -1412,6 +1430,12 @@ var PAGE_HTML = `<!doctype html>
   function reset() {
     // 世代を進める。進行中の fetch / setTimeout はこれで続きを実行しなくなる
     runToken += 1;
+    // in-flight の /api/judge があれば打ち切る。newPuzzle() は内部で reset() を
+    // 呼ぶので、これで newPuzzle() 時の abort も兼ねる(Issue #19)。
+    if (inflightController) {
+      inflightController.abort();
+      inflightController = null;
+    }
     var keepSpeed = state.speedMode;
     state = {
       round: 1,
