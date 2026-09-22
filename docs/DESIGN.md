@@ -281,8 +281,18 @@ Cloudflare 側の都合で変わる。形が違っていたらこの節と `hand
   (画面は末尾 4 文字のヒントだけ)。`saveAnthropicKey` / `clearAnthropicKey` / `loadAnthropicKey`
 - **エラー**: 非 2xx は `Claude API HTTP <status>: <error.message>`、`stop_reason` が `refusal` /
   `max_tokens`、テキストが JSON でない、検証(`validateClaudeAnswer`、Worker の `validateAnswer` と
-  同じ基準)に落ちる、ネットワーク失敗、いずれも `Error` に `request`(ボディ)を載せて投げ、
-  `focusNext` のエラー側で「(このプロンプトで失敗)」として残す(#34 と同じ経路)
+  同じ基準)に落ちる、ネットワーク失敗、いずれも `Error` に `request`(ボディ。ネットワーク失敗も
+  送ろうとしたボディを載せる)を載せて投げ、`focusNext` のエラー側で「(このプロンプトで失敗)」
+  として残す(#34 と同じ経路)
+  - **一時的な失敗と非一時的な失敗の分類(Issue #43、SPEC F5)**: HTTP 429(レート制限)/ 529
+    (過負荷)/ 5xx(`isTransientClaudeStatus()`)、およびネットワーク失敗(`fetch` 自体が reject。
+    `AbortError` は別扱いで無視される)は `err.transient=true` を付けて投げる。呼び出し側
+    (`focusCellForDigit` / `selectNextCell`)はこれを見て `showError()` の代わりに
+    `pauseForTransientError()` に分岐し、`errorMessage` を立てずに「停止」扱いにする(盤面・
+    周回ログ・`queue` を保ち「再開」で続けられる)。401(キー不正)・`refusal`・`max_tokens`・
+    JSON 不正・検証失敗はそれ以外(非一時的)なので `err.transient` を付けず、従来どおり
+    `showError()` でエラー停止になる(復帰はリセットのみ)。この区別は「利用者の操作では直せない
+    一時的な事情か、それとも入力やキー設定など利用者側に直せる要因か」がおおまかな基準
 - **設定の保存**: `scc.claude_settings.v1` に `{ modelMode, model, thinking }`。`reset()` /
   `newPuzzle()` をまたいで保持し、次回開いたときに `loadClaudeSettings()` で復元する
 - **不変条件**(9 章 1 の Claude 版): Claude に送るボディにも `SOLUTION` 由来の情報を入れない。
@@ -337,8 +347,12 @@ var state = {
                        // commitFocused() で消える(次のマス選びまで出さない)
   lastSelection: null, // 直近のマス選び1件 { r, c, confidence, candidates, p }。
                        // p は probabilities[choice](= 選ばれたマス自身の確率)
-  lastCellRequest: null // 直近のマス選びでモデルに送ったリクエスト(Jev なら
+  lastCellRequest: null, // 直近のマス選びでモデルに送ったリクエスト(Jev なら
                        // askCellJev の応答の request、Claude なら送ったボディ)
+  pauseReason: null    // 一時的な失敗による停止の理由文言(Issue #43)。stop()(手動)
+                       // では null のまま。run() / reset() / newPuzzle() / stop() で
+                       // null に戻る。isPaused() かつこれが非 null のときだけ
+                       // renderCurrentPanel() が理由の箱を出す(4.4)
 };
 // 描画に不要な進行管理はモジュール変数
 var queue = [];                 // この周でまだ判定していないマス [{r,c}]
@@ -410,25 +424,28 @@ var compareGenerating = false;  // 「新しい問題」(比較シェル版)で�
 | `isCurrent(token)` | `state.running && token === runToken`。古い世代のコールバックを弾く(4.3) |
 | `isPaused()` | `started && !state.running && !state.done && !state.errorMessage`。「実行を始めた後、停止していて、完了もエラーもしていない」状態(SPEC F1、Issue #32)。`renderControls()` の「再開」ラベルと `renderCurrentPanel()` の「停止中」表示で使う |
 | `judgeCell(r,c,signal)` | `buildSnapshot()` を **ここで 1 回だけ** 作り、`state.modelMode` に応じて `judgeCellJev` / `judgeCellClaude` に渡す(両経路で盤面の作り方を共通にする)。戻り値はどちらも `{ probabilities, choice, confidence, request }` |
-| `judgeCellJev(puzzle,r,c,signal)` | `/api/judge` を `fetch`(`signal` をそのまま渡す。`focusNext` が渡す `inflightController.signal`)。非2xxは `Error` にして投げる(502 の `request` は `err.request` に載せる) |
-| `judgeCellClaude(puzzle,r,c,signal)` | `loadAnthropicKey()` が無ければ即 `Error`。`buildClaudeRequest()` のボディで `api.anthropic.com` を直接 `fetch`(3.6)。非 2xx・`refusal`・形式不正・ネットワーク失敗は `Error` に `request`(ボディ)を載せて投げる |
+| `judgeCellJev(puzzle,r,c,signal)` | `/api/judge` を `fetch`(`signal` をそのまま渡す。`focusNext` が渡す `inflightController.signal`)。非2xxは `Error` にして投げる(502 の `request` は `err.request` に載せる)。429 / 503 は `markJevTransientError()` で `err.transient=true` を付ける(429 は `Retry-After` ヘッダーがあれば `err.retryAfter` も。Issue #43) |
+| `markJevTransientError(error,res)` | Jev 経路(Worker)の一時的な失敗(Issue #43)の判定。`res.status` が 429 / 503 のときだけ `error.transient=true` を立て、429 なら `Retry-After` ヘッダーを `Number()` して有限なら `error.retryAfter` に入れる。`judgeCellJev` / `askCellJev` の両方が使う |
+| `judgeCellClaude(puzzle,r,c,signal)` | `loadAnthropicKey()` が無ければ即 `Error`。`buildClaudeRequest()` のボディで `api.anthropic.com` を直接 `fetch`(3.6)。非 2xx・`refusal`・形式不正・ネットワーク失敗は `Error` に `request`(ボディ)を載せて投げる。ネットワーク失敗、および `isTransientClaudeStatus(res.status)`(429 / 529 / 5xx)な非 2xx には `err.transient=true` も付ける(Issue #43) |
+| `isTransientClaudeStatus(status)` | Claude 経路の一時的な失敗(Issue #43)の判定。`status === 429 \|\| status === 529 \|\| (500 <= status < 600)` |
 | `buildClaudeRequest(puzzle,r,c)` / `claudeThinkingConfig(model,on)` / `parseClaudeAnswer(data,expectedKeys)` / `validateClaudeAnswer(answer,expectedKeys)` | Claude 経路のリクエスト組み立て(3.6)、モデル別 thinking、応答からの JSON 取り出し、Worker の `validateAnswer` と同じ検証。`expectedKeys` は省略時 `DIGITS`(Issue #38 で候補キー集合を引数に取る形へ一般化。Worker の `validateAnswer` と同じ考え方) |
 | `askCell(signal)` | 確信度順モード(Issue #38)のマス選び1回。`buildSelectionSnapshot()` を **ここで1回だけ** 作り、`state.modelMode` に応じて `askCellJev` / `askCellClaude` に渡す。戻り値はどちらも `{ probabilities, choice, confidence, request, cell }` |
-| `askCellJev(puzzle,signal)` | `/api/judge` に `{ puzzle, ask: "cell" }` を `fetch`(`target` は付けない)。`judgeCellJev` と同じ形でエラーを投げる |
-| `askCellClaude(puzzle,signal)` | `selectionKeys()` で候補キーを作り、`buildClaudeCellRequest(puzzle,keys)` のボディで `api.anthropic.com` を `fetch`(3.6)。`choice`(`"r0c2"`)を正規表現で座標に分解し `cell` として返す。分解できない(=候補外の応答)場合もエラーとして投げる |
+| `askCellJev(puzzle,signal)` | `/api/judge` に `{ puzzle, ask: "cell" }` を `fetch`(`target` は付けない)。`judgeCellJev` と同じ形でエラーを投げる(429 / 503 の `transient` / `retryAfter` も同じ `markJevTransientError()` で付く) |
+| `askCellClaude(puzzle,signal)` | `selectionKeys()` で候補キーを作り、`buildClaudeCellRequest(puzzle,keys)` のボディで `api.anthropic.com` を `fetch`(3.6)。`choice`(`"r0c2"`)を正規表現で座標に分解し `cell` として返す。分解できない(=候補外の応答)場合もエラーとして投げる(429 / 529 / 5xx・ネットワーク失敗の `transient` は `judgeCellClaude` と同じ) |
 | `buildClaudeCellRequest(puzzle,keys)` / `buildClaudeCellSchema(keys)` | 確信度順のマス選び(Claude 経路)のリクエスト組み立て(3.6)。`buildClaudeRequest` と同じ `thinking` / `max_tokens` の規則を共有する |
 | `loadAnthropicKey()` / `saveAnthropicKey(key)` / `saveAnthropicKeyFromInput()` / `clearAnthropicKey()` / `anthropicKeyHint()` | キーの読み書き(`scc.anthropic_key.v1`)。画面には末尾 4 文字だけ |
 | `loadClaudeSettings()` / `saveClaudeSettings()` / `setModelMode(mode)` / `setClaudeModel(model)` / `setClaudeThinking(on)` / `modelSettingsLocked()` / `currentModelId()` | モデル設定(`scc.claude_settings.v1`)。実行中・停止中(`isPaused()`)はロックして切り替えない。`currentModelId()` は記録の `m` に入れる識別子 |
 | `setOrderMode(mode)` | 順番トグル(Issue #38)。`modelSettingsLocked()` と同じ条件でロックする(周の途中でマスの選び方が混ざらないように)。`localStorage` には保存しない |
 | `focusNext()` | 先頭で `runToken` を捕まえ、`queue` が空なら `finalizeRound()`。`state.orderMode === "confidence"` なら `selectNextCell(token)` に委譲して `return`。そうでなければ(scan)`queue` から1つ取り出して `focusCellForDigit(cell, token)` を呼ぶ |
-| `selectNextCell(token)` | 確信度順モード(Issue #38)のマス選び。`state.selecting=true` にして描画 →(リクエストごとに新しい `AbortController` を `inflightController` に作って)`askCell` → `result.request` があれば先に `state.lastCellRequest` に保存(失敗しても「マス選び」のプロンプトを表示できるように)→ `result.cell` が `queue` に無ければ `showError("選ばれたマスが候補にありません: …")` して `return` → `result.probabilities`(`"r0c2"` 形式)を `"r-c"` 形式に変換して `state.cellProbs`(と最大値 `state.cellProbsMax`。ヒートマップ用)に、`state.lastSelection` に `{ r, c, confidence, candidates: probabilities のキー数, p: probabilities[choice] }` を保存 → `queue.splice(idx,1)` で選ばれたマスを取り除き `state.selecting=false` → `focusCellForDigit(cell, token)`(この中で描画)。`AbortError` は無視、それ以外の失敗は `err.request` があれば `state.lastCellRequest` に保存してから `showError` |
-| `focusCellForDigit(cell,token)` | 1マスの数字判定本体(従来の `focusNext()` の中身そのもの。Issue #38 で `focusNext` / `selectNextCell` の両方から呼べるように抽出した)。フォーカス→(新しい `AbortController` で)`judgeCell`→バー表示・`result.request` があれば `state.lastRequest` に保存(Issue #34)→(待ち)→`commitFocused`→(待ち)→`focusNext()` で次へ。`judgeCell` が `AbortError` で reject したときは(世代トークンの判定と同じ扱いで)無視して `return` し、`showError` には流さない(4.3、Issue #19)。それ以外の失敗で `err.request` があれば(`judgeCell` が 502 の `request` を載せる)`state.lastRequest` に保存して `lastRequestFailed=true` にしてから `showError`(Issue #34) |
+| `selectNextCell(token)` | 確信度順モード(Issue #38)のマス選び。`state.selecting=true` にして描画 →(リクエストごとに新しい `AbortController` を `inflightController` に作って)`askCell` → `result.request` があれば先に `state.lastCellRequest` に保存(失敗しても「マス選び」のプロンプトを表示できるように)→ `result.cell` が `queue` に無ければ `showError("選ばれたマスが候補にありません: …")` して `return` → `result.probabilities`(`"r0c2"` 形式)を `"r-c"` 形式に変換して `state.cellProbs`(と最大値 `state.cellProbsMax`。ヒートマップ用)に、`state.lastSelection` に `{ r, c, confidence, candidates: probabilities のキー数, p: probabilities[choice] }` を保存 → `queue.splice(idx,1)` で選ばれたマスを取り除き `state.selecting=false` → `focusCellForDigit(cell, token)`(この中で描画)。`AbortError` は無視、それ以外の失敗は `err.request` があれば `state.lastCellRequest` に保存し、`err.transient`(Issue #43)なら `pauseForTransientError(err)` に分岐して `return`、そうでなければ従来どおり `showError` |
+| `focusCellForDigit(cell,token)` | 1マスの数字判定本体(従来の `focusNext()` の中身そのもの。Issue #38 で `focusNext` / `selectNextCell` の両方から呼べるように抽出した)。フォーカス→(新しい `AbortController` で)`judgeCell`→バー表示・`result.request` があれば `state.lastRequest` に保存(Issue #34)→(待ち)→`commitFocused`→(待ち)→`focusNext()` で次へ。`judgeCell` が `AbortError` で reject したときは(世代トークンの判定と同じ扱いで)無視して `return` し、`showError` には流さない(4.3、Issue #19)。それ以外の失敗で `err.request` があれば(`judgeCell` が 502 の `request` を載せる)`state.lastRequest` に保存して `lastRequestFailed=true` にしてから、`err.transient`(Issue #43)なら `pauseForTransientError(err)` に分岐して `return`、そうでなければ従来どおり `showError`(Issue #34) |
 | `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong`/`state.lastJudgment` を更新。`pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない。正誤が確定するこの時点で `appendRecord()` を呼び、集計ビュー用の1件(`m: currentModelId()` 付き)を記録する。`state.cellProbs` もここで `null` に戻す(Issue #38。次のマス選びまでヒートマップを出さない) |
 | `finalizeRound()` | ログ追記→`shouldStop` の結果で完了 / 強制終了 / 次の周(`queue = nextQueue(roundWrong)`)。「次の周」のときは、between-round の `setTimeout` を張る**前**に `state.round` / `queue` / `roundSize` / `roundTally` を更新する。この順序のおかげで、待ち時間中に `stop()` されても次の周の状態が既に確定している(下記 `stop()`、Issue #32) |
-| `stop()` | 実行中の停止(SPEC F1、Issue #32)。`reset()` と同じく `runToken` を進めて in-flight の `/api/judge`(`inflightController.abort()`)と予約済みの `setTimeout` を無効化するが、`reset()` と違って **`state.values` / `state.round` / `state.roundLog` / `roundTally` / `roundSize` / `queue` / `started` は捨てない**。`state.focusedKey` があれば(= 判定中のマスがまだ `commitFocused()` されていない)、その結果を破棄して記録(`appendRecord`)にも残さず、`queue.unshift({r,c})` で queue の先頭に戻す(再開したら同じマスをもう一度聞く。SPEC F2)。周をまたぐ待ち時間中(`finalizeRound()` の between-round の `setTimeout` 待ち)に呼ばれた場合は、その時点で `focusedKey` は既に `null`(`commitFocused()` で消えている)なので何もすることがなく、次の周の先頭から再開する(`finalizeRound()` の更新順序による。SPEC F3)。`state.done` / `state.errorMessage` のときは何もしない(両者は常に `running=false` とセットで立つので `state.running` を見るだけで判定できる)。**確信度順モード中の停止(Issue #38)**: `state.selecting`(マス選び中)なら無条件で `state.selecting=false` / `state.cellProbs=null` にする。選ばれたマスはまだ `queue` から取り除いていない(選び終わって `splice` して初めて取り除く)ので、`focusedKey` が無い限り再キューは不要。再開(`run()`)はマス選びからやり直す |
-| `run()` | 初回のみ queue を全空マスで初期化し `focusNext` を開始。`started` が既に true なら(= `stop()` した後の再開)queue を作り直さず `focusNext()` を呼ぶだけなので、`stop()` が保った進行状態からそのまま続く(確信度順モードで停止していた場合も、queue は変わっていないのでマス選びからやり直す形で自然に再開する) |
-| `reset()` | `runToken` を進め、`inflightController` があれば `abort()` して in-flight の `/api/judge` を打ち切り、進行管理と `state` を初期化(`speedMode` / `difficulty` / `orderMode` は維持。`lastRequest` / `lastCellRequest` / `lastSelection` も `null` に戻す)(Issue #19、#21、#34、#38) |
-| `showError(message)` | `runToken` を進め、`inflightController` があれば `abort()` して `state.errorMessage` を立て、`running=false` で止める(不変条件4、Issue #19) |
+| `stop()` | 実行中の停止(SPEC F1、Issue #32)。`reset()` と同じく `runToken` を進めて in-flight の `/api/judge`(`inflightController.abort()`)と予約済みの `setTimeout` を無効化するが、`reset()` と違って **`state.values` / `state.round` / `state.roundLog` / `roundTally` / `roundSize` / `queue` / `started` は捨てない**。`state.focusedKey` があれば(= 判定中のマスがまだ `commitFocused()` されていない)、その結果を破棄して記録(`appendRecord`)にも残さず、`queue.unshift({r,c})` で queue の先頭に戻す(再開したら同じマスをもう一度聞く。SPEC F2)。周をまたぐ待ち時間中(`finalizeRound()` の between-round の `setTimeout` 待ち)に呼ばれた場合は、その時点で `focusedKey` は既に `null`(`commitFocused()` で消えている)なので何もすることがなく、次の周の先頭から再開する(`finalizeRound()` の更新順序による。SPEC F3)。`state.done` / `state.errorMessage` のときは何もしない(両者は常に `running=false` とセットで立つので `state.running` を見るだけで判定できる)。**確信度順モード中の停止(Issue #38)**: `state.selecting`(マス選び中)なら無条件で `state.selecting=false` / `state.cellProbs=null` にする。選ばれたマスはまだ `queue` から取り除いていない(選び終わって `splice` して初めて取り除く)ので、`focusedKey` が無い限り再キューは不要。再開(`run()`)はマス選びからやり直す。手動停止には理由が無いので `state.pauseReason=null` にする(下記 `pauseForTransientError()` と区別する。Issue #43) |
+| `pauseForTransientError(err)` | 一時的な失敗による停止(Issue #43、SPEC F5)。`judgeCell*` / `askCell*` が `err.transient=true` で投げてきたときに `showError()` の代わりに呼ぶ。**`stop()` と同じ後始末**(`runToken` を進めて in-flight を abort、`running=false`、判定中のマスは `queue` の先頭に戻し `pendingCommit` を破棄、`selecting=false` / `cellProbs=null`)をするが、`state.errorMessage` は立てない(= `isPaused()` は true のまま)。`state.pauseReason` に理由文言(`"一時的な失敗で停止しました: " + err.message`。`err.retryAfter` が数値なら `"(N秒後に再試行できます)"` を挟む)をセットする。`state.values` / `roundLog` / `roundTally` / `roundSize` / `queue` / `started` は `stop()` と同じく捨てない。記録(`appendRecord`)は呼ばない(判定が確定していないため) |
+| `run()` | 初回のみ queue を全空マスで初期化し `focusNext` を開始。`started` が既に true なら(= `stop()` / `pauseForTransientError()` した後の再開)queue を作り直さず `focusNext()` を呼ぶだけなので、保たれた進行状態からそのまま続く(確信度順モードで停止していた場合も、queue は変わっていないのでマス選びからやり直す形で自然に再開する)。冒頭で `state.pauseReason=null` にする(一時的な失敗からの再開で理由表示を消す。手動停止からの再開はもともと `null` なので無害。Issue #43) |
+| `reset()` | `runToken` を進め、`inflightController` があれば `abort()` して in-flight の `/api/judge` を打ち切り、進行管理と `state` を初期化(`speedMode` / `difficulty` / `orderMode` は維持。`lastRequest` / `lastCellRequest` / `lastSelection` / `pauseReason` も `null` に戻す)(Issue #19、#21、#34、#38、#43) |
+| `showError(message)` | `runToken` を進め、`inflightController` があれば `abort()` して `state.errorMessage` を立て、`running=false` で止める(不変条件4、Issue #19)。以前の `pauseReason` が残っていても `null` に戻す(エラー停止が優先されるので理由の表示は不要。Issue #43) |
 | `setSpeed(mode)` | `state.speedMode` を切り替えて再描画。実行中でも切り替えられる(4.4) |
 | `setDifficulty(mode)` | `state.difficulty`(`"easy"` / `"normal"` / `"hard"`)を切り替えて再描画。変えただけでは盤面は変わらず、次の `newPuzzle()` の目標ヒント数に効く(Issue #21) |
 | `render()` | `state` から DOM(グリッド・統計・バー・ログ・集計パネル・バナー・ボタン)を **全部 innerHTML で再生成**。周回ログのスクロール位置だけは引き継ぐ |
@@ -448,7 +465,7 @@ var compareGenerating = false;  // 「新しい問題」(比較シェル版)で�
 | `clearRecords()` | `confirm()` で確認したうえで `saveRecords([])` し、再描画する |
 | `readUrlOptions()` / `applyUrlOptions(opts)` / `parseQueryString(search)` / `parsePuzzleString(str)` / `applyPuzzleFromString(str)` | URL パラメータ(Issue #46、SPEC F1')。`readUrlOptions()` は `location.search` を1回読んでパースするだけ(副作用なし)。`applyUrlOptions()` がそれを `state.modelMode` / `state.orderMode` / `state.speedMode` / `embedMode` に反映し、`puzzle` があれば `applyPuzzleFromString()` に渡す。`applyPuzzleFromString()` は `newPuzzle()` の「盤面差し替え」部分(`GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize`)をジェネレーターの代わりに一意解チェック(`solveCount(rows, 2, solutions)`)だけで行う共通処理で、埋め込みモードの `message` の `newPuzzle` からも呼ぶ |
 | `countCorrectValues()` | `state.values` で `status === "correct"` の件数。`renderStats()` と `postStatus()` の両方が使う(重複計算を避ける) |
-| `postStatus()` | 埋め込みモード(`embedMode`)の `render()` のたびに呼ばれる。`window.parent === window`(iframe でない)なら何もしない。`{ type:"status", model, round, correct, total, remaining, running, paused, done, roundsToSolve, stoppedAtLimit, errorMessage }` を `window.parent.postMessage(payload, location.origin)` する(SPEC F1') |
+| `postStatus()` | 埋め込みモード(`embedMode`)の `render()` のたびに呼ばれる。`window.parent === window`(iframe でない)なら何もしない。`{ type:"status", model, round, correct, total, remaining, running, paused, pauseReason, done, roundsToSolve, stoppedAtLimit, errorMessage }` を `window.parent.postMessage(payload, location.origin)` する(SPEC F1'、`pauseReason` は Issue #43)。比較シェルの `compareStatusText()` はこれを見て `paused && pauseReason` なら「停止中(一時的な失敗)」を出す |
 | `setupEmbedMessageListener()` | 埋め込みモードの起動時に1回呼ぶ。`window.addEventListener("message", ...)` で親からの操作を受け、`event.origin === location.origin` のときだけ `run()` / `stop()` / `reset()` / (`newPuzzle` なら `applyPuzzleFromString()` → `reset()`) / `setSpeed()` / `setOrderMode()` を呼ぶ |
 | `renderCompareShell()` / `compareRun()` / `compareStop()` / `compareReset()` / `compareNewPuzzle()` / `compareSetSpeed()` / `compareSetOrderMode()` / `compareSetDifficulty()` / `updateCompareStatus()` / `setupCompareMessageListener()` | 比較シェル(`GET /compare`、Issue #46、8章)。`renderCompareShell()` は `app.innerHTML` を**最初の1回だけ**組み立て(上部バー・2つの `<iframe class="compare-frame">`・各ステータス欄)、直後に `document.querySelectorAll(".compare-topbar" / ".compare-status" / ".compare-frame")` で要素を拾って `compareEls` / `compareFrames` に保持する。以後の更新(`compareRun()` 等)は `app.innerHTML` を触らず、`compareEls.topbar.innerHTML` / `compareEls.statusJev.innerHTML` / `compareEls.statusClaude.innerHTML` だけを差し替える(iframe の再読み込みを避けるため)。`comparePostToFrames(message)` が両 `iframe.contentWindow` に同じメッセージを `postMessage(message, location.origin)` する。`setupCompareMessageListener()` は子からの `status` メッセージ(`event.origin` と `event.source`(どちらの `contentWindow` か)を確認)を `updateCompareStatus()` に振り分ける |
 
@@ -459,7 +476,8 @@ idle ──run()──▶ focusNext()
                  │ token = runToken(この呼び出しの世代を捕まえる)
                  │ focusedKey=key, currentProbs=null, render()
                  ▼
-              judgeCell()  ── 失敗 ──▶ showError(), running=false, 停止
+              judgeCell()  ── 失敗(err.transient) ──▶ pauseForTransientError(err), paused
+                 │           ── 失敗(それ以外)     ──▶ showError(), running=false, 停止
                  │ 成功
                  ▼
             currentProbs=probs, pendingCommit={...}, render()
@@ -470,13 +488,25 @@ idle ──run()──▶ focusNext()
                  ▼
             queue 残あり → focusNext() / 空 → finalizeRound()
 
-  (どの待ちの最中でも) ──stop()──▶ paused
+  (どの待ちの最中でも) ──stop()──▶ paused(pauseReason=null。手動停止)
                  │ runToken+=1, inflightController があれば abort()
                  │ running=false。values/round/roundLog/roundTally/roundSize/queue/started は保持
                  │ focusedKey があれば(未 commit)queue の先頭に戻し、pendingCommit を破棄
                  ▼
-  paused ──run()──▶ focusNext()(started が true なので queue を作り直さず続きから)
+  paused ──run()──▶ focusNext()(started が true なので queue を作り直さず続きから。pauseReason=null)
 ````
+
+**一時的な失敗による停止(`pauseForTransientError()`、Issue #43、SPEC F5)。** `judgeCell()`
+(または `askCell()`。下記)が投げた `Error` に `err.transient=true` が付いているときは、
+`showError()` の代わりにこちらへ分岐する。中身は `stop()` と同じ後始末(`runToken` を進めて
+in-flight を abort、判定中のマスは `queue` の先頭に戻す)をしつつ、`state.errorMessage` を
+立てず `state.pauseReason` に理由文言を持たせる点だけが違う(`isPaused()` は `stop()` と同じ
+く true になり、盤面・周回ログ・`queue` も同じく保たれる)。「再開」(`run()`)を押すと
+`pauseReason=null` に戻り、同じマス(`queue` の先頭に戻した、まだ確定していないマス)を
+もう一度聞き直す。`err.transient` が付くのは Claude 経路の HTTP 429/529/5xx・ネットワーク
+失敗(`judgeCellClaude` / `askCellClaude`)、Jev 経路(Worker)の HTTP 429(レート制限。
+`err.retryAfter` に `Retry-After` ヘッダーの秒数も付く)/ 503(カウンタ障害。
+`judgeCellJev` / `askCellJev`)。判定は確定していないので `appendRecord()` は呼ばない。
 
 **確信度順モード(Issue #38)は `focusNext()` の先頭にマス選びが入る。** `state.orderMode
 === "confidence"` のときだけ、`focusNext()` は `queue` から直接取り出さず `selectNextCell()`
@@ -489,15 +519,16 @@ focusNext()(orderMode==="confidence"、queueに残あり)
             selectNextCell(token)
                  │ selecting=true, focusedKey=null, cellProbs=null, render()
                  ▼
-              askCell()  ── 失敗 ──▶ showError(), 停止
+              askCell()  ── 失敗(err.transient) ──▶ pauseForTransientError(err), paused(queueは変更しない)
+                 │           ── 失敗(それ以外)     ──▶ showError(), 停止
                  │ 成功(result.cell が queue に無ければ showError)
                  ▼
       cellProbs=…, lastSelection=…, queue.splice(idx,1), selecting=false, render()
                  ▼
             focusCellForDigit(cell, token)  ── 以降は上の1マス判定と同じ
 
-  (マス選び中に)──stop()──▶ selecting=false, cellProbs=null(queueは変更しない)
-  paused ──run()──▶ focusNext() ── orderMode==="confidence" のマス選びからやり直す
+  (マス選び中に)──stop()──▶ selecting=false, cellProbs=null(queueは変更しない、pauseReason=null)
+  paused ──run()──▶ focusNext() ── orderMode==="confidence" のマス選びからやり直す(pauseReason=null)
 ````
 
 **停止/再開(`stop()`、Issue #32、SPEC F1〜F3)。** `stop()` は `reset()` と同じく世代
@@ -515,8 +546,8 @@ between-round の `setTimeout` 待ち)の最中に呼ばれた場合は、`final
 `running=false` とセットで立つので、`stop()` は `state.running` を見るだけで判定できる
 (`if (!state.running) return;`)。
 
-**実行世代(`runToken`)のルール。** `reset()` と `showError()` と `stop()` は `runToken` を
-1つ進める。`focusNext()` / `finalizeRound()` は入口で `var token = runToken;` と世代を捕まえ、
+**実行世代(`runToken`)のルール。** `reset()` と `showError()` と `stop()`(と、`stop()` と同じ
+後始末をする `pauseForTransientError()`、Issue #43)は `runToken` を1つ進める。`focusNext()` / `finalizeRound()` は入口で `var token = runToken;` と世代を捕まえ、
 その後の `then` / 失敗ハンドラ / `setTimeout` のコールバックは **すべて先頭で
 `isCurrent(token)`(= `state.running && token === runToken`)を確認し、偽なら何もせずに
 return する**。`stop()` は `state.running` を `false` にするので、`isCurrent()` は
@@ -559,15 +590,19 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
 - 停止中(`isPaused()`)は「現在の判定」パネルを「停止中(残り N マス)」(N は `queue.length`)
   に差し替える。フォーカスの枠線は `stop()` が `state.focusedKey` を `null` にするので
   `buildCellStyle` 側の既存ロジックで自然に消える(新しく分岐を足していない。Issue #32)。
-  実行ボタン(`#run-btn`)は実行中は「停止」(`onclick="stop()"`)、停止中は「再開」
-  (`onclick="run()"`、無効化しない)、それ以外(未実行・完了・エラー・生成中)は「実行」
-  (完了・エラー・生成中は無効化)を出す
+  一時的な失敗による停止(Issue #43)は `state.pauseReason` があればその下に理由の箱
+  (`class="pause-reason"`)を添える。手動停止(`stop()`、`pauseReason` が `null` のまま)
+  では出ない。実行ボタン(`#run-btn`)は実行中は「停止」(`onclick="stop()"`)、停止中は
+  「再開」(`onclick="run()"`、無効化しない。一時的な失敗の停止でも同じ)、それ以外
+  (未実行・完了・エラー・生成中)は「実行」(完了・エラー・生成中は無効化)を出す
 - 「モデルに送ったプロンプト」パネル(`renderPromptPanel`)は「現在の判定」パネルとは独立して
   `state.lastRequest`(と `lastRequestFailed`)だけを見る。停止中・エラー中でも直前の値をそのまま出し続け、
   `isPaused()` のような特別扱いはしない(消えるのは `reset()` / `newPuzzle()` のときだけ。
   Issue #34)。502 で失敗した判定の `request` は「(このプロンプトで失敗)」付きで表示し、
-  `request` の無いエラー(400/429/503)では直前の値が残る。`<pre>` は `white-space: pre-wrap`
-  で長い `note` を折り返す(1 判定あたりレスポンスは約 1KB 増える。定数 `NOTE` が大半)
+  `request` の無いエラー(400 など)や一時的な失敗による停止(429/503/529/5xx・ネットワーク
+  失敗、Issue #43。`judgeCellClaude` の非 2xx を除き通常 `request` が無い)では直前の値が
+  残る。`<pre>` は `white-space: pre-wrap` で長い `note` を折り返す(1 判定あたりレスポンスは
+  約 1KB 増える。定数 `NOTE` が大半)
 - **確信度順モード(Issue #38)** は `state.orderMode` だけで分岐し、`buildCellStyle` /
   `renderCurrentPanel` / `renderPromptPanel` / `renderLegend` / `renderControls` の既存の
   関数にロジックを足す形にしてある(専用のコンポーネントを新設しない)。ヒートマップは
@@ -731,6 +766,12 @@ new_sqlite_classes = ["RateLimitCounter"]
     - W5: 2周目(1周目で1マス不正解になるスタブ)のマス選びの候補(`ask:"cell"` の `puzzle` の空マス)が不正解マスだけになること。周回ログの形式は従来どおり
     - W6: Claude 経路のマス選びのリクエストが `api.anthropic.com` へ行き、スキーマの `choice.enum` / `probabilities.required` が `selectionKeys()` と一致し、`system` が `CELL_NOTE` を含むこと(vm レルムの配列は `Array.prototype.slice.call` で host 側に移し替えてから比較する。hostRows と同じ理由)
     - W7: 確信度順でヒートマップの背景(`rgba(125, 211, 252`)がグリッドに出て、選択後にパネルへ「マス選び: N 候補中」が出ること。実行中は順番トグルが `disabled` になること
+  - **一時的な失敗 → 停止**(`test/page.test.js` Y1〜Y5、Issue #43)。S/T/W 系と同じ `runScript` / `makeAbortAwareFetch` / `waitFor` を使う
+    - Y1: Claude の 429 で `errorMessage` は立たず `isPaused()` が true、`pauseReason` に「429」を含むこと。`state.values` / `roundLog` / `queue` / 記録が保たれ、判定中だったマスが `queue` の先頭に戻ること。`run()` で `pauseReason` が消え、同じマスの `fetch` がもう一度飛ぶこと
+    - Y2: Claude の 529 / 500 も停止扱い(`pauseReason` にステータスコードを含む)。401 / `refusal` / 形式不正が従来どおり `showError()` になることは V4 で確認済み(V4 のネットワーク失敗のケースも Issue #43 で停止扱いに変わったため、V4 内で `isPaused()` 待ちに更新した)
+    - Y3: Jev の 429(`Retry-After: 30` ヘッダー付き)で `pauseReason` に「30」を含むこと。503 も停止扱い。400 / 502 は従来どおり `showError()`(`isPaused()` は false)であること
+    - Y4: 確信度順のマス選び中(`state.selecting`)の Jev 429 も停止扱いで、`queue` の長さが変わらないこと。`run()` で再開するとマス選びからやり直すこと
+    - Y5: `renderCurrentPanel()` が `isPaused() && state.pauseReason` のときだけ `class="pause-reason"` の箱を出し、手動 `stop()`(`pauseReason===null`)では出ないこと。`postStatus()` の payload に `pauseReason` が乗ること。`compareStatusText()` が `paused && pauseReason` のとき「停止中(一時的な失敗)」を返すこと
   - **比較モード**(`test/page.test.js` X1〜X4、Issue #46)。`runScript` の harness に `opts.location`(`{ pathname, search, origin }`、既定 `{ pathname:"/", search:"", origin:"https://example.com" }`)と `opts.window`(`{ parent, addEventListener, postMessage }`、既定は自分自身が `parent` の自己参照オブジェクト)を追加。`opts.document` は丸ごと差し替えられる(比較シェルの iframe / `querySelectorAll` を検査する X4 用)
     - X1: `puzzle=` で `GIVEN` / `SOLUTION` / `TOTAL_EMPTY` が差し替わること。矛盾した盤面(解0個)・形式不正(長さ81でない)はいずれも無視され、固定問題のままであること
     - X2: `model=claude&order=confidence&speed=fast` で初期 `state` が変わること。`localStorage`(`scc.claude_settings.v1`)には一切書き戻らないこと。既定(`location.pathname==="/"`、`search:""`)では従来どおり(`jev`/`scan`/`slow`)であること
