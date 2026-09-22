@@ -48,10 +48,17 @@ test("正常入力で 200 と9キーの probabilities が返る", async () => {
   var out = await judge(validBody());
   assert.equal(out.res.status, 200);
   assert.equal(out.res.headers.get("content-type"), "application/json; charset=utf-8");
-  assert.deepEqual(Object.keys(out.body).sort(), ["choice", "confidence", "probabilities"]);
+  assert.deepEqual(Object.keys(out.body).sort(), ["choice", "confidence", "probabilities", "request"]);
   assert.deepEqual(Object.keys(out.body.probabilities), ["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
   assert.equal(out.body.choice, "4");
   assert.equal(out.body.confidence, 0.31);
+});
+
+test("200: request は env.AI.run に渡したペイロードそのもの(Issue #34)", async () => {
+  var out = await judge(validBody());
+  assert.equal(out.res.status, 200);
+  assert.deepStrictEqual(out.env.aiCalls.length, 1);
+  assert.deepStrictEqual(out.body.request, out.env.aiCalls[0].payload);
 });
 
 test("confidence は Jev の値をそのまま通す(probabilities[choice] に置き換えない)", async () => {
@@ -70,7 +77,7 @@ test("ラッパーの無い素のレスポンスでも 200(ゲートウェイが
   var res = await worker.fetch(judgeRequest(validBody()), env);
   assert.equal(res.status, 200);
   var body = await res.json();
-  assert.deepEqual(Object.keys(body).sort(), ["choice", "confidence", "probabilities"]);
+  assert.deepEqual(Object.keys(body).sort(), ["choice", "confidence", "probabilities", "request"]);
   assert.equal(body.choice, "4");
   assert.equal(body.confidence, 0.31);
   assert.deepEqual(Object.keys(body.probabilities), ["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
@@ -256,6 +263,24 @@ test("502: AI.run が例外を投げる", async () => {
   assert.equal(typeof body.error, "string");
   assert.ok("raw" in body);
   assert.ok(String(body.raw).includes("upstream exploded"));
+  // 502(AI呼び出し失敗)にも request が付く(Issue #34)。
+  assert.deepStrictEqual(body.request, env.aiCalls[0].payload);
+});
+
+test("502: 応答の形が不正なときも request が付く(Issue #34)", async () => {
+  var env = makeEnv({ aiResult: { answers: {} } });
+  var res = await worker.fetch(judgeRequest(validBody()), env);
+  assert.equal(res.status, 502);
+  var body = await res.json();
+  assert.deepStrictEqual(body.request, env.aiCalls[0].payload);
+});
+
+test("400 には request が付かない(Issue #34、まだ payload を組み立てていない)", async () => {
+  var env = makeEnv();
+  var res = await worker.fetch(judgeRequest({ puzzle: validBody().puzzle }), env);
+  assert.equal(res.status, 400);
+  var body = await res.json();
+  assert.equal("request" in body, false);
 });
 
 test("400 と 502 にも X-RateLimit-Remaining-* が付く(どちらも1回として数えるため)", async () => {
@@ -410,5 +435,5 @@ test("余計なキーが付いた answers.digit は 200(絞って返す)", async
   var res = await worker.fetch(judgeRequest(validBody()), env);
   assert.equal(res.status, 200);
   var body = await res.json();
-  assert.deepEqual(Object.keys(body).sort(), ["choice", "confidence", "probabilities"]);
+  assert.deepEqual(Object.keys(body).sort(), ["choice", "confidence", "probabilities", "request"]);
 });

@@ -559,6 +559,9 @@ async function handleJudge(request, env) {
       {
         error: "AIの呼び出しに失敗しました",
         raw: truncate(String((err && err.message) || err)),
+        // env.AI.run に渡したペイロードそのもの(Issue #34)。失敗時もフロントで
+        // 「何を送って失敗したか」を確認できるように添える。
+        request: payload,
       },
       502,
       rate.headers
@@ -572,7 +575,12 @@ async function handleJudge(request, env) {
     // AI.run が undefined を解決したとき、そのままだと raw のキーごと JSON から消える。
     // デバッグ用に「何が返ってきたか」を必ず残したいので null に寄せる。
     return jsonResponse(
-      { error: badAnswer, raw: rawForResponse(result === undefined ? null : result) },
+      {
+        error: badAnswer,
+        raw: rawForResponse(result === undefined ? null : result),
+        // env.AI.run に渡したペイロードそのもの(Issue #34)。
+        request: payload,
+      },
       502,
       rate.headers
     );
@@ -585,6 +593,9 @@ async function handleJudge(request, env) {
       choice: answer.choice,
       // Jev 独自の確信度。probabilities[choice] とは一致しない(docs/SPEC.md 4章)。
       confidence: answer.confidence,
+      // env.AI.run に渡したペイロードそのもの(Issue #34)。フロントの「Jev に送った
+      // プロンプト」パネルがそのまま表示する。別のオブジェクトを組み立て直さない。
+      request: payload,
     },
     200,
     rate.headers
@@ -740,6 +751,19 @@ var PAGE_HTML = `<!doctype html>
   .bar-fill { height: 100%; border-radius: 4px; }
   .bar-pct { text-align: right; font-family: "IBM Plex Mono", monospace; color: var(--muted); }
   .muted { color: var(--muted); font-size: 13px; margin: 0; }
+  .prompt-json {
+    overflow: auto;
+    max-height: 320px;
+    white-space: pre;
+    font-family: "IBM Plex Mono", "Courier New", monospace;
+    font-size: 12px;
+    color: var(--muted);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 10px 12px;
+    margin: 0;
+  }
 
   #round-log ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
   #round-log li { font-size: 12px; font-family: "IBM Plex Mono", monospace; color: var(--muted); }
@@ -1167,7 +1191,8 @@ var PAGE_HTML = `<!doctype html>
     difficulty: DEFAULT_DIFFICULTY, // "easy" | "normal" | "hard"(SPEC F1)。次の newPuzzle() から効く
     errorMessage: null,
     stoppedAtLimit: false,
-    lastJudgment: null // 直前に確定した1件(最速モードでも結果が見えるように残す)
+    lastJudgment: null, // 直前に確定した1件(最速モードでも結果が見えるように残す)
+    lastRequest: null // 直近の判定で Worker が Jev に渡したペイロード(request、Issue #34)
   };
   // 描画に不要な進行管理はモジュール変数(docs/DESIGN.md 4.1)
   var queue = [];
@@ -1341,6 +1366,11 @@ var PAGE_HTML = `<!doctype html>
         return { digit: d, pct: Math.round((typeof p === "number" ? p : 0) * 100), isPick: d === result.choice };
       });
       state.currentProbs = probs;
+      // Worker が Jev に渡したペイロードそのもの(Issue #34)。停止中でも消さず、
+      // 次の判定が確定するまで(エラー時もそのまま)残す。
+      if (result.request && typeof result.request === "object") {
+        state.lastRequest = result.request;
+      }
       pendingCommit = { r: cell.r, c: cell.c, choice: result.choice, confidence: result.confidence, probabilities: result.probabilities };
       render();
       var beforeCommitMs = state.speedMode === "slow" ? SLOW_BEFORE_COMMIT_MS : FAST_BEFORE_COMMIT_MS;
@@ -1536,7 +1566,8 @@ var PAGE_HTML = `<!doctype html>
       difficulty: keepDifficulty,
       errorMessage: null,
       stoppedAtLimit: false,
-      lastJudgment: null
+      lastJudgment: null,
+      lastRequest: null
     };
     queue = [];
     roundWrong = [];
@@ -1774,6 +1805,25 @@ var PAGE_HTML = `<!doctype html>
     return head + "<p class=\\"muted\\">待機中</p>" + tail;
   }
 
+  // 「Jev に送ったプロンプト」パネル(Issue #34)。Worker が env.AI.run に渡した
+  // ペイロード(request)をそのまま JSON で表示する。フロント側で組み立て直さない
+  // (handleJudge と二重管理にしないため)。停止中・エラー時も直近の値を残す。
+  function renderPromptPanel() {
+    var head = "<div id=\\"prompt-panel\\" class=\\"panel\\"><p class=\\"panel-title\\">Jev に送ったプロンプト</p>";
+    var tail = "</div>";
+    var req = state.lastRequest;
+    if (!req) {
+      return head + "<p class=\\"muted\\">まだ判定していません(実行すると直近の判定に使ったプロンプトが表示されます)</p>" + tail;
+    }
+    var target = req.state && req.state.target;
+    var usedFor = "";
+    if (target && typeof target.row === "number" && typeof target.col === "number") {
+      usedFor = "<p class=\\"muted\\">" + escapeHtml(coordLabel(target.row, target.col)) + " の判定に使用</p>";
+    }
+    return head + usedFor +
+      "<pre class=\\"prompt-json\\">" + escapeHtml(JSON.stringify(req, null, 2)) + "</pre>" + tail;
+  }
+
   function renderRoundLog() {
     if (state.roundLog.length === 0) {
       return "<div id=\\"round-log\\" class=\\"panel\\"><p class=\\"panel-title\\">周回ログ</p><p class=\\"muted\\">まだ記録はありません</p></div>";
@@ -1944,6 +1994,7 @@ var PAGE_HTML = `<!doctype html>
       renderControls() +
       renderStats() +
       renderCurrentPanel() +
+      renderPromptPanel() +
       renderRoundLog() +
       renderCalibration() +
       renderBanner() +

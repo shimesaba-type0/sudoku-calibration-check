@@ -1326,15 +1326,44 @@ function makeAbortError() {
   return err;
 }
 
+/**
+ * Worker が実際に env.AI.run へ渡すペイロード(src/index.js handleJudge の `payload`)
+ * を模したもの。/api/judge のレスポンスに足す `request` フィールドのモック用
+ * (Issue #34)。中身の一致は検証しないので puzzle は簡略化したものでよい。
+ */
+function makeRequestPayload(puzzle, row, col) {
+  var criteria = {};
+  for (var d = 1; d <= 9; d++) criteria[String(d)] = "the digit " + d;
+  return {
+    state: {
+      puzzle: puzzle,
+      target: { row: row, col: col },
+      note: "puzzle is a 9x9 Sudoku grid",
+    },
+    questions: {
+      digit: {
+        type: "choice",
+        instructions: "Which digit from 1 to 9 belongs in the target cell of this Sudoku grid?",
+        criteria: criteria,
+      },
+    },
+  };
+}
+
 /** 正解をそのまま返す /api/judge のレスポンス(常に正解 ⇒ 1周で完了する)。 */
-function makeCorrectResponse(ctx, row, col) {
+function makeCorrectResponse(ctx, row, col, puzzle) {
   var digit = ctx.SOLUTION[row][col];
   var probabilities = {};
   for (var d = 1; d <= 9; d++) probabilities[String(d)] = String(d) === digit ? 0.9 : 0.0125;
   return {
     ok: true,
     json: async function () {
-      return { probabilities: probabilities, choice: digit, confidence: 0.5 };
+      return {
+        probabilities: probabilities,
+        choice: digit,
+        confidence: 0.5,
+        request: makeRequestPayload(puzzle || [], row, col),
+      };
     },
   };
 }
@@ -1352,7 +1381,7 @@ async function driveToCompletion(ctx, pending, calls, label) {
       if (item.settled) continue; // abort 済み。再送しない
       var body = JSON.parse(item.init.body);
       calls.push({ url: item.url, body: body });
-      item.resolve(makeCorrectResponse(ctx, body.target.row, body.target.col));
+      item.resolve(makeCorrectResponse(ctx, body.target.row, body.target.col, body.puzzle));
     }
     await tick();
   }
@@ -1732,4 +1761,110 @@ test("T6: 完了後(state.done)に stop() を呼んでも何も起きない", { 
   assert.equal(ctx.queue.length, queueBefore, "queue が変わってしまっている");
   assert.equal(ctx.state.round, roundBefore, "round が変わってしまっている");
   assert.equal(ctx.runToken, runTokenBefore, "runToken が進んでしまっている(stop() が何かしている)");
+});
+
+// -------------------------------------------------------------------
+// 「Jev に送ったプロンプト」パネル(renderPromptPanel、Issue #34)
+// -------------------------------------------------------------------
+
+test("U1: 判定1件のあと #prompt-panel に instructions の文言と座標ラベルが表示される", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+
+  // 未実行時は「まだ判定していません」
+  ctx.render();
+  assert.ok(
+    ctx.appElement.innerHTML.includes("まだ判定していません"),
+    "未実行時の初期文言が出ていない"
+  );
+  assert.equal(ctx.state.lastRequest, null, "state.lastRequest の初期値が null でない");
+
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "U1: 1件目の fetch 待ち");
+  var entry = af.pending.shift();
+  var body = JSON.parse(entry.init.body);
+  entry.resolve(makeCorrectResponse(ctx, body.target.row, body.target.col, body.puzzle));
+
+  await waitFor(function () {
+    return ctx.state.lastRequest !== null;
+  }, "U1: lastRequest が設定されるまで");
+
+  ctx.render();
+  var html = ctx.appElement.innerHTML;
+  assert.ok(html.includes('id="prompt-panel"'), "#prompt-panel が描画されていない");
+  assert.ok(html.includes("instructions"), "instructions の文言が出ていない");
+  var expectedLabel = (body.target.row + 1) + "行目 " + (body.target.col + 1) + "列目";
+  assert.ok(html.includes(expectedLabel + " の判定に使用"), "座標ラベルが出ていない: " + expectedLabel);
+  assert.deepStrictEqual(
+    JSON.parse(JSON.stringify(ctx.state.lastRequest)),
+    makeRequestPayload(body.puzzle, body.target.row, body.target.col),
+    "state.lastRequest がレスポンスの request と一致しない"
+  );
+});
+
+test("U2: stop() 後も #prompt-panel の内容が残る", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "U2: 1件目の fetch 待ち");
+  var entry = af.pending.shift();
+  var body = JSON.parse(entry.init.body);
+  entry.resolve(makeCorrectResponse(ctx, body.target.row, body.target.col, body.puzzle));
+
+  await waitFor(function () {
+    return ctx.state.lastRequest !== null;
+  }, "U2: lastRequest が設定されるまで");
+
+  // 2件目が in-flight のうちに stop() する(判定中のマスは破棄されるが、
+  // lastRequest は直前の確定分のまま残るはず)。
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "U2: 2件目の fetch 待ち");
+  var requestBeforeStop = ctx.state.lastRequest;
+  ctx.stop();
+
+  assert.equal(ctx.state.running, false, "stop() 後も running のまま");
+  assert.deepStrictEqual(
+    ctx.state.lastRequest,
+    requestBeforeStop,
+    "stop() で lastRequest が消えている、または変わっている"
+  );
+
+  ctx.render();
+  var html = ctx.appElement.innerHTML;
+  assert.ok(html.includes('id="prompt-panel"'), "#prompt-panel が描画されていない");
+  assert.ok(html.includes("instructions"), "stop() 後に instructions の文言が消えている");
+});
+
+test("U3: reset() で #prompt-panel が初期文言に戻る", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "U3: 1件目の fetch 待ち");
+  var entry = af.pending.shift();
+  var body = JSON.parse(entry.init.body);
+  entry.resolve(makeCorrectResponse(ctx, body.target.row, body.target.col, body.puzzle));
+
+  await waitFor(function () {
+    return ctx.state.lastRequest !== null;
+  }, "U3: lastRequest が設定されるまで");
+
+  ctx.reset();
+
+  assert.equal(ctx.state.lastRequest, null, "reset() で lastRequest が null に戻っていない");
+  ctx.render();
+  var html = ctx.appElement.innerHTML;
+  assert.ok(
+    html.includes("まだ判定していません"),
+    "reset() 後に初期文言に戻っていない"
+  );
+  assert.ok(!html.includes("instructions"), "reset() 後も instructions の文言が残っている");
 });
