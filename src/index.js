@@ -2536,7 +2536,7 @@ var PAGE_HTML = `<!doctype html>
   /**
    * 一時的な失敗による停止(Issue #43、SPEC F5)。Claude 経路の 429/529/5xx・
    * ネットワーク失敗、Jev 経路(Worker)の 429(レート制限)/503(カウンタ障害)を
-   * `judgeCell*` / `askCell*` が `err.transient = true` で投げてきたときに使う。
+   * judgeCell* / askCell* が err.transient = true で投げてきたときに使う。
    * stop() と同じことをする(盤面・周回ログ・統計・queue は保ち、判定中(フォーカス中)
    * のマスは queue の先頭に戻して記録に残さない)が、state.errorMessage は立てず
    * state.pauseReason に理由文言を持つ点だけが違う(isPaused() が true になり、

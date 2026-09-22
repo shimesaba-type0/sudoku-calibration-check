@@ -442,25 +442,29 @@ async function runMockMode(chromium, executablePath, mode) {
       }
     });
 
-    // [4] ratelimit モードで赤いエラーボックス → リセットで復帰
-    await runCheck(4, "ratelimitモードでエラーボックス→リセットで復帰", async function () {
+    // [4] ratelimit モードで停止扱い(理由が出て実行ボタンが「再開」)→ リセットで復帰
+    // (Issue #43: Jev の 429/503 は一時的な失敗として停止扱いになり、エラーボックスは出ない)
+    await runCheck(4, "ratelimitモードで停止扱い(理由が出て実行ボタンが「再開」)→リセットで復帰", async function () {
       if (mode !== "ratelimit") throw new Skip("--mode ratelimit 専用");
       await page.locator("#speed-toggle button", { hasText: "最速" }).click();
       await page.click("#run-btn");
-      var errorBox = page.locator("#error-box.error");
-      await errorBox.waitFor({ state: "visible", timeout: 30000 });
-      var message = await errorBox.textContent();
-      assert.ok(message && message.trim().length > 0, "エラーメッセージが空");
+      var pauseReasonBox = page.locator(".pause-reason");
+      await pauseReasonBox.waitFor({ state: "visible", timeout: 30000 });
+      var reasonText = await pauseReasonBox.textContent();
+      assert.ok(reasonText && reasonText.trim().length > 0, "停止理由が空");
+      assert.equal(await page.locator("#error-box.error").count(), 0, "一時的な失敗なのにエラーボックスが出ている");
+      var runLabel = (await page.locator("#run-btn").textContent() || "").trim();
+      assert.equal(runLabel, "再開", "実行ボタンが「再開」になっていない: " + runLabel);
       var runDisabled = await page.locator("#run-btn").getAttribute("disabled");
-      assert.notEqual(runDisabled, null, "エラー後も実行ボタンが有効なまま");
-      await page.screenshot({ path: path.join(outDir, mode + "-04-error.png") });
+      assert.equal(runDisabled, null, "停止中に実行ボタン(再開)が無効化されている");
+      await page.screenshot({ path: path.join(outDir, mode + "-04-paused.png") });
 
       await page.click("#reset-btn");
-      await page.locator("#error-box.error").waitFor({ state: "detached", timeout: 5000 });
-      var runDisabledAfterReset = await page.locator("#run-btn").getAttribute("disabled");
-      assert.equal(runDisabledAfterReset, null, "リセット後も実行ボタンが無効なまま");
+      await page.locator(".pause-reason").waitFor({ state: "detached", timeout: 5000 });
+      var runLabelAfterReset = (await page.locator("#run-btn").textContent() || "").trim();
+      assert.equal(runLabelAfterReset, "実行", "リセット後の実行ボタンのラベルが戻っていない: " + runLabelAfterReset);
       await page.screenshot({ path: path.join(outDir, mode + "-04-after-reset.png") });
-      return "error=\"" + message + "\"";
+      return "pauseReason=\"" + reasonText + "\"";
     });
 
     // [8] 比較モード(GET /compare、Issue #46)。左(Jev)は通常どおり判定でき、

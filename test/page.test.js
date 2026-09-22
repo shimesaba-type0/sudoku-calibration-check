@@ -2933,6 +2933,273 @@ test("W10: 順番トグルは停止中もロックされ、reset() / newPuzzle()
 });
 
 // -------------------------------------------------------------------
+// 一時的な失敗 → 停止(Issue #43、SPEC F5)。Claude 経路の 429/529/5xx・
+// ネットワーク失敗、Jev 経路(Worker)の 429/503 は showError() ではなく
+// pauseForTransientError() で停止扱いになり、盤面・周回ログ・queue を保ったまま
+// isPaused() が true になって run() で再開できる。
+// -------------------------------------------------------------------
+
+test("Y1: Claude の 429 は停止扱いになる(errorMessage は立たず、盤面/queue/記録が保たれ、run() で再開すると同じマスをもう一度聞く)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.saveAnthropicKey(TEST_KEY);
+  ctx.setModelMode("claude");
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Y1: fetch 待ち");
+  var entry = af.pending.shift();
+  var body = JSON.parse(entry.init.body);
+  var content = body.messages[0].content;
+  var sent = JSON.parse(content.slice(content.indexOf("\n") + 1));
+  var target = sent.target;
+  var recordsBefore = ctx.getRecords().length;
+  var roundLogBefore = ctx.state.roundLog.slice();
+  var valuesBefore = Object.keys(ctx.state.values).length;
+  var queueLenBefore = ctx.queue.length;
+
+  entry.resolve({
+    ok: false,
+    status: 429,
+    json: function () {
+      return Promise.resolve({ type: "error", error: { type: "rate_limit_error", message: "Number of request tokens has exceeded your per-minute rate limit" } });
+    },
+  });
+
+  await waitFor(function () {
+    return ctx.isPaused();
+  }, "Y1: 停止待ち");
+  assert.equal(ctx.state.errorMessage, null, "429 でエラーボックスが立った");
+  assert.equal(ctx.state.running, false);
+  assert.ok(ctx.state.pauseReason && ctx.state.pauseReason.indexOf("429") !== -1, "pauseReason に 429 が含まれない: " + ctx.state.pauseReason);
+  assert.equal(af.pending.length, 0, "停止後に次の fetch が飛んだ");
+
+  // 盤面・周回ログ・queue・記録は保たれ、判定中だったマスが queue の先頭に戻る
+  assert.equal(Object.keys(ctx.state.values).length, valuesBefore, "state.values が変わった");
+  assert.deepStrictEqual(ctx.state.roundLog, roundLogBefore, "roundLog が変わった");
+  assert.equal(ctx.getRecords().length, recordsBefore, "判定が確定していないのに記録が増えた");
+  assert.equal(ctx.queue.length, queueLenBefore + 1, "判定中だったマスが queue に戻っていない");
+  assert.equal(ctx.queue[0].r, target.row, "queue の先頭行が判定中のマスでない");
+  assert.equal(ctx.queue[0].c, target.col, "queue の先頭列が判定中のマスでない");
+  assert.equal(ctx.state.focusedKey, null);
+  assert.equal(ctx.state.lastRequestFailed, true, "lastRequestFailed が true になっていない");
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(ctx.state.lastRequest)), body);
+
+  // run() で再開すると pauseReason が消え、同じマスの fetch がもう一度飛ぶ
+  ctx.run();
+  assert.equal(ctx.state.pauseReason, null, "run() で pauseReason が消えていない");
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Y1: 再開後の fetch 待ち");
+  var resumedBody = JSON.parse(af.pending[0].init.body);
+  var resumedContent = resumedBody.messages[0].content;
+  var resumedSent = JSON.parse(resumedContent.slice(resumedContent.indexOf("\n") + 1));
+  assert.equal(resumedSent.target.row, target.row, "再開後に別のマスを聞いている(行)");
+  assert.equal(resumedSent.target.col, target.col, "再開後に別のマスを聞いている(列)");
+});
+
+test("Y2: Claude の 529/500 は停止扱い(429/ネットワーク失敗は Y1/V4 で確認済み)。401/refusal/形式不正は従来どおりエラー(V4)", { timeout: 10000 }, async () => {
+  async function runOnceTransient(status) {
+    var af = makeAbortAwareFetch();
+    var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+    ctx.saveAnthropicKey(TEST_KEY);
+    ctx.setModelMode("claude");
+    ctx.run();
+    await waitFor(function () {
+      return af.pending.length === 1;
+    }, "Y2: fetch 待ち(" + status + ")");
+    af.pending.shift().resolve(makeClaudeErrorResponse(status, "overloaded"));
+    await waitFor(function () {
+      return ctx.isPaused();
+    }, "Y2: 停止待ち(" + status + ")");
+    assert.equal(ctx.state.errorMessage, null, status + " でエラーボックスが立った");
+    assert.ok(ctx.state.pauseReason && ctx.state.pauseReason.indexOf(String(status)) !== -1, status + ": pauseReason に含まれない: " + ctx.state.pauseReason);
+  }
+  await runOnceTransient(529);
+  await runOnceTransient(500);
+});
+
+test("Y3: Jev の 429(Retry-After ヘッダー)/503 は停止扱い。400/502 は従来どおりエラー", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Y3: fetch 待ち(429)");
+  af.pending.shift().resolve({
+    ok: false,
+    status: 429,
+    headers: { get: function (name) { return name === "Retry-After" ? "30" : null; } },
+    json: function () {
+      return Promise.resolve({ error: "アクセス元(IP)ごとのレート制限(120回/3600秒)を超えました" });
+    },
+  });
+  await waitFor(function () {
+    return ctx.isPaused();
+  }, "Y3: 429 の停止待ち");
+  assert.equal(ctx.state.errorMessage, null, "429 でエラーボックスが立った");
+  assert.ok(ctx.state.pauseReason && ctx.state.pauseReason.indexOf("30") !== -1, "pauseReason に Retry-After の秒数(30)が含まれない: " + ctx.state.pauseReason);
+
+  // 503(カウンタ障害)も停止扱い
+  var af2 = makeAbortAwareFetch();
+  var ctx2 = runScript(await getPageHtml(), { fetch: af2.fetch });
+  ctx2.run();
+  await waitFor(function () {
+    return af2.pending.length === 1;
+  }, "Y3: fetch 待ち(503)");
+  af2.pending.shift().resolve({
+    ok: false,
+    status: 503,
+    headers: { get: function () { return "60"; } },
+    json: function () {
+      return Promise.resolve({ error: "レート制限の記録に失敗しました。しばらくしてから再試行してください" });
+    },
+  });
+  await waitFor(function () {
+    return ctx2.isPaused();
+  }, "Y3: 503 の停止待ち");
+  assert.equal(ctx2.state.errorMessage, null, "503 でエラーボックスが立った");
+  assert.ok(ctx2.state.pauseReason, "503 で pauseReason が立っていない");
+
+  // 400(request 無し)は従来どおりエラー
+  var af3 = makeAbortAwareFetch();
+  var ctx3 = runScript(await getPageHtml(), { fetch: af3.fetch });
+  ctx3.run();
+  await waitFor(function () {
+    return af3.pending.length === 1;
+  }, "Y3: fetch 待ち(400)");
+  af3.pending.shift().resolve({
+    ok: false,
+    status: 400,
+    json: function () {
+      return Promise.resolve({ error: "入力が不正です" });
+    },
+  });
+  await waitFor(function () {
+    return ctx3.state.errorMessage !== null;
+  }, "Y3: 400 のエラー待ち");
+  assert.equal(ctx3.isPaused(), false, "400 が停止扱いになった");
+
+  // 502(request 付き)も従来どおりエラー
+  var af4 = makeAbortAwareFetch();
+  var ctx4 = runScript(await getPageHtml(), { fetch: af4.fetch });
+  ctx4.run();
+  await waitFor(function () {
+    return af4.pending.length === 1;
+  }, "Y3: fetch 待ち(502)");
+  af4.pending.shift().resolve({
+    ok: false,
+    status: 502,
+    json: function () {
+      return Promise.resolve({ error: "AIの呼び出しに失敗しました", raw: "boom" });
+    },
+  });
+  await waitFor(function () {
+    return ctx4.state.errorMessage !== null;
+  }, "Y3: 502 のエラー待ち");
+  assert.equal(ctx4.isPaused(), false, "502 が停止扱いになった");
+});
+
+test("Y4: 確信度順のマス選び中の Jev 429 も停止扱い(queue は変わらず、再開はマス選びからやり直す)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.setOrderMode("confidence");
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Y4: マス選びの fetch 待ち");
+  var entry = af.pending.shift();
+  var queueLenBefore = ctx.queue.length;
+
+  entry.resolve({
+    ok: false,
+    status: 429,
+    headers: { get: function (name) { return name === "Retry-After" ? "15" : null; } },
+    json: function () {
+      return Promise.resolve({ error: "アクセス元(IP)ごとのレート制限(120回/3600秒)を超えました" });
+    },
+  });
+
+  await waitFor(function () {
+    return ctx.isPaused();
+  }, "Y4: 停止待ち");
+  assert.equal(ctx.state.errorMessage, null, "429 でエラーボックスが立った");
+  assert.ok(ctx.state.pauseReason && ctx.state.pauseReason.indexOf("15") !== -1, "pauseReason に Retry-After の秒数(15)が含まれない: " + ctx.state.pauseReason);
+  assert.equal(ctx.state.selecting, false, "state.selecting がリセットされていない");
+  assert.equal(ctx.state.cellProbs, null, "state.cellProbs がリセットされていない");
+  assert.equal(ctx.queue.length, queueLenBefore, "マス選び中の一時的な失敗で queue の長さが変わった");
+
+  // run() で再開するとマス選びからやり直す
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Y4: 再開後のマス選びの fetch 待ち");
+  var resumedBody = JSON.parse(af.pending[0].init.body);
+  assert.equal(resumedBody.ask, "cell", "再開後もマス選びから始まっていない");
+  assert.equal(ctx.state.selecting, true);
+  assert.equal(ctx.state.pauseReason, null);
+});
+
+test("Y5: renderCurrentPanel() は一時的な失敗の理由を pause-reason の箱で出し、手動 stop() では出ない。postStatus() にも pauseReason が乗る", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+
+  // 手動停止では理由が出ない
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Y5: fetch 待ち");
+  ctx.stop();
+  assert.equal(ctx.isPaused(), true);
+  assert.equal(ctx.state.pauseReason, null);
+  ctx.render();
+  var htmlManual = ctx.appElement.innerHTML;
+  assert.ok(htmlManual.indexOf("停止中(残り") !== -1, "停止中の表示が無い");
+  assert.ok(htmlManual.indexOf('class="pause-reason"') === -1, "手動停止で pause-reason の箱が出ている");
+  af.pending.shift(); // stop() で abort 済み(settled)の1件目を片付ける
+
+  // 一時的な失敗による停止では理由が出る
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Y5: 再開後の fetch 待ち");
+  af.pending.shift().resolve({
+    ok: false,
+    status: 429,
+    headers: { get: function (name) { return name === "Retry-After" ? "42" : null; } },
+    json: function () {
+      return Promise.resolve({ error: "アクセス元(IP)ごとのレート制限(120回/3600秒)を超えました" });
+    },
+  });
+  await waitFor(function () {
+    return ctx.isPaused() && ctx.state.pauseReason !== null;
+  }, "Y5: 一時的な失敗での停止待ち");
+  ctx.render();
+  var htmlTransient = ctx.appElement.innerHTML;
+  assert.ok(htmlTransient.indexOf('class="pause-reason"') !== -1, "pause-reason の箱が出ていない");
+  assert.ok(htmlTransient.indexOf("42") !== -1, "pause-reason の中身(42秒)が出ていない");
+
+  // postStatus(): embed モードなら status に pauseReason が乗る
+  var parentCalls = [];
+  var fakeParent = { postMessage: function (data) { parentCalls.push(data); } };
+  var fakeWindow = { parent: fakeParent, addEventListener: function () {}, postMessage: function () {} };
+  var ctxEmbed = runScript(await getPageHtml(), {
+    fetch: af.fetch,
+    location: { pathname: "/", search: "?embed=1", origin: "https://example.com" },
+    window: fakeWindow,
+  });
+  ctxEmbed.state.pauseReason = "一時的な失敗で停止しました: テスト";
+  ctxEmbed.render();
+  var lastStatus = parentCalls[parentCalls.length - 1];
+  assert.equal(lastStatus.type, "status");
+  assert.equal(lastStatus.pauseReason, "一時的な失敗で停止しました: テスト", "postStatus() に pauseReason が乗っていない");
+
+  // 比較シェルの見出し(compareStatusText): paused && pauseReason なら「停止中(一時的な失敗)」
+  assert.equal(ctx.compareStatusText({ paused: true, pauseReason: "x" }), "停止中(一時的な失敗)");
+  assert.equal(ctx.compareStatusText({ paused: true, pauseReason: null }), "停止中");
+});
+
+// -------------------------------------------------------------------
 // 比較モード(SPEC F1、docs/DESIGN.md 4章、Issue #46)。
 // X1/X2: 通常ページ(GET /)の URL パラメータ。X3: 埋め込みモード(embed=1)。
 // X4: 比較シェル(GET /compare)。
