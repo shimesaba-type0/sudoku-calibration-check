@@ -59,7 +59,13 @@ test("正常入力で 200 と9キーの probabilities が返る", async () => {
   var out = await judge(validBody());
   assert.equal(out.res.status, 200);
   assert.equal(out.res.headers.get("content-type"), "application/json; charset=utf-8");
-  assert.deepEqual(Object.keys(out.body).sort(), ["choice", "confidence", "probabilities", "request"]);
+  assert.deepEqual(Object.keys(out.body).sort(), [
+    "choice",
+    "confidence",
+    "probabilities",
+    "request",
+    "usage",
+  ]);
   assert.deepEqual(Object.keys(out.body.probabilities), ["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
   assert.equal(out.body.choice, "4");
   assert.equal(out.body.confidence, 0.31);
@@ -88,7 +94,13 @@ test("ラッパーの無い素のレスポンスでも 200(ゲートウェイが
   var res = await worker.fetch(judgeRequest(validBody()), env);
   assert.equal(res.status, 200);
   var body = await res.json();
-  assert.deepEqual(Object.keys(body).sort(), ["choice", "confidence", "probabilities", "request"]);
+  assert.deepEqual(Object.keys(body).sort(), [
+    "choice",
+    "confidence",
+    "probabilities",
+    "request",
+    "usage",
+  ]);
   assert.equal(body.choice, "4");
   assert.equal(body.confidence, 0.31);
   assert.deepEqual(Object.keys(body.probabilities), ["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
@@ -446,7 +458,13 @@ test("余計なキーが付いた answers.digit は 200(絞って返す)", async
   var res = await worker.fetch(judgeRequest(validBody()), env);
   assert.equal(res.status, 200);
   var body = await res.json();
-  assert.deepEqual(Object.keys(body).sort(), ["choice", "confidence", "probabilities", "request"]);
+  assert.deepEqual(Object.keys(body).sort(), [
+    "choice",
+    "confidence",
+    "probabilities",
+    "request",
+    "usage",
+  ]);
 });
 
 // --- ask:"cell"(マス選び。Issue #38) ---------------------------------------
@@ -535,6 +553,7 @@ test('ask:"cell": 200 の形(probabilities / choice / confidence / request / cel
     "confidence",
     "probabilities",
     "request",
+    "usage",
   ]);
   assert.equal(out.body.choice, "r3c5");
   // choice を座標に分解したものが cell(フロントが毎回パースしなくて済むように)
@@ -579,6 +598,7 @@ test('ask:"digit" を明示しても省略時とまったく同じ(従来どお�
     "confidence",
     "probabilities",
     "request",
+    "usage",
   ]);
   assert.equal("cell" in explicit.body, false, "digit の応答に cell は付けない");
 });
@@ -883,11 +903,11 @@ test('ask:"where": payload に正解表の行が一切含まれない(不変条�
   }
 });
 
-test('ask:"where": 200 の形(probabilities / digit / request のみ)', async () => {
+test('ask:"where": 200 の形(probabilities / digit / request / usage のみ)', async () => {
   var out = await judgeWhere();
   assert.equal(out.res.status, 200);
   assert.equal(out.res.headers.get("content-type"), "application/json; charset=utf-8");
-  assert.deepEqual(Object.keys(out.body).sort(), ["digit", "probabilities", "request"]);
+  assert.deepEqual(Object.keys(out.body).sort(), ["digit", "probabilities", "request", "usage"]);
   // noul には choice も confidence も無いので付けない(cell の cell も付けない)
   assert.equal("choice" in out.body, false);
   assert.equal("confidence" in out.body, false);
@@ -1224,11 +1244,11 @@ test('ask:"all": payload に正解表の行が一切含まれない(不変条件
   }
 });
 
-test('ask:"all": 200 の形(cells / request のみ。cells の各値は type 無し)', async () => {
+test('ask:"all": 200 の形(cells / request / usage のみ。cells の各値は type 無し)', async () => {
   var out = await judgeAll();
   assert.equal(out.res.status, 200);
   assert.equal(out.res.headers.get("content-type"), "application/json; charset=utf-8");
-  assert.deepEqual(Object.keys(out.body).sort(), ["cells", "request"]);
+  assert.deepEqual(Object.keys(out.body).sort(), ["cells", "request", "usage"]);
   // マス単位に choice / probabilities / confidence を返すので、トップレベルには付けない
   assert.equal("choice" in out.body, false);
   assert.equal("confidence" in out.body, false);
@@ -1476,6 +1496,7 @@ test('ask:"all" を足しても digit / cell / where の挙動は変わらない
     "confidence",
     "probabilities",
     "request",
+    "usage",
   ]);
   assert.deepEqual(Object.keys(digit.env.aiCalls[0].payload.questions), ["digit"]);
 
@@ -1485,5 +1506,78 @@ test('ask:"all" を足しても digit / cell / where の挙動は変わらない
 
   var where = await judgeWhere();
   assert.equal(where.res.status, 200);
-  assert.deepEqual(Object.keys(where.body).sort(), ["digit", "probabilities", "request"]);
+  assert.deepEqual(Object.keys(where.body).sort(), ["digit", "probabilities", "request", "usage"]);
+});
+
+// --- usage(Jev のトークン使用量。コスト表示用) -------------------------------
+
+test("200 に usage(input_tokens / output_tokens)が付く(ask の種類によらず)", async () => {
+  // 期待値は test/helpers.js のモックが返す usage(docs/DESIGN.md 3.4 の実測値)。
+  var digit = await judge(validBody());
+  assert.equal(digit.res.status, 200);
+  assert.deepStrictEqual(digit.body.usage, { input_tokens: 665, output_tokens: 80 });
+
+  var cell = await judgeCell();
+  assert.equal(cell.res.status, 200);
+  assert.deepStrictEqual(cell.body.usage, { input_tokens: 700, output_tokens: 90 });
+
+  var where = await judgeWhere();
+  assert.equal(where.res.status, 200);
+  assert.deepStrictEqual(where.body.usage, { input_tokens: 1948, output_tokens: 973 });
+
+  var all = await judgeAll();
+  assert.equal(all.res.status, 200);
+  assert.deepStrictEqual(all.body.usage, { input_tokens: 9483, output_tokens: 4083 });
+});
+
+test("ラッパーの無い素のレスポンスでも usage が付く(トップレベルの usage を読む)", async () => {
+  var bare = await judge(validBody(), { aiResult: bareJevResponse() });
+  assert.equal(bare.res.status, 200);
+  assert.deepStrictEqual(bare.body.usage, { input_tokens: 665, output_tokens: 80 });
+
+  // where もラッパー無しで確認する(取り出し元が extractAnswers と同じ場所であること)
+  var env = makeEnv({
+    aiResult: {
+      model: "jev-1.13.0",
+      answers: jevWhereAnswers(GIVEN_CELL_KEYS),
+      usage: { input_tokens: 12, output_tokens: 34 },
+    },
+  });
+  var res = await worker.fetch(judgeRequest(validWhereBody()), env);
+  assert.equal(res.status, 200);
+  var body = await res.json();
+  assert.deepStrictEqual(body.usage, { input_tokens: 12, output_tokens: 34 });
+});
+
+test("usage が無い・形がおかしいときは usage ごと省略する(200 のまま)", async () => {
+  var cases = {
+    "usage が無い": undefined,
+    "usage が null": null,
+    "usage が配列": [665, 80],
+    "usage が文字列": "665/80",
+    "input_tokens が無い": { output_tokens: 80 },
+    "output_tokens が無い": { input_tokens: 665 },
+    "input_tokens が文字列": { input_tokens: "665", output_tokens: 80 },
+    // 片方だけ数値でも、有限な方だけを載せたりせず丸ごと省略する(単純さを優先)
+    "output_tokens が NaN": { input_tokens: 665, output_tokens: NaN },
+    "input_tokens が Infinity": { input_tokens: Infinity, output_tokens: 80 },
+  };
+
+  for (var label in cases) {
+    var aiResult = jevResponse();
+    if (cases[label] === undefined) {
+      delete aiResult.result.usage;
+    } else {
+      aiResult.result.usage = cases[label];
+    }
+    var out = await judge(validBody(), { aiResult: aiResult });
+    // usage は参考情報なので、壊れていても判定結果の検証には影響させない(502 にしない)
+    assert.equal(out.res.status, 200, label + ": 200 を期待したが " + out.res.status);
+    assert.equal("usage" in out.body, false, label + ": usage が付いている");
+    assert.deepEqual(
+      Object.keys(out.body).sort(),
+      ["choice", "confidence", "probabilities", "request"],
+      label
+    );
+  }
 });

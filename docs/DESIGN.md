@@ -253,6 +253,9 @@ await env.AI.run("typesafe/jev", {
   を使う(SPEC 4章)
 - `usage.input_tokens` は 1 判定あたり約 665。SPEC 5章の見積り(約400)より多かったので、
   SPEC 5章のコスト試算は実測値に更新した
+- この `usage`(`input_tokens` / `output_tokens`)は **`/api/judge` の 200 にそのまま載せる**
+  (コスト表示用。`extractUsage`。取り出し元は `extractAnswers` と同じで、ラッパー付きなら
+  `result.usage`、素の形ならトップレベルの `usage`。形がおかしければ `usage` ごと省略し、502 にはしない)
 - 同じ入力を3回投げて `choice` が `1` / `4` / `2` と割れた(正解は `4`)。確率もほぼ平坦
   (最大 0.22)だった。**決定的ではない**。これは不具合ではなく、このアプリが観測したい対象そのもの
 
