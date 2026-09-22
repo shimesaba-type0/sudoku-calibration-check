@@ -1234,6 +1234,8 @@ var PAGE_HTML = `<!doctype html>
     padding: 10px 12px;
     margin: 0;
   }
+  .prompt-details summary { color: var(--accent); font-size: 13px; cursor: pointer; margin: 4px 0; }
+  .prompt-details[open] summary { margin-bottom: 8px; }
 
   #round-log ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
   #round-log li { font-size: 12px; font-family: "IBM Plex Mono", monospace; color: var(--muted); }
@@ -1685,6 +1687,11 @@ var PAGE_HTML = `<!doctype html>
   var CLAUDE_HAIKU_THINKING_BUDGET = 2048; // Haiku 4.5 は budget_tokens 方式(adaptive 非対応)
   var CLAUDE_ANSWER_MAX_TOKENS = 1024;     // JSON 1 件ぶん(思考なし)
   var CLAUDE_ADAPTIVE_MAX_TOKENS = 16000;  // adaptive thinking は思考トークンも max_tokens に含まれるので余裕を持たせる
+  // 一括モード(Issue #48)は出力が大きい(最大64マス×9確率ぶんの JSON)ので、それぞれの
+  // 最低値を大きく取る(既存の設定との Math.max で使う。docs/DESIGN.md 3.6)。
+  var CLAUDE_ALL_ANSWER_MAX_TOKENS = 16000;   // 思考なしの一括の最低値
+  var CLAUDE_ALL_ADAPTIVE_MAX_TOKENS = 24000; // adaptive thinking の一括の最低値
+  var CLAUDE_ALL_HAIKU_MAX_TOKENS = 12000;    // Haiku(budget_tokens 方式)の一括の最低値
   var JEV_MODEL_ID = "typesafe/jev";
   // Worker が Jev に渡すのと同じルール説明・質問文(比較条件を揃える)。Worker 側の
   // 定数をテンプレートに埋め込んでいるので、二重管理にならない。
@@ -1694,6 +1701,11 @@ var PAGE_HTML = `<!doctype html>
   // 同じやり方でテンプレートに埋め込む(docs/DESIGN.md 3.5)。
   var CELL_NOTE = ${JSON.stringify(CELL_NOTE)};
   var CELL_INSTRUCTIONS = ${JSON.stringify(CELL_INSTRUCTIONS)};
+  // 一括モード(Issue #48)で使う、Worker と同じ固定文。CELL_NOTE と同じやり方で埋め込む。
+  // ALL_INSTRUCTIONS_TEMPLATE は空マス1つぶんの文言(Worker が questions の各 instructions に
+  // 使うもの)なので、Claude 経路のユーザーメッセージには使わず、別に CLAUDE_ALL_INSTRUCTIONS
+  // (全マスまとめて聞く1本の質問文)を用意する(docs/DESIGN.md 3.6)。
+  var ALL_NOTE = ${JSON.stringify(ALL_NOTE)};
   var CLAUDE_SYSTEM = NOTE + " Answer with JSON only, matching the given schema: " +
     "\\"choice\\" is the digit you pick, \\"probabilities\\" gives your calibrated probability for each digit 1-9 " +
     "(they should sum to 1), and \\"confidence\\" is your overall confidence (0-1) that \\"choice\\" is correct.";
@@ -1702,6 +1714,17 @@ var PAGE_HTML = `<!doctype html>
     "\\"choice\\" is the cell you pick (its key, such as \\"r0c2\\"), \\"probabilities\\" gives your calibrated " +
     "probability that each candidate cell is the one you would pick (they should sum to 1), and \\"confidence\\" " +
     "is your overall confidence (0-1) that \\"choice\\" is correct.";
+  // 一括モード(Issue #48、Claude 経路)の system。ALL_NOTE をベースに、マスごとに choice /
+  // probabilities / confidence の3つ組を答えることを伝える(docs/DESIGN.md 3.6)。
+  var CLAUDE_ALL_SYSTEM = ALL_NOTE + " Answer with JSON only, matching the given schema: for each cell key, " +
+    "\\"choice\\" is the digit you pick for that cell, \\"probabilities\\" gives your calibrated probability " +
+    "for each digit 1-9 for that cell (they should sum to 1), and \\"confidence\\" is your overall confidence " +
+    "(0-1) that \\"choice\\" is correct for that cell.";
+  // 一括モードのユーザーメッセージの質問文。Worker の ALL_INSTRUCTIONS_TEMPLATE はマス1つぶんの
+  // 文言なので、Claude には全マスまとめて聞く1本の文言を使う(スキーマの required キーが
+  // 対象マスの一覧そのものなので、座標を文中に列挙し直す必要は無い)。
+  var CLAUDE_ALL_INSTRUCTIONS = "Which digit from 1 to 9 belongs in each empty cell of this Sudoku grid? " +
+    "Answer for every cell key required by the schema (each key is formatted as \\"r<row>c<col>\\", zero-based).";
   // structured outputs(output_config.format = json_schema)のスキーマ。Worker の
   // validateAnswer と同じ形(choice は 1〜9、probabilities は 1〜9 の 9 キー、confidence は数値)。
   var CLAUDE_OUTPUT_SCHEMA = (function () {
@@ -1734,6 +1757,34 @@ var PAGE_HTML = `<!doctype html>
         confidence: { type: "number" }
       },
       required: ["choice", "probabilities", "confidence"],
+      additionalProperties: false
+    };
+  }
+
+  // 一括モード(Issue #48)のスキーマ。keys(その周の queue、行優先)ごとに、digit 判定と
+  // 同じ形(choice は 1〜9、probabilities は 1〜9 の 9 キー、confidence は数値)の
+  // オブジェクトを required で持つ。呼び出しのたびに候補(= queue)が変わるので毎回組み立てる
+  // (buildClaudeCellSchema と同じ考え方)。
+  function buildClaudeAllSchema(keys) {
+    var digitProbProps = {};
+    for (var d = 0; d < DIGITS.length; d++) digitProbProps[DIGITS[d]] = { type: "number" };
+    var cellProps = {};
+    for (var i = 0; i < keys.length; i++) {
+      cellProps[keys[i]] = {
+        type: "object",
+        properties: {
+          choice: { type: "string", enum: DIGITS.slice() },
+          probabilities: { type: "object", properties: digitProbProps, required: DIGITS.slice(), additionalProperties: false },
+          confidence: { type: "number" }
+        },
+        required: ["choice", "probabilities", "confidence"],
+        additionalProperties: false
+      };
+    }
+    return {
+      type: "object",
+      properties: cellProps,
+      required: keys.slice(),
       additionalProperties: false
     };
   }
@@ -1795,11 +1846,13 @@ var PAGE_HTML = `<!doctype html>
     claudeModel: DEFAULT_CLAUDE_MODEL, // Claude 経路のモデル ID(CLAUDE_MODELS のどれか)
     claudeThinking: true,     // Claude 経路で思考(extended thinking)を使うか
     calibModelFilter: "all",  // 較正図のモデルフィルタ("all" | モデル識別子)
-    orderMode: "scan",        // "scan"(左上から) | "confidence"(確信度順、Issue #38)。reset() で維持
+    orderMode: "scan",        // "scan"(左上から) | "confidence"(確信度順、Issue #38) | "all"(一括、Issue #48)。reset() で維持
     selecting: false,         // 確信度順のマス選び中か
     cellProbs: null,          // 確信度順のヒートマップ用 { "r-c": p, ... }。マス選びの直後だけ持つ
     lastSelection: null,      // 直近のマス選び1件 { r, c, confidence, candidates, p }
     lastCellRequest: null,    // 直近のマス選びでモデルに送ったリクエスト(Jev なら request、Claude なら送ったボディ)
+    allFetching: false,       // 一括モード(Issue #48)の呼び出し中か(結果が届くまで座標もバーも無い)
+    lastAllRequest: null,     // 直近の一括呼び出し { request, failed, count }(プロンプト枠。Issue #48)
     pauseReason: null         // 一時的な失敗による停止の理由文言(Issue #43)。手動 stop() では null のまま。
                               // run() / reset() / newPuzzle() / stop() で null に戻る
   };
@@ -1810,6 +1863,10 @@ var PAGE_HTML = `<!doctype html>
   var roundSize = TOTAL_EMPTY; // 開始前は「0 / 51」と見せる
   var started = false;
   var pendingCommit = null;
+  // 一括モード(Issue #48)の今の周のキャッシュ。null = まだこの周で askAll() していない。
+  // 応答が届いたら "r-c" 形式のキー → { choice, probabilities, confidence } に変換して持つ。
+  // 停止/再開では保つ(再度呼ばない)。周が変わる(finalizeRound)・reset()/newPuzzle() で null に戻す。
+  var allResults = null;
   // 問題を生成している最中か。生成中はボタンを押せなくする。
   var generating = false;
   // 実行の世代。reset() / showError() のたびに進める。進行中の fetch や
@@ -1902,6 +1959,40 @@ var PAGE_HTML = `<!doctype html>
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ puzzle: puzzle, ask: "cell" }),
+      signal: signal
+    });
+    if (res.ok) return res.json();
+    var message = "HTTP " + res.status;
+    var data = null;
+    try {
+      data = await res.json();
+      if (data && typeof data.error === "string") message = data.error;
+    } catch (e) {
+      // JSONでないボディはそのまま HTTP <status> にフォールバック
+    }
+    var error = new Error(message);
+    if (data && data.request && typeof data.request === "object") {
+      error.request = data.request;
+    }
+    markJevTransientError(error, res);
+    throw error;
+  }
+
+  // 一括モード(Issue #48)の1周ぶん。スナップショットはここで1回だけ作り
+  // (buildSelectionSnapshot()。queue の全マスを "." にしたもの)、モデルトグルに応じて
+  // Jev / Claude に渡す。戻り値はどちらも { cells, request }(cells はマスのキー →
+  // { choice, probabilities, confidence })。
+  async function askAll(signal) {
+    var puzzle = buildSelectionSnapshot();
+    if (state.modelMode === "claude") return askAllClaude(puzzle, signal);
+    return askAllJev(puzzle, signal);
+  }
+
+  async function askAllJev(puzzle, signal) {
+    var res = await fetch("/api/judge", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ puzzle: puzzle, ask: "all" }),
       signal: signal
     });
     if (res.ok) return res.json();
@@ -2037,11 +2128,11 @@ var PAGE_HTML = `<!doctype html>
     render();
   }
 
-  // 順番トグル(左上から / 確信度順、Issue #38)。モデルトグルと同じ条件でロックする
-  // (周の途中で切り替えると、選び方が混ざって周回ログの意味が崩れるため)。
+  // 順番トグル(左上から / 確信度順 / 一括、Issue #38・#48)。モデルトグルと同じ条件で
+  // ロックする(周の途中で切り替えると、選び方が混ざって周回ログの意味が崩れるため)。
   // localStorage には保存しない(reset() / newPuzzle() をまたいで state だけで保持する)。
   function setOrderMode(mode) {
-    if (mode !== "scan" && mode !== "confidence") return;
+    if (mode !== "scan" && mode !== "confidence" && mode !== "all") return;
     if (modelSettingsLocked()) return;
     state.orderMode = mode;
     render();
@@ -2115,6 +2206,36 @@ var PAGE_HTML = `<!doctype html>
     return body;
   }
 
+  // 一括モード(Issue #48)のリクエストボディ(Claude 経路)。buildClaudeCellRequest と同じ
+  // 組み立て方だが、system が CLAUDE_ALL_SYSTEM、messages[0].content が
+  // CLAUDE_ALL_INSTRUCTIONS + 改行 + { puzzle }(target は無い)、スキーマが
+  // buildClaudeAllSchema(keys)(マスごとに choice/probabilities/confidence の3つ組)。
+  // max_tokens は出力が大きい(最大64マス×9確率)ので、既存の設定と一括専用の最低値の
+  // 大きい方を使う(docs/DESIGN.md 3.6)。
+  function buildClaudeAllRequest(puzzle, keys) {
+    var body = {
+      model: state.claudeModel,
+      max_tokens: CLAUDE_ALL_ANSWER_MAX_TOKENS, // 思考なしの最低値
+      system: CLAUDE_ALL_SYSTEM,
+      messages: [
+        {
+          role: "user",
+          content: CLAUDE_ALL_INSTRUCTIONS + "\\n" + JSON.stringify({ puzzle: puzzle })
+        }
+      ],
+      output_config: { format: { type: "json_schema", schema: buildClaudeAllSchema(keys) } }
+    };
+    var thinking = claudeThinkingConfig(state.claudeModel, state.claudeThinking);
+    if (thinking) {
+      body.thinking = thinking;
+      if (thinking.type === "adaptive") body.max_tokens = Math.max(CLAUDE_ADAPTIVE_MAX_TOKENS, CLAUDE_ALL_ADAPTIVE_MAX_TOKENS);
+      if (typeof thinking.budget_tokens === "number") {
+        body.max_tokens = Math.max(thinking.budget_tokens + CLAUDE_ANSWER_MAX_TOKENS, CLAUDE_ALL_HAIKU_MAX_TOKENS);
+      }
+    }
+    return body;
+  }
+
   // Worker の validateAnswer と同じ基準で Claude の JSON を検証する。expectedKeys は
   // choice / probabilities が取りうるキーの集合(省略時は DIGITS。確信度順のマス選び
   // (Issue #38)では queue のマスのキーを渡す)。Worker の validateAnswer と同じく
@@ -2145,9 +2266,9 @@ var PAGE_HTML = `<!doctype html>
     return null;
   }
 
-  // Messages API の応答から JSON 回答を取り出す。{ answer } か { error }。
-  // expectedKeys は validateClaudeAnswer にそのまま渡す(省略時は DIGITS)。
-  function parseClaudeAnswer(data, expectedKeys) {
+  // Messages API の応答から stop_reason のチェックとテキストブロックの取り出しだけを行う
+  // 共通部分(digit / cell / all のどの経路でも同じ)。{ text } か { error }。
+  function extractClaudeText(data) {
     if (!data || typeof data !== "object") return { error: "Claude の応答が JSON ではありません" };
     if (data.stop_reason === "refusal") return { error: "Claude が応答を拒否しました(stop_reason: refusal)" };
     if (data.stop_reason === "max_tokens") return { error: "Claude の応答が max_tokens で途切れました" };
@@ -2162,13 +2283,55 @@ var PAGE_HTML = `<!doctype html>
       }
     }
     if (text === null) return { error: "Claude の応答にテキストがありません" };
+    return { text: text };
+  }
+
+  // Messages API の応答から JSON 回答を取り出す。{ answer } か { error }。
+  // expectedKeys は validateClaudeAnswer にそのまま渡す(省略時は DIGITS)。
+  function parseClaudeAnswer(data, expectedKeys) {
+    var extracted = extractClaudeText(data);
+    if (extracted.error) return { error: extracted.error };
     var parsed;
     try {
-      parsed = JSON.parse(text);
+      parsed = JSON.parse(extracted.text);
     } catch (e) {
       return { error: "Claude の応答を JSON として解釈できません" };
     }
     var bad = validateClaudeAnswer(parsed, expectedKeys);
+    if (bad !== null) return { error: bad };
+    return { answer: parsed };
+  }
+
+  // 一括モード(Issue #48)の応答の検証。answer はマスのキー(expectedKeys = queue の
+  // キー一覧)をそれぞれ持つオブジェクトで、各値は digit 判定と同じ基準
+  // (validateClaudeAnswer(answer[key], DIGITS))を満たす必要がある。Worker の
+  // validateAllAnswers(docs/DESIGN.md 3.3)と同じ考え方で、どのマスで落ちたかが
+  // わかる文言にする。
+  function validateClaudeAllAnswer(answer, expectedKeys) {
+    if (!answer || typeof answer !== "object" || Array.isArray(answer)) return "Claude の応答が JSON オブジェクトではありません";
+    var keys = Object.keys(answer);
+    if (keys.length !== expectedKeys.length) return "Claude の応答のキーが対象マスと一致していません";
+    for (var i = 0; i < expectedKeys.length; i++) {
+      var k = expectedKeys[i];
+      if (!Object.prototype.hasOwnProperty.call(answer, k)) return "Claude の応答のキーが対象マスと一致していません";
+      var bad = validateClaudeAnswer(answer[k], DIGITS);
+      if (bad !== null) return k + " の応答: " + bad;
+    }
+    return null;
+  }
+
+  // 一括モードの応答から JSON をまとめて取り出す。{ answer } か { error }。
+  // answer はマスのキー → { choice, probabilities, confidence } のオブジェクト。
+  function parseClaudeAllAnswer(data, expectedKeys) {
+    var extracted = extractClaudeText(data);
+    if (extracted.error) return { error: extracted.error };
+    var parsed;
+    try {
+      parsed = JSON.parse(extracted.text);
+    } catch (e) {
+      return { error: "Claude の応答を JSON として解釈できません" };
+    }
+    var bad = validateClaudeAllAnswer(parsed, expectedKeys);
     if (bad !== null) return { error: bad };
     return { answer: parsed };
   }
@@ -2301,6 +2464,58 @@ var PAGE_HTML = `<!doctype html>
     };
   }
 
+  // 一括モード(Issue #48)の1周ぶん(Claude 経路)。judgeCellClaude / askCellClaude と
+  // 同じ組み立て。戻り値は askAllJev と同じ形 { cells, request }(cells は
+  // マスのキー → { choice, probabilities, confidence })。
+  async function askAllClaude(puzzle, signal) {
+    var key = loadAnthropicKey();
+    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」でキーを保存してください)");
+    var keys = selectionKeys();
+    var body = buildClaudeAllRequest(puzzle, keys);
+    var res;
+    try {
+      res = await fetch(ANTHROPIC_MESSAGES_URL, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "x-api-key": key,
+          "anthropic-version": ANTHROPIC_VERSION,
+          "anthropic-dangerous-direct-browser-access": "true"
+        },
+        body: JSON.stringify(body),
+        signal: signal
+      });
+    } catch (e) {
+      if (e && e.name === "AbortError") throw e;
+      var netErr = new Error("Claude API に接続できません: " + (e && e.message ? e.message : String(e)));
+      netErr.request = body;
+      netErr.transient = true;
+      throw netErr;
+    }
+    var data = null;
+    try {
+      data = await res.json();
+    } catch (e) {
+      if (e && e.name === "AbortError") throw e;
+      data = null;
+    }
+    if (!res.ok) {
+      var message = "Claude API HTTP " + res.status;
+      if (data && data.error && typeof data.error.message === "string") message += ": " + data.error.message;
+      var httpErr = new Error(message);
+      httpErr.request = body;
+      if (isTransientClaudeStatus(res.status)) httpErr.transient = true;
+      throw httpErr;
+    }
+    var parsed = parseClaudeAllAnswer(data, keys);
+    if (parsed.error) {
+      var formatErr = new Error(parsed.error);
+      formatErr.request = body;
+      throw formatErr;
+    }
+    return { cells: parsed.answer, request: body };
+  }
+
   // -------------------------------------------------------------------
   // 集計ビュー: 記録の読み書き(SPEC F1 拡張2、docs/DESIGN.md 4.1 / 4.2)。
   // localStorage が無い・例外を投げる・壊れた JSON が入っている、いずれの場合も
@@ -2424,6 +2639,12 @@ var PAGE_HTML = `<!doctype html>
     // queue から取り除かれてから数字判定(focusCellForDigit)に進む。
     if (state.orderMode === "confidence") {
       selectNextCell(token);
+      return;
+    }
+    // 一括モード(Issue #48): 周の最初の呼び出しでまだ askAll() していなければ
+    // (allResults === null)1回だけ呼び、以降はキャッシュから1マスずつ確定する。
+    if (state.orderMode === "all") {
+      focusNextAll(token);
       return;
     }
     var cell = queue.shift();
@@ -2569,6 +2790,99 @@ var PAGE_HTML = `<!doctype html>
     });
   }
 
+  // 一括モード(Issue #48)の周の入口。allResults(この周のキャッシュ)がまだ無ければ
+  // askAllRound() で1回だけ呼び、届いたら1マスずつ focusCellFromCache() へ渡す。
+  // 既にキャッシュがある(= 応答済み、または停止/再開で戻ってきた)ならすぐ次のマスへ。
+  function focusNextAll(token) {
+    if (allResults === null) {
+      askAllRound(token);
+      return;
+    }
+    var cell = queue.shift();
+    focusCellFromCache(cell, token);
+  }
+
+  // 一括モードの周ぶんの呼び出し。応答は "r0c2" 形式のキーで届くので "r-c" 形式に
+  // 変換して allResults に持つ(state.values / focusedKey と同じキー形式に揃える)。
+  function askAllRound(token) {
+    state.allFetching = true;
+    state.focusedKey = null;
+    state.currentProbs = null;
+    pendingCommit = null;
+    render();
+
+    var requestedCount = queue.length;
+    inflightController = new AbortController();
+    askAll(inflightController.signal).then(function (result) {
+      if (!isCurrent(token)) return;
+      if (result.request && typeof result.request === "object") {
+        state.lastAllRequest = { request: result.request, failed: false, count: requestedCount };
+      }
+      var cells = result.cells || {};
+      var converted = {};
+      var keys = Object.keys(cells);
+      for (var i = 0; i < keys.length; i++) {
+        var m = /^r(\\d)c(\\d)$/.exec(keys[i]);
+        if (!m) continue;
+        converted[m[1] + "-" + m[2]] = cells[keys[i]];
+      }
+      allResults = converted;
+      state.allFetching = false;
+      focusNextAll(token);
+    }, function (err) {
+      if (!isCurrent(token)) return;
+      if (err && err.name === "AbortError") return;
+      if (err && err.request && typeof err.request === "object") {
+        state.lastAllRequest = { request: err.request, failed: true, count: requestedCount };
+      }
+      state.allFetching = false;
+      // 一時的な失敗(Issue #43)は停止扱い(queue は変えていないので、再開は
+      // 同じ周のまま askAllRound() をやり直す)。それ以外は従来どおり showError()。
+      if (err && err.transient) {
+        pauseForTransientError(err);
+        return;
+      }
+      showError(err && err.message ? err.message : String(err));
+    }).catch(function (err) {
+      if (!isCurrent(token)) return;
+      showError("画面の更新に失敗しました: " + (err && err.message ? err.message : String(err)));
+    });
+  }
+
+  // 一括モードの1マスぶん。focusCellForDigit と同じ「フォーカス→バー表示→確定→次へ」の
+  // 流れだが、judgeCell() を呼ばずキャッシュ(allResults)から読むだけなので fetch は
+  // 発生しない(#48: 1周1回の呼び出しで済ませるのが目的)。
+  function focusCellFromCache(cell, token) {
+    var key = cell.r + "-" + cell.c;
+    state.focusedKey = key;
+    state.currentProbs = null;
+    pendingCommit = null;
+    render();
+
+    var result = allResults ? allResults[key] : null;
+    if (!result) {
+      showError("一括の結果に対象マスがありません: " + key);
+      return;
+    }
+    var probs = DIGITS.map(function (d) {
+      var p = result.probabilities ? result.probabilities[d] : 0;
+      return { digit: d, pct: Math.round((typeof p === "number" ? p : 0) * 100), isPick: d === result.choice };
+    });
+    state.currentProbs = probs;
+    pendingCommit = { r: cell.r, c: cell.c, choice: result.choice, confidence: result.confidence, probabilities: result.probabilities };
+    render();
+    var beforeCommitMs = state.speedMode === "slow" ? SLOW_BEFORE_COMMIT_MS : FAST_BEFORE_COMMIT_MS;
+    setTimeout(function () {
+      if (!isCurrent(token)) return;
+      commitFocused();
+      var afterCommitMs = state.speedMode === "slow" ? SLOW_AFTER_COMMIT_MS : FAST_AFTER_COMMIT_MS;
+      setTimeout(function () {
+        if (!isCurrent(token)) return;
+        focusNext();
+      }, afterCommitMs);
+    }, beforeCommitMs);
+  }
+
   function commitFocused() {
     if (!pendingCommit) return;
     var r = pendingCommit.r;
@@ -2588,7 +2902,12 @@ var PAGE_HTML = `<!doctype html>
     var probs = pendingCommit.probabilities;
     var pc = probs && typeof probs[pendingCommit.choice] === "number" ? probs[pendingCommit.choice] : null;
     var conf = typeof pendingCommit.confidence === "number" ? pendingCommit.confidence : null;
-    appendRecord({
+    // 一括モード(Issue #48)は m を "jev/all"(Claude は currentModelId() + "/all"、
+    // 例 "claude-opus-5+think/all")にし、o:"all" を添える(較正図で jev/all のように
+    // 別項目として絞り込めるように。SPEC 3章)。他のモードは従来どおり currentModelId()。
+    var isAll = state.orderMode === "all";
+    var modelId = isAll ? (state.modelMode === "claude" ? currentModelId() + "/all" : "jev/all") : currentModelId();
+    var record = {
       t: Date.now(),
       p: puzzleId(),
       r: r,
@@ -2598,8 +2917,10 @@ var PAGE_HTML = `<!doctype html>
       pc: pc,
       conf: conf,
       ok: correct,
-      m: currentModelId() // どのモデルの判定か(Issue #37)。無い記録は Jev 扱い
-    });
+      m: modelId // どのモデルの判定か(Issue #37)。無い記録は Jev 扱い
+    };
+    if (isAll) record.o = "all";
+    appendRecord(record);
     // 次の結果が来るまで表示に残す(最速モードでも判定が見えるように)
     state.lastJudgment = {
       r: r,
@@ -2620,6 +2941,9 @@ var PAGE_HTML = `<!doctype html>
 
   function finalizeRound() {
     var token = runToken;
+    // 一括モード(Issue #48)のこの周のキャッシュは、周が変わるたびに空にする
+    // (次の周は改めて askAllRound() で1回聞く)。
+    allResults = null;
     state.roundLog.push(formatRoundSummary(state.round, roundTally.correct, roundTally.total));
     var decision = shouldStop(state.round, roundWrong.length);
     if (decision === "solved") {
@@ -2704,6 +3028,10 @@ var PAGE_HTML = `<!doctype html>
     // 再開(run())はマス選びからやり直す。
     state.selecting = false;
     state.cellProbs = null;
+    // 一括モード(Issue #48)の呼び出し中に止めた場合: in-flight は上で abort 済み。
+    // queue は変えていない(askAllRound はまだ queue.shift() していない)ので再開は
+    // 同じ周のまま askAllRound() をやり直す。allResults(キャッシュ)は保つ。
+    state.allFetching = false;
     // 手動停止には理由が無い(null)。一時的な失敗による停止は理由文言を持つ(Issue #43)
     state.pauseReason = reason;
     render();
@@ -2744,6 +3072,10 @@ var PAGE_HTML = `<!doctype html>
     state.currentProbs = null;
     state.selecting = false;
     state.cellProbs = null;
+    // エラー停止では一括モード(Issue #48)のキャッシュも捨てる(復帰はリセットのみ
+    // なので、途中から再開することはない。SPEC F5)。
+    state.allFetching = false;
+    allResults = null;
     // errorMessage が立つとエラー停止が優先される(isPaused() は false)。以前の
     // 一時的な失敗の理由を残さない(Issue #43)。
     state.pauseReason = null;
@@ -2803,6 +3135,8 @@ var PAGE_HTML = `<!doctype html>
       cellProbs: null,
       lastSelection: null,
       lastCellRequest: null,
+      allFetching: false,
+      lastAllRequest: null,
       pauseReason: null
     };
     queue = [];
@@ -2811,6 +3145,7 @@ var PAGE_HTML = `<!doctype html>
     roundSize = TOTAL_EMPTY;
     started = false;
     pendingCommit = null;
+    allResults = null; // 一括モード(Issue #48)のキャッシュもリセット/新しい問題で捨てる
     render();
   }
 
@@ -2874,7 +3209,7 @@ var PAGE_HTML = `<!doctype html>
     var opts = {};
     if (typeof params.puzzle === "string" && params.puzzle.length === 81) opts.puzzle = params.puzzle;
     if (params.model === "jev" || params.model === "claude") opts.model = params.model;
-    if (params.order === "scan" || params.order === "confidence") opts.order = params.order;
+    if (params.order === "scan" || params.order === "confidence" || params.order === "all") opts.order = params.order;
     if (params.speed === "slow" || params.speed === "fast") opts.speed = params.speed;
     opts.embed = params.embed === "1";
     return opts;
@@ -3032,6 +3367,7 @@ var PAGE_HTML = `<!doctype html>
     var fastActive = state.speedMode === "fast" ? " active" : "";
     var scanActive = state.orderMode === "scan" ? " active" : "";
     var confidenceActive = state.orderMode === "confidence" ? " active" : "";
+    var allOrderActive = state.orderMode === "all" ? " active" : "";
     var easyActive = state.difficulty === "easy" ? " active" : "";
     var normalActive = state.difficulty === "normal" ? " active" : "";
     var hardActive = state.difficulty === "hard" ? " active" : "";
@@ -3048,6 +3384,7 @@ var PAGE_HTML = `<!doctype html>
       "<div id=\\"order-toggle\\">" +
       "<button class=\\"order-btn" + scanActive + "\\" onclick=\\"compareSetOrderMode('scan')\\" " + orderDisabled + ">左上から</button>" +
       "<button class=\\"order-btn" + confidenceActive + "\\" onclick=\\"compareSetOrderMode('confidence')\\" " + orderDisabled + ">確信度順</button>" +
+      "<button class=\\"order-btn" + allOrderActive + "\\" onclick=\\"compareSetOrderMode('all')\\" " + orderDisabled + ">一括</button>" +
       "</div>" +
       "<div id=\\"difficulty-toggle\\">" +
       "<button class=\\"difficulty-btn" + easyActive + "\\" onclick=\\"compareSetDifficulty('easy')\\">やさしい</button>" +
@@ -3121,7 +3458,7 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function compareSetOrderMode(mode) {
-    if (mode !== "scan" && mode !== "confidence") return;
+    if (mode !== "scan" && mode !== "confidence" && mode !== "all") return;
     if (compareEitherRunning() || compareEitherPaused()) return; // 子と同じロック(S2)
     state.orderMode = mode;
     comparePostToFrames({ type: "setOrderMode", mode: mode });
@@ -3321,9 +3658,10 @@ var PAGE_HTML = `<!doctype html>
     var jevActive = state.modelMode === "jev" ? " active" : "";
     var claudeActive = state.modelMode === "claude" ? " active" : "";
     var modelDisabled = modelSettingsLocked() ? "disabled" : "";
-    // 順番トグル(左上から / 確信度順、Issue #38)。モデルトグルと同じ条件でロックする。
+    // 順番トグル(左上から / 確信度順 / 一括、Issue #38・#48)。モデルトグルと同じ条件でロックする。
     var scanActive = state.orderMode === "scan" ? " active" : "";
     var confidenceActive = state.orderMode === "confidence" ? " active" : "";
+    var allOrderActive = state.orderMode === "all" ? " active" : "";
     var orderDisabled = modelSettingsLocked() ? "disabled" : "";
     return "<div class=\\"controls\\">" +
       "<button id=\\"run-btn\\" onclick=\\"" + runOnclick + "\\" " + runDisabled + ">" + runLabel + "</button>" +
@@ -3345,6 +3683,7 @@ var PAGE_HTML = `<!doctype html>
       "<div id=\\"order-toggle\\">" +
       "<button class=\\"order-btn" + scanActive + "\\" aria-pressed=\\"" + (state.orderMode === "scan") + "\\" onclick=\\"setOrderMode('scan')\\" " + orderDisabled + ">左上から</button>" +
       "<button class=\\"order-btn" + confidenceActive + "\\" aria-pressed=\\"" + (state.orderMode === "confidence") + "\\" onclick=\\"setOrderMode('confidence')\\" " + orderDisabled + ">確信度順</button>" +
+      "<button class=\\"order-btn" + allOrderActive + "\\" aria-pressed=\\"" + (state.orderMode === "all") + "\\" onclick=\\"setOrderMode('all')\\" " + orderDisabled + ">一括</button>" +
       "</div>" +
       "</div>";
   }
@@ -3459,6 +3798,11 @@ var PAGE_HTML = `<!doctype html>
       return head + "<p class=\\"muted\\">マス選び中…(候補 " + queue.length + " マス)</p>" + tail;
     }
 
+    // 一括モード(Issue #48)の呼び出し中: 応答が届くまでは座標もバーも無い。
+    if (state.allFetching) {
+      return head + "<p class=\\"muted\\">一括で判定中…(" + queue.length + " マス)</p>" + tail;
+    }
+
     // 結果が届いている最中のマス: 座標とバーをそのまま出す
     if (state.focusedKey && state.currentProbs) {
       var parts = state.focusedKey.split("-");
@@ -3511,6 +3855,16 @@ var PAGE_HTML = `<!doctype html>
       "<pre class=\\"prompt-json\\">" + escapeHtml(JSON.stringify(req, null, 2)) + "</pre>";
   }
 
+  // 一括モード(Issue #48)の「モデルに送ったプロンプト」1件ぶん。1周ぶんの request は
+  // 空マスの数だけ質問を含み大きいので、「質問 N 問」の要約行 + 折りたたみ(<details>)で出す
+  // (allReq = { request, failed, count })。
+  function renderAllRequestBlock(allReq) {
+    var failedNote = allReq.failed ? "(このプロンプトで失敗)" : "";
+    var summary = "<p class=\\"muted\\">一括: 質問 " + allReq.count + " 問" + failedNote + "</p>";
+    return summary + "<details class=\\"prompt-details\\"><summary>プロンプトを表示</summary>" +
+      "<pre class=\\"prompt-json\\">" + escapeHtml(JSON.stringify(allReq.request, null, 2)) + "</pre></details>";
+  }
+
   // 「モデルに送ったプロンプト」パネル(Issue #34、#37、#38)。Jev なら Worker が env.AI.run に渡した
   // ペイロード(request)をそのまま JSON で表示する。フロント側で組み立て直さない
   // (handleJudge と二重管理にしないため)。停止中・エラー時も直近の値を残す。
@@ -3519,6 +3873,15 @@ var PAGE_HTML = `<!doctype html>
   function renderPromptPanel() {
     var head = "<div id=\\"prompt-panel\\" class=\\"panel\\"><p class=\\"panel-title\\">モデルに送ったプロンプト</p>";
     var tail = "</div>";
+
+    // 一括モード(Issue #48)は「一括」1段(質問N問の要約 + 折りたたみ)。
+    if (state.orderMode === "all") {
+      var allReq = state.lastAllRequest;
+      if (!allReq) {
+        return head + "<p class=\\"muted\\">まだ判定していません(実行すると直近の一括判定に使ったプロンプトが表示されます)</p>" + tail;
+      }
+      return head + renderAllRequestBlock(allReq) + tail;
+    }
 
     if (state.orderMode !== "confidence") {
       var req = state.lastRequest;
