@@ -104,8 +104,8 @@ Durable Object は同じ名前のインスタンスが世界に1つしか存在�
    - **行・列・箱の矛盾は検証しない**。過去の周の不正解の推測を正誤問わず残して送る設計なので、矛盾した盤面が来るのは正常な状態(8 章)
    - 盤面はブラウザ側のジェネレーターが作る(4.2 `generatePuzzle`)ので、Worker は特定の問題の初期配置を持たない。`GIVEN` も `SOLUTION` も Worker 側には無い(1 章・10 章)
 4. `criteria` を `{ "1": "the digit 1", ..., "9": "the digit 9" }` として生成
-5. `env.AI.run("typesafe/jev", { state, questions })` を呼ぶ。例外は 502(`raw` に例外メッセージを200文字まで入れ、`console.error` でログを残す)
-6. 返ってきたレスポンスから `answers.digit` を取り出して検証し(`extractAnswer` → `validateAnswer`)、次のどれかを満たさなければ 502(`raw` に生レスポンスを添えて返す。デバッグ用)
+5. `env.AI.run("typesafe/jev", payload)`(`payload = { state, questions }`)を呼ぶ。例外は 502(`raw` に例外メッセージを200文字まで入れ、`console.error` でログを残す)。**この 502 にも `request: payload` を添える**(Issue #34。フロントが「何を送って失敗したか」を確認できるように)
+6. 返ってきたレスポンスから `answers.digit` を取り出して検証し(`extractAnswer` → `validateAnswer`)、次のどれかを満たさなければ 502(`raw` に生レスポンスを、**`request: payload` も**添えて返す。デバッグ用・Issue #34)
    - レスポンスがオブジェクトである
    - `state` フィールドがある場合、その値が `"Completed"` である(AI Gateway のラッパー。3.4)。違えば中身を見ずに 502
    - `answers` の取り出しは **`result` がオブジェクトなら `result.answers`、そうでなければトップレベルの `answers`**。ゲートウェイのラッパーが将来外れても動くようにするための2段構え(3.4)
@@ -113,7 +113,7 @@ Durable Object は同じ名前のインスタンスが世界に1つしか存在�
    - `probabilities` がオブジェクトで、キーがちょうど `"1"`〜`"9"` の9個。値はすべて有限の数値
    - `choice` が文字列で、`"1"`〜`"9"` のいずれか
    - `confidence` が有限の数値。**値の妥当性は見ない**(Jev 独自の確信度で `probabilities[choice]` とは一致しないため。3.4 / SPEC 4章)
-7. `{ probabilities, choice, confidence }` に絞って 200 で返す。`confidence` は Jev の値をそのまま通す(`probabilities[choice]` に差し替えない)
+7. `{ probabilities, choice, confidence, request }` に絞って 200 で返す。`confidence` は Jev の値をそのまま通す(`probabilities[choice]` に差し替えない)。`request` は **同じ `payload` をそのまま**渡す(別オブジェクトを組み立て直さない)。フロントの「Jev に送ったプロンプト」パネル(4.2 `renderPromptPanel`)がこれをそのまま表示する(Issue #34)。400/415/429/503 には `request` を付けない(まだ `payload` を組み立てていないため)
 8. `X-RateLimit-Remaining-IP` / `X-RateLimit-Remaining-Global`(その時点の残り回数)は、**レート制限を通過したすべてのレスポンス** に付く(`RATE_LIMITER` バインディングがあるとき。無いフェイルオープン時は残数が存在しないので付かない)。200 だけでなく、その後の 400(入力不正)や 502(AI 失敗・形式不正)にも付く(どれも1回として数えているため)。レート制限より手前で止まる 415 と、制限に引っかかった 429 / 503 には付かない
 
 `state` はオブジェクトで渡す(Jev は string / object / array を受け付ける):
@@ -221,8 +221,12 @@ var state = {
   difficulty: "normal", // "easy" | "normal" | "hard"。次の newPuzzle() のヒント数に効く(SPEC F1/F4')
   errorMessage: null,  // エラーボックスに出す文言。null なら非表示
   stoppedAtLimit: false, // 15周の安全弁で止まったか(完了バナーの出し分け)
-  lastJudgment: null   // 直前に確定した1件 { r, c, choice, confidence, status, probs }。
+  lastJudgment: null,  // 直前に確定した1件 { r, c, choice, confidence, status, probs }。
                        // 次の結果が来るまで表示に残す(最速モードでも判定が見えるように)
+  lastRequest: null    // 直近の判定で Worker が Jev に渡したペイロード(/api/judge の
+                       // レスポンスの request をそのまま保持。3.3 手順7)。「Jev に送った
+                       // プロンプト」パネル(renderPromptPanel)が表示する。停止中・
+                       // エラー時も消さず、reset() / newPuzzle() でだけ null に戻す(Issue #34)
 };
 // 描画に不要な進行管理はモジュール変数
 var queue = [];                 // この周でまだ判定していないマス [{r,c}]
@@ -269,17 +273,18 @@ var inflightController = null;  // in-flight の /api/judge 用 AbortController(
 | `isCurrent(token)` | `state.running && token === runToken`。古い世代のコールバックを弾く(4.3) |
 | `isPaused()` | `started && !state.running && !state.done && !state.errorMessage`。「実行を始めた後、停止していて、完了もエラーもしていない」状態(SPEC F1、Issue #32)。`renderControls()` の「再開」ラベルと `renderCurrentPanel()` の「停止中」表示で使う |
 | `judgeCell(r,c,signal)` | `buildSnapshot()` を作って `/api/judge` を `fetch`(`signal` をそのまま渡す。`focusNext` が渡す `inflightController.signal`)。非2xxは `Error` にして投げる |
-| `focusNext()` | 先頭で `runToken` を捕まえ、`queue` から1つ取り出しフォーカス→(リクエストごとに新しい `AbortController` を `inflightController` に作って)`judgeCell`→バー表示→(待ち)→`commitFocused`→(待ち)→再帰。`queue` が空なら `finalizeRound`。`judgeCell` が `AbortError` で reject したときは(世代トークンの判定と同じ扱いで)無視して `return` し、`showError` には流さない(4.3、Issue #19) |
+| `focusNext()` | 先頭で `runToken` を捕まえ、`queue` から1つ取り出しフォーカス→(リクエストごとに新しい `AbortController` を `inflightController` に作って)`judgeCell`→バー表示・`result.request` があれば `state.lastRequest` に保存(Issue #34)→(待ち)→`commitFocused`→(待ち)→再帰。`queue` が空なら `finalizeRound`。`judgeCell` が `AbortError` で reject したときは(世代トークンの判定と同じ扱いで)無視して `return` し、`showError` には流さない(4.3、Issue #19) |
 | `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong`/`state.lastJudgment` を更新。`pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない。正誤が確定するこの時点で `appendRecord()` を呼び、集計ビュー用の1件を記録する |
 | `finalizeRound()` | ログ追記→`shouldStop` の結果で完了 / 強制終了 / 次の周(`queue = nextQueue(roundWrong)`)。「次の周」のときは、between-round の `setTimeout` を張る**前**に `state.round` / `queue` / `roundSize` / `roundTally` を更新する。この順序のおかげで、待ち時間中に `stop()` されても次の周の状態が既に確定している(下記 `stop()`、Issue #32) |
 | `stop()` | 実行中の停止(SPEC F1、Issue #32)。`reset()` と同じく `runToken` を進めて in-flight の `/api/judge`(`inflightController.abort()`)と予約済みの `setTimeout` を無効化するが、`reset()` と違って **`state.values` / `state.round` / `state.roundLog` / `roundTally` / `roundSize` / `queue` / `started` は捨てない**。`state.focusedKey` があれば(= 判定中のマスがまだ `commitFocused()` されていない)、その結果を破棄して記録(`appendRecord`)にも残さず、`queue.unshift({r,c})` で queue の先頭に戻す(再開したら同じマスをもう一度聞く。SPEC F2)。周をまたぐ待ち時間中(`finalizeRound()` の between-round の `setTimeout` 待ち)に呼ばれた場合は、その時点で `focusedKey` は既に `null`(`commitFocused()` で消えている)なので何もすることがなく、次の周の先頭から再開する(`finalizeRound()` の更新順序による。SPEC F3)。`state.done` / `state.errorMessage` のときは何もしない(両者は常に `running=false` とセットで立つので `state.running` を見るだけで判定できる) |
 | `run()` | 初回のみ queue を全空マスで初期化し `focusNext` を開始。`started` が既に true なら(= `stop()` した後の再開)queue を作り直さず `focusNext()` を呼ぶだけなので、`stop()` が保った進行状態からそのまま続く |
-| `reset()` | `runToken` を進め、`inflightController` があれば `abort()` して in-flight の `/api/judge` を打ち切り、進行管理と `state` を初期化(`speedMode` / `difficulty` は維持)(Issue #19、#21) |
+| `reset()` | `runToken` を進め、`inflightController` があれば `abort()` して in-flight の `/api/judge` を打ち切り、進行管理と `state` を初期化(`speedMode` / `difficulty` は維持。`lastRequest` も `null` に戻す)(Issue #19、#21、#34) |
 | `showError(message)` | `runToken` を進め、`inflightController` があれば `abort()` して `state.errorMessage` を立て、`running=false` で止める(不変条件4、Issue #19) |
 | `setSpeed(mode)` | `state.speedMode` を切り替えて再描画。実行中でも切り替えられる(4.4) |
 | `setDifficulty(mode)` | `state.difficulty`(`"easy"` / `"normal"` / `"hard"`)を切り替えて再描画。変えただけでは盤面は変わらず、次の `newPuzzle()` の目標ヒント数に効く(Issue #21) |
 | `render()` | `state` から DOM(グリッド・統計・バー・ログ・集計パネル・バナー・ボタン)を **全部 innerHTML で再生成**。周回ログのスクロール位置だけは引き継ぐ |
-| `render*()` | `renderGrid` / `renderLegend` / `renderControls` / `renderErrorBox` / `renderStats`(+`statCard`)/ `renderCurrentPanel`(+`coordLabel` / `renderBars`)/ `renderRoundLog` / `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`。それぞれHTML文字列を返すだけで、DOMには触らない |
+| `render*()` | `renderGrid` / `renderLegend` / `renderControls` / `renderErrorBox` / `renderStats`(+`statCard`)/ `renderCurrentPanel`(+`coordLabel` / `renderBars`)/ `renderPromptPanel` / `renderRoundLog` / `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`。それぞれHTML文字列を返すだけで、DOMには触らない |
+| `renderPromptPanel()` | 「現在の判定」パネルの直下の「Jev に送ったプロンプト」枠(SPEC F1、Issue #34)。`state.lastRequest` があれば `coordLabel`(`lastRequest.state.target` の座標)と、`JSON.stringify(lastRequest, null, 2)` を `escapeHtml` して `<pre class="prompt-json">` に表示する。`null` なら「まだ判定していません」。Worker の `handleJudge` が返す `request` をそのまま表示するだけで、フロント側でペイロードを組み立て直さない(二重管理を避けるため) |
 | `buildCellStyle()` | マスの状態(given/pending/correct/incorrect + focused)からインラインstyle文字列を返す |
 | `escapeHtml(text)` | `innerHTML` に入れる前に `& < > " '` を実体参照にする |
 | `fnv1a32(text)` / `puzzleId()` | 集計ビュー(SPEC F1 拡張2)の問題ID用の簡易ハッシュ。32bit FNV-1a を8桁16進で返す。`puzzleId()` は `GIVEN` の9行を結合した文字列をハッシュ化する |
@@ -380,6 +385,10 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
   実行ボタン(`#run-btn`)は実行中は「停止」(`onclick="stop()"`)、停止中は「再開」
   (`onclick="run()"`、無効化しない)、それ以外(未実行・完了・エラー・生成中)は「実行」
   (完了・エラー・生成中は無効化)を出す
+- 「Jev に送ったプロンプト」パネル(`renderPromptPanel`)は「現在の判定」パネルとは独立して
+  `state.lastRequest` だけを見る。停止中・エラー中でも直前の値をそのまま出し続け、
+  `isPaused()` のような特別扱いはしない(消えるのは `reset()` / `newPuzzle()` のときだけ。
+  Issue #34)
 
 ## 5. データ
 
