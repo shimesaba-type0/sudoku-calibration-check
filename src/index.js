@@ -731,12 +731,16 @@ async function handleJudge(request, env) {
   return jsonResponse(responseBody, 200, rate.headers);
 }
 
-// GET / に付けるセキュリティヘッダー(docs/DESIGN.md 7章)。CORS ヘッダーは付けない。
+// GET / と GET /compare に付けるセキュリティヘッダー(docs/DESIGN.md 7章)。
+// CORS ヘッダーは付けない。CSP の frame-ancestors は 'self'(同一オリジンの
+// iframe だけ許可)。比較モード(/compare、Issue #46)が同じページを iframe で
+// 2枚並べて埋め込む(GET /?embed=1...)ため、'none' のままでは自分自身を
+// 埋め込めない。他サイトからの埋め込みは 'self' のままなので引き続き不可。
 var PAGE_HEADERS = {
   "content-type": "text/html; charset=utf-8",
   "X-Content-Type-Options": "nosniff",
   "Referrer-Policy": "no-referrer",
-  "Content-Security-Policy": "frame-ancestors 'none'",
+  "Content-Security-Policy": "frame-ancestors 'self'",
 };
 
 export default {
@@ -746,7 +750,10 @@ export default {
     if (url.pathname === "/api/status" && request.method === "GET") {
       return readRateLimitStatus(request, env);
     }
-    if (url.pathname === "/" && request.method === "GET") {
+    // 比較モード(GET /compare、Issue #46)は通常ページと同じ PAGE_HTML を返す。
+    // 差は「比較シェル」を描くかどうかだけで、フロント側が location.pathname を
+    // 見て分岐する(docs/DESIGN.md 3.1 / 4章)。
+    if ((url.pathname === "/" || url.pathname === "/compare") && request.method === "GET") {
       return new Response(PAGE_HTML, { headers: PAGE_HEADERS });
     }
     return new Response("Not found", { status: 404 });
@@ -804,7 +811,9 @@ var PAGE_HTML = `<!doctype html>
   }
   #app { max-width: 960px; margin: 0 auto; }
   h1 { margin: 0 0 4px; font-size: 20px; font-weight: 600; letter-spacing: 0.02em; }
-  .subtitle { margin: 0 0 20px; color: var(--muted); font-size: 13px; }
+  .subtitle { margin: 0 0 8px; color: var(--muted); font-size: 13px; }
+  .compare-link { margin: 0 0 20px; font-size: 12px; }
+  .compare-link a, .subtitle a { color: var(--accent); }
   .layout { display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start; }
   .grid-panel { flex: 0 0 auto; }
   .side-panel { flex: 1 1 320px; min-width: 280px; display: flex; flex-direction: column; gap: 16px; }
@@ -923,6 +932,21 @@ var PAGE_HTML = `<!doctype html>
   .calib-chart-title { font-size: 11px; color: var(--muted); margin: 0 0 6px; text-align: center; }
   .calib-chart svg { width: 100%; height: auto; display: block; }
   .calib-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+
+  /* 比較モード(GET /compare、Issue #46) */
+  .compare-topbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 16px; }
+  .compare-frames { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+  .compare-col { flex: 1 1 420px; min-width: 300px; }
+  .compare-status { background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
+  .compare-status h2 { margin: 0 0 4px; font-size: 14px; font-family: "IBM Plex Mono", monospace; }
+  .compare-meta { color: var(--muted); font-size: 12px; }
+  .compare-notice { color: var(--incorrect); font-size: 12px; margin-top: 4px; }
+  .compare-frame { width: 100%; height: 900px; border: 1px solid var(--panel-border); border-radius: 10px; background: var(--panel-bg); }
+
+  @media (max-width: 900px) {
+    .compare-frames { flex-direction: column; }
+    .compare-col { flex-basis: auto; width: 100%; }
+  }
 
   @media (max-width: 640px) {
     .grid { grid-template-columns: repeat(9, 32px); grid-template-rows: repeat(9, 32px); }
@@ -1479,6 +1503,20 @@ var PAGE_HTML = `<!doctype html>
   // Jev への問い合わせ自体を打ち切る(runToken だけだと「結果を無視する」に留まり、
   // Worker 側は最後まで判定してしまう。Issue #19)。
   var inflightController = null;
+  // 埋め込みモード(GET /?embed=1、比較モードの iframe が使う。Issue #46)。
+  // true のときは render() がコントロール・Claude設定・較正図・プロンプト枠・見出しを
+  // 省き、render() のたびに親(window.parent)へ status を postMessage する(4.1/4.2)。
+  var embedMode = false;
+
+  // 比較シェル(GET /compare、Issue #46)専用のモジュール変数。renderCompareShell()
+  // が一度だけ DOM を組み立て、以後は sub要素への直接の innerHTML 差し替えで更新する
+  // (iframe を含む app.innerHTML を丸ごと作り直すと、そのたびに両 iframe が再読み込み
+  // されて進行状況が消えてしまうため。docs/DESIGN.md 8章)。
+  var compareStatus = { jev: null, claude: null }; // 直近の status メッセージ(iframe ごと)
+  var compareStartedAt = null; // 「実行」を押した時刻(ミリ秒)。経過秒の表示に使う
+  var compareFrames = { jev: null, claude: null }; // <iframe> 要素(DOM参照)
+  var compareEls = { topbar: null, statusJev: null, statusClaude: null }; // 更新対象の sub要素
+  var compareGenerating = false; // 「新しい問題」で生成中か(比較シェル版)
 
   // -------------------------------------------------------------------
   // API呼び出し
@@ -2400,6 +2438,352 @@ var PAGE_HTML = `<!doctype html>
   }
 
   // -------------------------------------------------------------------
+  // URL パラメータ・埋め込みモード・比較モード(SPEC F1、Issue #46)
+  // -------------------------------------------------------------------
+
+  // location.search を最小限のクエリ文字列パーサーで読む(URLSearchParams への
+  // 依存を避け、node:vm のテストハーネスに追加のグローバルを増やさないため)。
+  // 同じキーが複数あれば最初の1つだけを使う。
+  function parseQueryString(search) {
+    var result = {};
+    if (typeof search !== "string" || !search) return result;
+    var qs = search.charAt(0) === "?" ? search.slice(1) : search;
+    if (!qs) return result;
+    var parts = qs.split("&");
+    for (var i = 0; i < parts.length; i++) {
+      if (!parts[i]) continue;
+      var eq = parts[i].indexOf("=");
+      var key = eq === -1 ? parts[i] : parts[i].slice(0, eq);
+      var value = eq === -1 ? "" : parts[i].slice(eq + 1);
+      try { key = decodeURIComponent(key.replace(/\\+/g, " ")); } catch (e) { continue; }
+      try { value = decodeURIComponent(value.replace(/\\+/g, " ")); } catch (e) { value = ""; }
+      if (!Object.prototype.hasOwnProperty.call(result, key)) result[key] = value;
+    }
+    return result;
+  }
+
+  // location.search を起動時に1回読む。通常ページ(GET /)の初期値の上書きに使う
+  // (SPEC F1、Issue #46)。既知のキー・値以外は無視する(puzzle は形式チェックのみ
+  // ここで行い、一意解の検証は applyPuzzleFromString() が行う)。
+  function readUrlOptions() {
+    var params = parseQueryString(typeof location !== "undefined" ? location.search : "");
+    var opts = {};
+    if (typeof params.puzzle === "string" && params.puzzle.length === 81) opts.puzzle = params.puzzle;
+    if (params.model === "jev" || params.model === "claude") opts.model = params.model;
+    if (params.order === "scan" || params.order === "confidence") opts.order = params.order;
+    if (params.speed === "slow" || params.speed === "fast") opts.speed = params.speed;
+    opts.embed = params.embed === "1";
+    return opts;
+  }
+
+  // 81文字の文字列("1"〜"9" と "." のみ)を9行のスナップショットに分解する。
+  // 形式が違えば null。
+  function parsePuzzleString(str) {
+    if (typeof str !== "string" || str.length !== 81 || !/^[1-9.]{81}$/.test(str)) return null;
+    var rows = [];
+    for (var r = 0; r < 9; r++) rows.push(str.slice(r * 9, r * 9 + 9));
+    return rows;
+  }
+
+  // puzzle= パラメータ / message の newPuzzle の共通処理。一意解のときだけ
+  // GIVEN / SOLUTION / TOTAL_EMPTY / roundSize を差し替えて true を返す(newPuzzle() が
+  // ジェネレーターの結果を差し替えるのと同じ4項目。docs/DESIGN.md 4.2)。形式不正・
+  // 非一意解はそのまま無視して false を返す(固定問題のまま)。
+  function applyPuzzleFromString(str) {
+    var rows = parsePuzzleString(str);
+    if (!rows) return false;
+    var solutions = [];
+    if (solveCount(rows, 2, solutions) !== 1) return false;
+    GIVEN = rows;
+    SOLUTION = solutions[0];
+    TOTAL_EMPTY = countEmpty(GIVEN);
+    roundSize = TOTAL_EMPTY;
+    return true;
+  }
+
+  // readUrlOptions() の結果を state / embedMode に適用する。localStorage には
+  // 一切書き戻さない(通常ページの設定を汚さない。SPEC F1)。
+  function applyUrlOptions(opts) {
+    if (opts.puzzle) applyPuzzleFromString(opts.puzzle);
+    if (opts.model) state.modelMode = opts.model;
+    if (opts.order) state.orderMode = opts.order;
+    if (opts.speed) state.speedMode = opts.speed;
+    embedMode = !!opts.embed;
+  }
+
+  // state.values の中で status が "correct" の件数(累計正解数)。renderStats() と
+  // postStatus() の両方が使う(重複を避けるための共通化)。
+  function countCorrectValues() {
+    var n = 0;
+    for (var key in state.values) {
+      if (Object.prototype.hasOwnProperty.call(state.values, key) && state.values[key].status === "correct") n++;
+    }
+    return n;
+  }
+
+  // 埋め込みモード(embed=1)の render() のたびに親(比較シェル)へ現況を知らせる
+  // (SPEC F1、Issue #46)。iframe でない(window.parent === window)ときは何もしない。
+  function postStatus() {
+    if (!embedMode) return;
+    if (typeof window === "undefined" || !window.parent || window.parent === window) return;
+    var payload = {
+      type: "status",
+      model: currentModelId(),
+      round: state.round,
+      correct: countCorrectValues(),
+      total: TOTAL_EMPTY,
+      remaining: queue.length,
+      running: state.running,
+      paused: isPaused(),
+      done: state.done,
+      roundsToSolve: state.roundsToSolve,
+      stoppedAtLimit: state.stoppedAtLimit,
+      errorMessage: state.errorMessage
+    };
+    try {
+      window.parent.postMessage(payload, location.origin);
+    } catch (e) {
+      // 親が受け取れなくても埋め込み表示自体は続ける
+    }
+  }
+
+  // 埋め込みモードで親(比較シェル)からの操作を受け付ける(SPEC F1、Issue #46)。
+  // 同一オリジンのメッセージだけを処理する(他オリジンは無視。7章)。
+  function setupEmbedMessageListener() {
+    window.addEventListener("message", function (event) {
+      if (!event || event.origin !== location.origin) return;
+      var data = event.data;
+      if (!data || typeof data !== "object") return;
+      if (data.type === "run") { run(); return; }
+      if (data.type === "stop") { stop(); return; }
+      if (data.type === "reset") { reset(); return; }
+      if (data.type === "newPuzzle" && typeof data.puzzle === "string") {
+        if (applyPuzzleFromString(data.puzzle)) reset();
+        return;
+      }
+      if (data.type === "setSpeed" && typeof data.mode === "string") { setSpeed(data.mode); return; }
+      if (data.type === "setOrderMode" && typeof data.mode === "string") { setOrderMode(data.mode); return; }
+    });
+  }
+
+  // -------------------------------------------------------------------
+  // 比較シェル(GET /compare、Issue #46)。同じ PAGE_HTML を iframe で2枚並べ、
+  // 親であるこのページが postMessage で同時に操作する(判定ループの state / queue /
+  // 世代トークンはページに1組しかないため、2インスタンス化はしない。docs/DESIGN.md 8章)。
+  // -------------------------------------------------------------------
+
+  function compareIframeSrc(model) {
+    var qs = "embed=1" +
+      "&model=" + encodeURIComponent(model) +
+      "&puzzle=" + encodeURIComponent(GIVEN.join("")) +
+      "&speed=" + encodeURIComponent(state.speedMode) +
+      "&order=" + encodeURIComponent(state.orderMode);
+    return "/?" + qs;
+  }
+
+  function compareBothRunning() {
+    return !!(compareStatus.jev && compareStatus.jev.running) && !!(compareStatus.claude && compareStatus.claude.running);
+  }
+
+  function compareStatusText(status) {
+    if (!status) return "未実行";
+    if (status.errorMessage) return "エラー: " + status.errorMessage;
+    if (status.done) {
+      return status.stoppedAtLimit ? "強制終了(" + MAX_ROUNDS + "周)" : "完了(" + status.roundsToSolve + "周)";
+    }
+    if (status.running) return "実行中";
+    if (status.paused) return "停止中";
+    return "未実行";
+  }
+
+  function compareElapsedSeconds() {
+    if (!compareStartedAt) return 0;
+    return Math.max(0, Math.floor((Date.now() - compareStartedAt) / 1000));
+  }
+
+  function renderCompareTopbarHtml() {
+    var bothRunning = compareBothRunning();
+    var runLabel = bothRunning ? "停止" : "実行";
+    var runOnclick = bothRunning ? "compareStop()" : "compareRun()";
+    var slowActive = state.speedMode === "slow" ? " active" : "";
+    var fastActive = state.speedMode === "fast" ? " active" : "";
+    var scanActive = state.orderMode === "scan" ? " active" : "";
+    var confidenceActive = state.orderMode === "confidence" ? " active" : "";
+    var easyActive = state.difficulty === "easy" ? " active" : "";
+    var normalActive = state.difficulty === "normal" ? " active" : "";
+    var hardActive = state.difficulty === "hard" ? " active" : "";
+    var newDisabled = compareGenerating ? "disabled" : "";
+    var newLabel = compareGenerating ? "生成中…" : "新しい問題";
+    return "<div class=\\"controls\\">" +
+      "<button id=\\"compare-run-btn\\" onclick=\\"" + runOnclick + "\\">" + runLabel + "</button>" +
+      "<button id=\\"compare-reset-btn\\" onclick=\\"compareReset()\\">リセット</button>" +
+      "<button id=\\"compare-new-btn\\" onclick=\\"compareNewPuzzle()\\" " + newDisabled + ">" + newLabel + "</button>" +
+      "<div id=\\"speed-toggle\\">" +
+      "<button class=\\"speed-btn" + slowActive + "\\" onclick=\\"compareSetSpeed('slow')\\">じっくり確認</button>" +
+      "<button class=\\"speed-btn" + fastActive + "\\" onclick=\\"compareSetSpeed('fast')\\">最速</button>" +
+      "</div>" +
+      "<div id=\\"order-toggle\\">" +
+      "<button class=\\"order-btn" + scanActive + "\\" onclick=\\"compareSetOrderMode('scan')\\">左上から</button>" +
+      "<button class=\\"order-btn" + confidenceActive + "\\" onclick=\\"compareSetOrderMode('confidence')\\">確信度順</button>" +
+      "</div>" +
+      "<div id=\\"difficulty-toggle\\">" +
+      "<button class=\\"difficulty-btn" + easyActive + "\\" onclick=\\"compareSetDifficulty('easy')\\">やさしい</button>" +
+      "<button class=\\"difficulty-btn" + normalActive + "\\" onclick=\\"compareSetDifficulty('normal')\\">ふつう</button>" +
+      "<button class=\\"difficulty-btn" + hardActive + "\\" onclick=\\"compareSetDifficulty('hard')\\">むずかしい</button>" +
+      "</div>" +
+      "</div>";
+  }
+
+  function renderCompareStatusHtml(which) {
+    var modelId = which === "jev" ? JEV_MODEL_ID : state.claudeModel;
+    var status = compareStatus[which];
+    var round = status ? status.round : 1;
+    var correct = status ? status.correct : 0;
+    var total = status ? status.total : TOTAL_EMPTY;
+    var notice = "";
+    if (which === "claude" && loadAnthropicKey() === null) {
+      notice = "<div class=\\"compare-notice\\">Claude のキー未設定(通常ページの設定パネルで保存してください)</div>";
+    }
+    return "<h2>" + escapeHtml(modelId) + "</h2>" +
+      "<div class=\\"compare-meta\\">経過 " + compareElapsedSeconds() + "秒 ・ " + round + "周目 ・ 正解 " + correct + " / " + total + " ・ " + escapeHtml(compareStatusText(status)) + "</div>" +
+      notice;
+  }
+
+  function renderCompareTopbarInPlace() {
+    if (compareEls.topbar) compareEls.topbar.innerHTML = renderCompareTopbarHtml();
+  }
+
+  function renderCompareStatusInPlace(which) {
+    var el = which === "jev" ? compareEls.statusJev : compareEls.statusClaude;
+    if (el) el.innerHTML = renderCompareStatusHtml(which);
+  }
+
+  function comparePostToFrames(message) {
+    if (compareFrames.jev && compareFrames.jev.contentWindow) {
+      compareFrames.jev.contentWindow.postMessage(message, location.origin);
+    }
+    if (compareFrames.claude && compareFrames.claude.contentWindow) {
+      compareFrames.claude.contentWindow.postMessage(message, location.origin);
+    }
+  }
+
+  function compareRun() {
+    if (compareBothRunning()) { compareStop(); return; }
+    compareStartedAt = Date.now();
+    comparePostToFrames({ type: "run" });
+    renderCompareTopbarInPlace();
+  }
+
+  function compareStop() {
+    comparePostToFrames({ type: "stop" });
+    renderCompareTopbarInPlace();
+  }
+
+  function compareReset() {
+    compareStartedAt = null;
+    compareStatus = { jev: null, claude: null };
+    comparePostToFrames({ type: "reset" });
+    renderCompareTopbarInPlace();
+    renderCompareStatusInPlace("jev");
+    renderCompareStatusInPlace("claude");
+  }
+
+  function compareSetSpeed(mode) {
+    if (mode !== "slow" && mode !== "fast") return;
+    state.speedMode = mode;
+    comparePostToFrames({ type: "setSpeed", mode: mode });
+    renderCompareTopbarInPlace();
+  }
+
+  function compareSetOrderMode(mode) {
+    if (mode !== "scan" && mode !== "confidence") return;
+    state.orderMode = mode;
+    comparePostToFrames({ type: "setOrderMode", mode: mode });
+    renderCompareTopbarInPlace();
+  }
+
+  function compareSetDifficulty(mode) {
+    if (mode !== "easy" && mode !== "normal" && mode !== "hard") return;
+    state.difficulty = mode;
+    renderCompareTopbarInPlace();
+  }
+
+  // 「新しい問題」(比較シェル版)。既存の generatePuzzleWithRetry() で盤面を作り、
+  // 両 iframe に newPuzzle を送る(iframe 自体は作り直さない。src の差し替えによる
+  // 再読み込みをしない設計。docs/DESIGN.md 8章)。
+  function compareNewPuzzle() {
+    if (compareGenerating) return;
+    compareGenerating = true;
+    renderCompareTopbarInPlace();
+    var targetGivens = DIFFICULTY_GIVENS[state.difficulty] || DEFAULT_TARGET_GIVENS;
+    setTimeout(function () {
+      try {
+        var puzzle = generatePuzzleWithRetry(targetGivens);
+        GIVEN = puzzle.given;
+        SOLUTION = puzzle.solution;
+        TOTAL_EMPTY = countEmpty(GIVEN);
+        roundSize = TOTAL_EMPTY;
+        compareStartedAt = null;
+        compareStatus = { jev: null, claude: null };
+        comparePostToFrames({ type: "newPuzzle", puzzle: GIVEN.join("") });
+      } finally {
+        compareGenerating = false;
+      }
+      renderCompareTopbarInPlace();
+      renderCompareStatusInPlace("jev");
+      renderCompareStatusInPlace("claude");
+    }, 0);
+  }
+
+  function updateCompareStatus(which, status) {
+    compareStatus[which] = status;
+    renderCompareStatusInPlace(which);
+    renderCompareTopbarInPlace();
+  }
+
+  // 子(iframe)からの status メッセージを受け取る。同一オリジンかつ、どちらの
+  // iframe から届いたか(event.source)を確認してから振り分ける(7章)。
+  function setupCompareMessageListener() {
+    window.addEventListener("message", function (event) {
+      if (!event || event.origin !== location.origin) return;
+      var data = event.data;
+      if (!data || typeof data !== "object" || data.type !== "status") return;
+      if (compareFrames.jev && event.source === compareFrames.jev.contentWindow) { updateCompareStatus("jev", data); return; }
+      if (compareFrames.claude && event.source === compareFrames.claude.contentWindow) { updateCompareStatus("claude", data); return; }
+    });
+  }
+
+  // 比較シェルの初期描画。app.innerHTML を組み立てるのはここで最初の1回だけ
+  // (iframe を含むため。以後の更新は renderCompareTopbarInPlace() /
+  // renderCompareStatusInPlace() が sub要素だけを差し替える。docs/DESIGN.md 8章)。
+  function renderCompareShell() {
+    var app = document.getElementById("app");
+    app.innerHTML =
+      "<h1>数独キャリブレーションチェック — 比較モード</h1>" +
+      "<p class=\\"subtitle\\">同じ問題を Jev と Claude に同時に解かせて見比べる ・ <a href=\\"/\\">通常モードへ</a></p>" +
+      "<div class=\\"compare-topbar\\">" + renderCompareTopbarHtml() + "</div>" +
+      "<div class=\\"compare-frames\\">" +
+      "<div class=\\"compare-col\\">" +
+      "<div class=\\"compare-status\\">" + renderCompareStatusHtml("jev") + "</div>" +
+      "<iframe class=\\"compare-frame\\" src=\\"" + escapeHtml(compareIframeSrc("jev")) + "\\"></iframe>" +
+      "</div>" +
+      "<div class=\\"compare-col\\">" +
+      "<div class=\\"compare-status\\">" + renderCompareStatusHtml("claude") + "</div>" +
+      "<iframe class=\\"compare-frame\\" src=\\"" + escapeHtml(compareIframeSrc("claude")) + "\\"></iframe>" +
+      "</div>" +
+      "</div>";
+    var topbarEls = document.querySelectorAll(".compare-topbar");
+    compareEls.topbar = topbarEls[0];
+    var statusEls = document.querySelectorAll(".compare-status");
+    compareEls.statusJev = statusEls[0];
+    compareEls.statusClaude = statusEls[1];
+    var frameEls = document.querySelectorAll(".compare-frame");
+    compareFrames.jev = frameEls[0];
+    compareFrames.claude = frameEls[1];
+    setupCompareMessageListener();
+  }
+
+  // -------------------------------------------------------------------
   // 描画(docs/DESIGN.md 4.4)。state から毎回 innerHTML で作り直す。
   // -------------------------------------------------------------------
   function escapeHtml(text) {
@@ -2582,10 +2966,7 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function renderStats() {
-    var correctCount = 0;
-    for (var key in state.values) {
-      if (Object.prototype.hasOwnProperty.call(state.values, key) && state.values[key].status === "correct") correctCount++;
-    }
+    var correctCount = countCorrectValues();
     var remaining = TOTAL_EMPTY - correctCount;
     var roundPct = roundSize === 0 ? 0 : Math.round((roundTally.total / roundSize) * 100);
     return "<div id=\\"stats\\" class=\\"stats\\">" +
@@ -2923,30 +3304,56 @@ var PAGE_HTML = `<!doctype html>
     var oldLog = document.querySelector("#round-log ul");
     var savedScroll = oldLog ? oldLog.scrollTop : 0;
     var wasAtBottom = oldLog ? oldLog.scrollHeight - oldLog.scrollTop - oldLog.clientHeight < 4 : true;
-    app.innerHTML =
-      "<h1>数独キャリブレーションチェック</h1>" +
-      "<p class=\\"subtitle\\">Jev (typesafe/jev) または Claude に1マスずつ数字を聞き、確率の較正を目で確かめる</p>" +
-      renderErrorBox() +
-      "<div class=\\"layout\\">" +
-      "<div class=\\"grid-panel\\">" + renderGrid() + renderLegend() + "</div>" +
-      "<div class=\\"side-panel\\">" +
-      renderControls() +
-      renderClaudeSettings() +
-      renderStats() +
-      renderCurrentPanel() +
-      renderPromptPanel() +
-      renderRoundLog() +
-      renderCalibration() +
-      renderBanner() +
-      "</div>" +
-      "</div>";
+    if (embedMode) {
+      // 埋め込みモード(比較シェルの iframe、Issue #46)。コントロール・Claude設定・
+      // 較正図・プロンプト枠・見出しは描かず、グリッド・凡例・統計・現在の判定・
+      // 周回ログ・エラーボックス・完了バナーだけを描く(SPEC F1)。
+      app.innerHTML =
+        renderErrorBox() +
+        "<div class=\\"layout\\">" +
+        "<div class=\\"grid-panel\\">" + renderGrid() + renderLegend() + "</div>" +
+        "<div class=\\"side-panel\\">" +
+        renderStats() +
+        renderCurrentPanel() +
+        renderRoundLog() +
+        renderBanner() +
+        "</div>" +
+        "</div>";
+    } else {
+      app.innerHTML =
+        "<h1>数独キャリブレーションチェック</h1>" +
+        "<p class=\\"subtitle\\">Jev (typesafe/jev) または Claude に1マスずつ数字を聞き、確率の較正を目で確かめる</p>" +
+        "<p class=\\"compare-link\\"><a href=\\"/compare\\">比較モード(Jev / Claude を並べて実行)</a></p>" +
+        renderErrorBox() +
+        "<div class=\\"layout\\">" +
+        "<div class=\\"grid-panel\\">" + renderGrid() + renderLegend() + "</div>" +
+        "<div class=\\"side-panel\\">" +
+        renderControls() +
+        renderClaudeSettings() +
+        renderStats() +
+        renderCurrentPanel() +
+        renderPromptPanel() +
+        renderRoundLog() +
+        renderCalibration() +
+        renderBanner() +
+        "</div>" +
+        "</div>";
+    }
 
     var newLog = document.querySelector("#round-log ul");
     if (newLog) newLog.scrollTop = wasAtBottom ? newLog.scrollHeight : savedScroll;
+
+    if (embedMode) postStatus();
   }
 
   loadClaudeSettings();
-  render();
+  if (typeof location !== "undefined" && location.pathname === "/compare") {
+    renderCompareShell();
+  } else {
+    applyUrlOptions(readUrlOptions());
+    render();
+    if (embedMode) setupEmbedMessageListener();
+  }
 </script>
 </body>
 </html>

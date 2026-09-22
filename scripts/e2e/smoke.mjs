@@ -462,6 +462,40 @@ async function runMockMode(chromium, executablePath, mode) {
       await page.screenshot({ path: path.join(outDir, mode + "-04-after-reset.png") });
       return "error=\"" + message + "\"";
     });
+
+    // [8] 比較モード(GET /compare、Issue #46)。左(Jev)は通常どおり判定でき、
+    // 周回ログが出ること。右(Claude)はこの E2E モックにキーを持たせていないので
+    // (実キーでの疎通はオーナーのブラウザで確認する。CLAUDE.md)、即エラー表示に
+    // なることを確認する(「片方がエラーで止まっても他方は続く」設計。SPEC 3章F1)。
+    await runCheck(8, "/compareで実行すると左(Jev)に周回ログが出る(右はキー未設定でエラー)", async function () {
+      if (mode === "ratelimit") {
+        throw new Skip("ratelimit モードは3件目で429になり周を完走できない");
+      }
+      await page.goto(mockServer.baseUrl + "/compare", { waitUntil: "load" });
+      var frames = page.locator("iframe.compare-frame");
+      await frames.first().waitFor({ state: "attached", timeout: 10000 });
+      assert.equal(await frames.count(), 2, "iframe が2枚ない");
+
+      // 既定は「じっくり確認」(700ms+150ms/マス)で51マスに時間がかかりすぎるため、
+      // 「最速」に切り替えてから実行する(両 iframe に setSpeed が飛ぶ)。
+      await page.locator("#speed-toggle button", { hasText: "最速" }).click();
+      await page.click("#compare-run-btn");
+
+      var jevFrame = page.frameLocator("iframe.compare-frame").nth(0);
+      var jevLog = jevFrame.locator("#round-log li").first();
+      await jevLog.waitFor({ state: "visible", timeout: 30000 });
+      var jevText = await jevLog.textContent();
+      assert.match(jevText, /^1周目:/, "左(Jev)の1行目が「1周目:」で始まらない: " + jevText);
+
+      var claudeFrame = page.frameLocator("iframe.compare-frame").nth(1);
+      var claudeError = claudeFrame.locator("#error-box.error");
+      await claudeError.waitFor({ state: "visible", timeout: 15000 });
+      var claudeMessage = await claudeError.textContent();
+      assert.ok(claudeMessage && claudeMessage.trim().length > 0, "右(Claude)のエラーメッセージが空");
+
+      await page.screenshot({ path: path.join(outDir, mode + "-08-compare.png") });
+      return "jev=\"" + jevText + "\" / claude-error=\"" + claudeMessage + "\"";
+    });
   } finally {
     await browser.close();
     mockServer.server.close();
