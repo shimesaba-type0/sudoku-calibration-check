@@ -38,7 +38,7 @@ TypeSafe AI の決定モデル **Jev**(`typesafe/jev`、Cloudflare Workers AI �
 
 - Cloudflare Workers(Module Worker、JavaScript)。フレームワーク・ビルドステップなし
 - フロントエンドは `src/index.js` 内の `PAGE_HTML` テンプレート文字列に素のHTML/CSS/JSとして埋め込み。**別ファイル化や React 化はしない**(1ファイルで読める・デプロイできることを優先)
-- AI 呼び出しは `env.AI.run('typesafe/jev', {...})` のみ。他のモデル・外部APIは使わない
+- **Worker 側の** AI 呼び出しは `env.AI.run('typesafe/jev', {...})` のみ。Claude(Anthropic API)は **ブラウザから利用者自身のキーで直接呼ぶ**(BYOK、`docs/DESIGN.md` 3.6)。Worker でキーを中継しない・Worker から他のモデルや外部 API を呼ばない
 - Node.js 22 以上、wrangler 4.x(wrangler 4.135 の engines が Node 22 以上。`npm test` のグロブ指定も Node 22 以降の機能)
 
 ## よく使うコマンド
@@ -88,7 +88,8 @@ npm run dev                 # ローカル起動。AIバインディングはリ
 - リセット/新しい問題/エラー時に in-flight の `/api/judge` を `AbortController` で中断する(#19)。周回ロジックの振る舞いテスト(S1〜S4)あり
 - Playwright E2E スモーク(#17): `npm run e2e`(モック)/ `npm run e2e -- --url <URL>`(本番、最大 3 判定)。プロキシ環境では `E2E_PROXY` / `E2E_IGNORE_HTTPS_ERRORS=1`
 - 実行中に「停止」で止め、「再開」で続きから動かせる(#32)。盤面・周回・ログは保持し、判定中だったマスは再開時にもう一度聞く。振る舞いテスト T1〜T6 あり
-- 既知の未実装: 確信度順モードのフロント(#38 の後半。Worker の `ask:"cell"` だけ先に入っている)。SPEC 7 章の拡張 3(Claude API)と 4(ログ異常検知への転用)は依頼があるまで着手しない
+- Claude(Anthropic API)との比較(#37、SPEC 7 章 拡張 3): 「Jev / Claude」トグルと設定パネル(API キー・モデル・思考の有無)。ブラウザから `api.anthropic.com` を直接呼び(BYOK、Worker は関与しない)、structured outputs で `choice` / `probabilities` / `confidence` を自己申告させる。記録に `m`(モデル識別子)が付き、較正図をモデルで絞り込める。**実キーでの疎通はオーナーのブラウザで確認する**(セッションにキーは無い)
+- 既知の未実装: 確信度順モードのフロント(#38 の後半。Worker の `ask:"cell"` だけ先に入っている)。SPEC 7 章の拡張 4(ログ異常検知への転用)は依頼があるまで着手しない。#36(盤面の表現の比較)は Issue 参照
 - IP 単位のレート制限は 2026-09-22 にオーナー判断(Issue #20)で 30 → 120 回/時に緩和済み(1 問 ≈ 78 判定を 1 時間で完走できるように)。全体 500 回/時は据え置き
 - `/api/judge` の `ask:"cell"`(#38 の Worker 側)。空マスの一覧を criteria にして「最も確定しやすいマス」を Jev に choice で聞く。`target` は取らず(付いていたら 400)、200 に `cell:{row,col}` を添える。`ask` 省略時は従来どおり。フロント(順番トグル・ヒートマップ)は #38 の後半で別途
 - Jev に送ったプロンプトの表示枠(#34)。`/api/judge` のレスポンス(200・502)に `request`(Worker が `env.AI.run` に渡した payload)を添え、フロントの「現在の判定」パネル直下に表示する。502 の分は「(このプロンプトで失敗)」付き。振る舞いテスト U1〜U5 あり
