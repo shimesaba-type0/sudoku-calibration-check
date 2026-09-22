@@ -107,6 +107,34 @@ export function jevCellResponse(keys, choice) {
   };
 }
 
+/**
+ * ask:"where" 用の `answers`(Issue #45)。空マスのキーごとに noul の回答を1つ作る。
+ * 値はキーごとに変えてある(取り違えが起きたらテストが落ちるように)。
+ */
+export function jevWhereAnswers(keys) {
+  var answers = {};
+  for (var i = 0; i < keys.length; i++) {
+    answers[keys[i]] = { type: "noul", noul: Number((0.01 * ((i % 90) + 1)).toFixed(4)) };
+  }
+  return answers;
+}
+
+/**
+ * ask:"where" のラッパー付きレスポンス(docs/DESIGN.md 3.4 と同じ形)。
+ * usage は 2026-09-22 に 51 個の noul 質問を1回で投げたときの実測値。
+ */
+export function jevWhereResponse(keys) {
+  return {
+    state: "Completed",
+    result: {
+      model: "jev-1.13.0",
+      answers: jevWhereAnswers(keys),
+      usage: { input_tokens: 1948, output_tokens: 973 },
+    },
+    gatewayMetadata: { keySource: "Unified" },
+  };
+}
+
 // ラッパーの無い素の形式。Cloudflare が将来ゲートウェイを外しても動くことの確認に使う。
 export function bareJevResponse() {
   return {
@@ -264,6 +292,15 @@ export function validBody(overrides) {
 /** ask:"cell"(マス選び)の既定の有効なボディ。target は付けない。 */
 export function validCellBody(overrides) {
   var body = { puzzle: GIVEN.slice(), ask: "cell" };
+  if (overrides) {
+    for (var key in overrides) body[key] = overrides[key];
+  }
+  return body;
+}
+
+/** ask:"where"(数字ごと)の既定の有効なボディ。target は付けず、digit が必須。 */
+export function validWhereBody(overrides) {
+  var body = { puzzle: GIVEN.slice(), ask: "where", digit: "4" };
   if (overrides) {
     for (var key in overrides) body[key] = overrides[key];
   }
