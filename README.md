@@ -1,6 +1,6 @@
 # sudoku-calibration-check
 
-数独のマスを1つずつ「何の数字か」AIに聞き、返ってきた確率と実際の正解を突き合わせて、
+数独のマスを1つずつ「何の数字か」AI(TypeSafe の Jev、または Anthropic の Claude)に聞き、返ってきた確率と実際の正解を突き合わせて、
 **「較正された確率」という主張が本当かを目で確かめる**ための小さな実験用 Web アプリです。
 Cloudflare Workers 1つで完結し、ビルドステップはありません。判定ループ・採点・周回はすべて
 ブラウザ側で動き、Worker は「1マス分の確率を聞いて返す」だけの薄い層です。
@@ -96,7 +96,18 @@ npm run deploy
 `confidence` は **Jev が返す独自の確信度** で、`probabilities[choice]` とは一致しません
 (実測では 0.20 に対して 0.10 など)。較正が本当かを確かめるのに使うのは `probabilities` の
 ほうです(`docs/SPEC.md` 4章 / `docs/DESIGN.md` 3.4)。`request` は Worker が Jev に渡した
-ペイロードそのもので、画面の「Jev に送ったプロンプト」枠がそのまま表示します(502 にも付きます)。
+ペイロードそのもので、画面の「モデルに送ったプロンプト」枠がそのまま表示します(502 にも付きます)。
+
+## Claude(Anthropic API)で比べる(BYOK)
+
+画面の「Jev / Claude」トグルで Claude を選ぶと設定パネルが出ます。**自分の Anthropic API キー**を
+入れて保存すると、ブラウザが `https://api.anthropic.com/v1/messages` を **直接** 呼びます
+(この Worker は関与せず、キーも受け取りません)。キーはそのブラウザの `localStorage` にだけ保存され、
+「キーを消す」で削除できます。利用料は自分の Anthropic アカウントに課金されます。
+モデル(`claude-opus-5` / `claude-sonnet-5` / `claude-haiku-4-5`)と思考の有無を選べ、較正図は
+モデルごとに絞り込めます。1 問あたり約 78 回呼ぶので、Opus 5 + 思考ありでは 1 問で相応の料金になります
+(この経路に Worker のレート制限は効きません)。確率は structured outputs で Claude 自身に申告させたものです
+(`docs/SPEC.md` 4章「Claude 経路」/ `docs/DESIGN.md` 3.6)。
 
 それ以外のパスは 404 です。`/api/judge` は `content-type: application/json` 以外を 415 で
 弾き、CORS ヘッダーも付けていないため、他サイトのページからは呼べません。
