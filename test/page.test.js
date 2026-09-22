@@ -3703,7 +3703,7 @@ test("Z1: 一括の1周は fetch 1回(ask:\"all\")、盤面は buildSelectionSna
   assert.equal(af.pending.length, 0, "1周(51マス)の完走に複数回 fetch している");
 });
 
-test("Z2: 一括の応答後に全マスが順に確定し、記録の m が \"jev/all\"・o が \"all\" になる", { timeout: 10000 }, async () => {
+test("Z2: 一括の応答後に全マスが順に確定し、記録の m が \"typesafe/jev/all\"・o が \"all\" になる", { timeout: 10000 }, async () => {
   var af = makeAbortAwareFetch();
   var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
   ctx.setOrderMode("all");
@@ -3725,7 +3725,7 @@ test("Z2: 一括の応答後に全マスが順に確定し、記録の m が \"j
   var records = ctx.getRecords();
   assert.equal(records.length, ctx.TOTAL_EMPTY, "記録の件数が空マス数と一致しない");
   records.forEach(function (rec) {
-    assert.equal(rec.m, "jev/all", "記録の m が jev/all でない: " + rec.m);
+    assert.equal(rec.m, "typesafe/jev/all", "記録の m が typesafe/jev/all でない: " + rec.m);
     assert.equal(rec.o, "all", "記録の o が all でない: " + rec.o);
   });
   assert.equal(af.pending.length, 0, "一括なのに複数回 fetch している");

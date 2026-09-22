@@ -2938,11 +2938,11 @@ var PAGE_HTML = `<!doctype html>
     var probs = pendingCommit.probabilities;
     var pc = probs && typeof probs[pendingCommit.choice] === "number" ? probs[pendingCommit.choice] : null;
     var conf = typeof pendingCommit.confidence === "number" ? pendingCommit.confidence : null;
-    // 一括モード(Issue #48)は m を "jev/all"(Claude は currentModelId() + "/all"、
-    // 例 "claude-opus-5+think/all")にし、o:"all" を添える(較正図で jev/all のように
+    // 一括モード(Issue #48)は m を currentModelId() + "/all"(Jev なら "typesafe/jev/all"、
+    // Claude なら例 "claude-opus-5+think/all")にし、o:"all" を添える(較正図で typesafe/jev/all のように
     // 別項目として絞り込めるように。SPEC 3章)。他のモードは従来どおり currentModelId()。
     var isAll = state.orderMode === "all";
-    var modelId = isAll ? (state.modelMode === "claude" ? currentModelId() + "/all" : "jev/all") : currentModelId();
+    var modelId = isAll ? currentModelId() + "/all" : currentModelId();
     var record = {
       t: Date.now(),
       p: puzzleId(),
