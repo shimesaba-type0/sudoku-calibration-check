@@ -1639,7 +1639,7 @@ var PAGE_HTML = `<!doctype html>
     lastSelection: null,      // 直近のマス選び1件 { r, c, confidence, candidates, p }
     lastCellRequest: null,    // 直近のマス選びでモデルに送ったリクエスト(Jev なら request、Claude なら送ったボディ)
     pauseReason: null         // 一時的な失敗による停止の理由文言(Issue #43)。手動 stop() では null のまま。
-                               // run() / reset() / newPuzzle() / stop() で null に戻る
+                              // run() / reset() / newPuzzle() / stop() で null に戻る
   };
   // 描画に不要な進行管理はモジュール変数(docs/DESIGN.md 4.1)
   var queue = [];
@@ -1719,8 +1719,10 @@ var PAGE_HTML = `<!doctype html>
     if (res.status !== 429 && res.status !== 503) return;
     error.transient = true;
     if (res.status === 429 && res.headers && typeof res.headers.get === "function") {
-      var retryAfter = Number(res.headers.get("Retry-After"));
-      if (isFinite(retryAfter)) error.retryAfter = retryAfter;
+      // ヘッダーが無い(null)・空文字のときは Number() が 0 になるので、正の有限値のときだけ載せる
+      var raw = res.headers.get("Retry-After");
+      var retryAfter = raw === null ? NaN : Number(raw);
+      if (isFinite(retryAfter) && retryAfter > 0) error.retryAfter = retryAfter;
     }
   }
 
@@ -2012,6 +2014,7 @@ var PAGE_HTML = `<!doctype html>
   // 一時的な失敗(Issue #43)。Claude 経路の 429(レート制限)/ 529(過負荷)/ 5xx は
   // pauseForTransientError() の対象になる(401 などそれ以外の非 2xx は従来どおり showError())。
   function isTransientClaudeStatus(status) {
+    // 529 は 5xx の範囲に含まれるが、Anthropic の「過負荷」として個別に扱う意図を明示しておく
     return status === 429 || status === 529 || (status >= 500 && status < 600);
   }
 
@@ -2507,6 +2510,17 @@ var PAGE_HTML = `<!doctype html>
    * running を見るだけで判定できる。
    */
   function stop() {
+    haltRun(null);
+  }
+
+  /**
+   * 実行を止める共通処理。stop()(手動停止、reason は null)と
+   * pauseForTransientError()(一時的な失敗による停止、reason は理由文言)が使う。
+   * 盤面・周回ログ・統計・queue は保ち、判定中(フォーカス中)のマスは queue の先頭に
+   * 戻して記録に残さない。state.errorMessage は立てない(isPaused() が true になり、
+   * 実行ボタンは「再開」になる)。
+   */
+  function haltRun(reason) {
     if (!state.running) return;
     // 世代を進めて、進行中の fetch / setTimeout のコールバックを無効化する
     runToken += 1;
@@ -2528,8 +2542,8 @@ var PAGE_HTML = `<!doctype html>
     // 再開(run())はマス選びからやり直す。
     state.selecting = false;
     state.cellProbs = null;
-    // 手動停止には理由が無い(一時的な失敗による停止(下記)と区別する。Issue #43)
-    state.pauseReason = null;
+    // 手動停止には理由が無い(null)。一時的な失敗による停止は理由文言を持つ(Issue #43)
+    state.pauseReason = reason;
     render();
   }
 
@@ -2537,38 +2551,21 @@ var PAGE_HTML = `<!doctype html>
    * 一時的な失敗による停止(Issue #43、SPEC F5)。Claude 経路の 429/529/5xx・
    * ネットワーク失敗、Jev 経路(Worker)の 429(レート制限)/503(カウンタ障害)を
    * judgeCell* / askCell* が err.transient = true で投げてきたときに使う。
-   * stop() と同じことをする(盤面・周回ログ・統計・queue は保ち、判定中(フォーカス中)
-   * のマスは queue の先頭に戻して記録に残さない)が、state.errorMessage は立てず
-   * state.pauseReason に理由文言を持つ点だけが違う(isPaused() が true になり、
-   * 実行ボタンは「再開」のまま)。確信度順のマス選び中の一時的な失敗も同じ扱い
-   * (queue は変えない。再開はマス選びからやり直す)。
+   * stop() と同じ後始末(haltRun())をしたうえで、state.pauseReason に理由文言を持つ。
+   * 確信度順のマス選び中の一時的な失敗も同じ扱い(queue は変えない。再開はマス選びからやり直す)。
    */
   function pauseForTransientError(err) {
-    // 世代を進めて、進行中の fetch / setTimeout のコールバックを無効化する
-    runToken += 1;
-    // in-flight の /api/judge があれば打ち切る(stop() と同じ、Issue #19)
-    if (inflightController) {
-      inflightController.abort();
-      inflightController = null;
-    }
-    state.running = false;
-    if (state.focusedKey) {
-      var parts = state.focusedKey.split("-");
-      queue.unshift({ r: Number(parts[0]), c: Number(parts[1]) });
-    }
-    pendingCommit = null;
-    state.focusedKey = null;
-    state.currentProbs = null;
-    state.selecting = false;
-    state.cellProbs = null;
+    haltRun(buildPauseReason(err));
+  }
+
+  function buildPauseReason(err) {
     var message = err && err.message ? err.message : String(err);
     var reason = "一時的な失敗で停止しました: " + message;
     if (err && typeof err.retryAfter === "number" && isFinite(err.retryAfter)) {
       reason += "(" + err.retryAfter + "秒後に再試行できます)";
     }
     reason += " — 少し待って「再開」で続きから";
-    state.pauseReason = reason;
-    render();
+    return reason;
   }
 
   function showError(message) {

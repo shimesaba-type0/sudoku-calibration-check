@@ -2945,6 +2945,20 @@ test("Y1: Claude の 429 は停止扱いになる(errorMessage は立たず、�
   ctx.saveAnthropicKey(TEST_KEY);
   ctx.setModelMode("claude");
   ctx.run();
+  // 先に 3 マスを正常に確定させてから 429 にする(「途中まで埋まった盤面・統計・記録が
+  // 捨てられない」ことを空でない状態で検証するため。レビュー S2)
+  for (var i = 0; i < 3; i++) {
+    await waitFor(function () {
+      return af.pending.length === 1;
+    }, "Y1: " + (i + 1) + "マス目の fetch 待ち");
+    var okEntry = af.pending.shift();
+    var okContent = JSON.parse(okEntry.init.body).messages[0].content;
+    var okTarget = JSON.parse(okContent.slice(okContent.indexOf("\n") + 1)).target;
+    okEntry.resolve(makeClaudeResponse(ctx, okTarget.row, okTarget.col));
+    await waitFor(function () {
+      return ctx.state.values[okTarget.row + "-" + okTarget.col] !== undefined;
+    }, "Y1: " + (i + 1) + "マス目の確定待ち");
+  }
   await waitFor(function () {
     return af.pending.length === 1;
   }, "Y1: fetch 待ち");
@@ -2956,7 +2970,11 @@ test("Y1: Claude の 429 は停止扱いになる(errorMessage は立たず、�
   var recordsBefore = ctx.getRecords().length;
   var roundLogBefore = ctx.state.roundLog.slice();
   var valuesBefore = Object.keys(ctx.state.values).length;
+  var roundBefore = ctx.state.round;
+  var roundTallyBefore = JSON.parse(JSON.stringify(ctx.roundTally));
   var queueLenBefore = ctx.queue.length;
+  assert.equal(valuesBefore, 3, "前提: 3 マス確定している");
+  assert.equal(recordsBefore, 3, "前提: 記録が 3 件ある");
 
   entry.resolve({
     ok: false,
@@ -2977,6 +2995,8 @@ test("Y1: Claude の 429 は停止扱いになる(errorMessage は立たず、�
   // 盤面・周回ログ・queue・記録は保たれ、判定中だったマスが queue の先頭に戻る
   assert.equal(Object.keys(ctx.state.values).length, valuesBefore, "state.values が変わった");
   assert.deepStrictEqual(ctx.state.roundLog, roundLogBefore, "roundLog が変わった");
+  assert.equal(ctx.state.round, roundBefore, "state.round が変わった");
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(ctx.roundTally)), roundTallyBefore, "roundTally が変わった");
   assert.equal(ctx.getRecords().length, recordsBefore, "判定が確定していないのに記録が増えた");
   assert.equal(ctx.queue.length, queueLenBefore + 1, "判定中だったマスが queue に戻っていない");
   assert.equal(ctx.queue[0].r, target.row, "queue の先頭行が判定中のマスでない");
@@ -3197,6 +3217,139 @@ test("Y5: renderCurrentPanel() は一時的な失敗の理由を pause-reason �
   // 比較シェルの見出し(compareStatusText): paused && pauseReason なら「停止中(一時的な失敗)」
   assert.equal(ctx.compareStatusText({ paused: true, pauseReason: "x" }), "停止中(一時的な失敗)");
   assert.equal(ctx.compareStatusText({ paused: true, pauseReason: null }), "停止中");
+});
+
+test("Y6: Jev の 429 で Retry-After が無い・空文字のときは秒数を出さない(0秒後と出ない)", { timeout: 10000 }, async () => {
+  var cases = [
+    { name: "ヘッダー無し", headers: { get: function () { return null; } } },
+    { name: "空文字", headers: { get: function (name) { return name === "Retry-After" ? "" : null; } } },
+    { name: "HTTP 日付", headers: { get: function (name) { return name === "Retry-After" ? "Wed, 21 Oct 2026 07:28:00 GMT" : null; } } },
+    { name: "headers 無し", headers: undefined },
+  ];
+  for (var i = 0; i < cases.length; i++) {
+    var af = makeAbortAwareFetch();
+    var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+    ctx.run();
+    await waitFor(function () {
+      return af.pending.length === 1;
+    }, "Y6: fetch 待ち(" + cases[i].name + ")");
+    var res = {
+      ok: false,
+      status: 429,
+      json: function () {
+        return Promise.resolve({ error: "アクセス元(IP)ごとのレート制限(120回/3600秒)を超えました" });
+      },
+    };
+    if (cases[i].headers) res.headers = cases[i].headers;
+    af.pending.shift().resolve(res);
+    await waitFor(function () {
+      return ctx.isPaused();
+    }, "Y6: 停止待ち(" + cases[i].name + ")");
+    assert.equal(ctx.state.errorMessage, null, cases[i].name + ": エラーボックスが立った");
+    assert.ok(ctx.state.pauseReason && ctx.state.pauseReason.indexOf("レート制限") !== -1, cases[i].name + ": pauseReason に理由が無い: " + ctx.state.pauseReason);
+    assert.ok(ctx.state.pauseReason.indexOf("秒後") === -1, cases[i].name + ": Retry-After が無いのに秒数が出ている: " + ctx.state.pauseReason);
+  }
+});
+
+test("Y7: 確信度順でマス選びは成功し数字判定が 429 のときも停止扱い。選ばれたマスは queue に戻り、再開はマス選びからやり直す", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.setOrderMode("confidence");
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Y7: マス選びの fetch 待ち");
+  var selectEntry = af.pending.shift();
+  var selectBody = JSON.parse(selectEntry.init.body);
+  var keys = ctx.selectionKeys();
+  var chosenKey = keys[0];
+  var queueLenBefore = ctx.queue.length;
+  selectEntry.resolve(makeCellResponse(selectBody.puzzle, keys, chosenKey));
+
+  await waitFor(function () {
+    return ctx.state.selecting === false && af.pending.length === 1;
+  }, "Y7: 数字判定の fetch 待ち");
+  assert.equal(ctx.queue.length, queueLenBefore - 1, "選ばれたマスが queue から取り除かれていない");
+  var cm = /^r(\d)c(\d)$/.exec(chosenKey);
+  var chosenRow = Number(cm[1]);
+  var chosenCol = Number(cm[2]);
+  assert.equal(ctx.state.focusedKey, chosenRow + "-" + chosenCol);
+
+  af.pending.shift().resolve({
+    ok: false,
+    status: 429,
+    headers: { get: function (name) { return name === "Retry-After" ? "30" : null; } },
+    json: function () {
+      return Promise.resolve({ error: "アクセス元(IP)ごとのレート制限(120回/3600秒)を超えました" });
+    },
+  });
+  await waitFor(function () {
+    return ctx.isPaused();
+  }, "Y7: 停止待ち");
+  assert.equal(ctx.state.errorMessage, null, "429 でエラーボックスが立った");
+  assert.ok(ctx.state.pauseReason && ctx.state.pauseReason.indexOf("30") !== -1, "pauseReason に Retry-After の秒数(30)が無い: " + ctx.state.pauseReason);
+  assert.equal(ctx.state.focusedKey, null);
+  assert.equal(ctx.state.cellProbs, null, "state.cellProbs がリセットされていない");
+  assert.equal(ctx.queue.length, queueLenBefore, "判定中だったマスが queue に戻っていない");
+  assert.equal(ctx.queue[0].r, chosenRow, "queue の先頭が判定中だったマスでない(行)");
+  assert.equal(ctx.queue[0].c, chosenCol, "queue の先頭が判定中だったマスでない(列)");
+  assert.equal(ctx.state.values[chosenRow + "-" + chosenCol], undefined, "確定していないのに盤面に値が入った");
+  assert.equal(ctx.getRecords().length, 0, "確定していないのに記録が増えた");
+
+  // 再開はマス選びからやり直し、戻したマスも候補("."、キーに含まれる)に入る
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Y7: 再開後のマス選びの fetch 待ち");
+  var resumedBody = JSON.parse(af.pending[0].init.body);
+  assert.equal(resumedBody.ask, "cell", "再開後にマス選びから始まっていない");
+  assert.equal(resumedBody.puzzle[chosenRow][chosenCol], ".", "戻したマスが候補として空になっていない");
+  assert.ok(Array.prototype.slice.call(ctx.selectionKeys()).indexOf(chosenKey) !== -1, "戻したマスが候補キーに無い");
+  assert.equal(ctx.state.pauseReason, null);
+});
+
+test("Y8: Claude 経路の確信度順マス選び(askCellClaude)の 529 も停止扱い(queue は変わらず、再開はマス選びからやり直す)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  assert.equal(ctx.saveAnthropicKey(TEST_KEY), true);
+  ctx.setModelMode("claude");
+  ctx.setOrderMode("confidence");
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Y8: マス選びの fetch 待ち");
+  var entry = af.pending.shift();
+  assert.equal(entry.url, ANTHROPIC_URL);
+  var body = JSON.parse(entry.init.body);
+  var queueLenBefore = ctx.queue.length;
+  entry.resolve({
+    ok: false,
+    status: 529,
+    json: function () {
+      return Promise.resolve({ type: "error", error: { type: "overloaded_error", message: "Overloaded" } });
+    },
+  });
+  await waitFor(function () {
+    return ctx.isPaused();
+  }, "Y8: 停止待ち");
+  assert.equal(ctx.state.errorMessage, null, "529 でエラーボックスが立った");
+  assert.ok(ctx.state.pauseReason && ctx.state.pauseReason.indexOf("529") !== -1, "pauseReason に 529 が無い: " + ctx.state.pauseReason);
+  assert.equal(ctx.state.selecting, false);
+  assert.equal(ctx.state.cellProbs, null);
+  assert.equal(ctx.queue.length, queueLenBefore, "マス選び中の一時的な失敗で queue の長さが変わった");
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(ctx.state.lastCellRequest)), body, "lastCellRequest が送ったボディと一致しない");
+  ctx.render();
+  assert.ok(!ctx.appElement.innerHTML.includes(TEST_KEY), "innerHTML にキーが出ている");
+
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Y8: 再開後のマス選びの fetch 待ち");
+  assert.equal(af.pending[0].url, ANTHROPIC_URL);
+  var resumedBody = JSON.parse(af.pending[0].init.body);
+  assert.ok(typeof resumedBody.system === "string" && resumedBody.system.indexOf("no target cell this time") !== -1, "再開後にマス選びから始まっていない");
+  assert.equal(ctx.state.selecting, true);
+  assert.equal(ctx.state.pauseReason, null);
 });
 
 // -------------------------------------------------------------------
