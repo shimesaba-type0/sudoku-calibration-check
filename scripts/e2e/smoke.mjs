@@ -367,41 +367,6 @@ async function runMockMode(chromium, executablePath, mode) {
       return "bars=" + barCount;
     });
 
-    // [7] 確信度順モード(Issue #38)。順番トグルを切り替えて最速で実行し、1周目の
-    // ログが出ること・/api/judge の呼び出し数が空マス数のちょうど2倍(マス選び+数字)
-    // であることを確認する。ratelimit モードは3件目で429になり呼び出し数を検証できない
-    // ため対象外(本番モードはこのチェック自体が呼ばれない。runMockMode 専用)。
-    await runCheck(7, "確信度順で1周目のログが出る(/api/judge が空マス数の2倍)", async function () {
-      if (mode === "ratelimit") {
-        throw new Skip("ratelimit モードは3件目で429になり呼び出し数を検証できない");
-      }
-      var judgeCount = 0;
-      var counter = function (req) {
-        if (req.url().indexOf("/api/judge") !== -1) judgeCount += 1;
-      };
-      page.on("request", counter);
-      try {
-        var orderToggle = page.locator("#order-toggle button", { hasText: "確信度順" });
-        var orderCount = await orderToggle.count();
-        if (orderCount === 0) {
-          throw new Skip("順番トグルが無い(Issue #38 のフロントマージ前)");
-        }
-        await orderToggle.click();
-        await page.locator("#speed-toggle button", { hasText: "最速" }).click();
-        await page.click("#run-btn");
-        var logItem = page.locator("#round-log li").first();
-        await logItem.waitFor({ state: "visible", timeout: 30000 });
-        var text = await logItem.textContent();
-        assert.match(text, /^1周目:/, "1行目が「1周目:」で始まらない: " + text);
-        assert.equal(judgeCount, TOTAL_EMPTY * 2, "/api/judge のリクエスト数が空マス数の2倍でない: " + judgeCount);
-        await page.screenshot({ path: path.join(outDir, mode + "-07-confidence-order.png") });
-        return text + " / judge calls=" + judgeCount;
-      } finally {
-        page.off("request", counter);
-        await page.click("#reset-btn");
-      }
-    });
-
     // [6] 「新しい問題」ボタン(#5 マージ前は無い)
     await runCheck(6, "「新しい問題」ボタンで盤面が変わる", async function () {
       var newPuzzleBtn = page.locator("button", { hasText: "新しい問題" });
@@ -416,6 +381,65 @@ async function runMockMode(chromium, executablePath, mode) {
       assert.notDeepEqual(before, after, "「新しい問題」を押しても盤面が変わらない");
       await page.screenshot({ path: path.join(outDir, mode + "-06-new-puzzle.png") });
       return "changed";
+    });
+
+    // [7] 確信度順モード(Issue #38)。順番トグルを切り替えて最速で実行し、1周目の
+    // ログが出ること・/api/judge の呼び出しが「マス選び(ask:cell)と数字が同数で、
+    // 数字が空マス数以上」であることを確認する。総数の厳密一致にしないのは、mixed
+    // モードでは1周目のログ直後に2周目のマス選びが飛ぶことがあり、タイミングで
+    // 1〜2件増えるため(レビュー指摘)。ratelimit モードは3件目で429になるので対象外
+    // (本番モードはこのチェック自体が呼ばれない。runMockMode 専用)。
+    await runCheck(7, "確信度順で1周目のログが出る(/api/judge はマス選びと数字が同数)", async function () {
+      if (mode === "ratelimit") {
+        throw new Skip("ratelimit モードは3件目で429になり呼び出し数を検証できない");
+      }
+      var cellCalls = 0;
+      var digitCalls = 0;
+      var counter = function (req) {
+        if (req.url().indexOf("/api/judge") === -1) return;
+        var ask = "digit";
+        try {
+          var parsed = JSON.parse(req.postData() || "{}");
+          if (parsed && parsed.ask === "cell") ask = "cell";
+        } catch (e) {
+          // ボディが読めなければ digit として数える(モックは常に JSON を送る)
+        }
+        if (ask === "cell") cellCalls += 1;
+        else digitCalls += 1;
+      };
+      // [6] で盤面が差し替わっているので、固定問題(モックが正解を知っている盤面)に戻す
+      await page.goto(mockServer.baseUrl + "/", { waitUntil: "load" });
+      page.on("request", counter);
+      try {
+        var orderToggle = page.locator("#order-toggle button", { hasText: "確信度順" });
+        var orderCount = await orderToggle.count();
+        if (orderCount === 0) {
+          throw new Skip("順番トグルが無い(Issue #38 のフロントマージ前)");
+        }
+        await orderToggle.click();
+        await page.locator("#speed-toggle button", { hasText: "最速" }).click();
+        await page.click("#run-btn");
+        var logItem = page.locator("#round-log li").first();
+        await logItem.waitFor({ state: "visible", timeout: 30000 });
+        var text = await logItem.textContent();
+        // assert と表示で同じ値を使う(以降もリクエストが増え続けるため、ここで固定する)
+        var countedCell = cellCalls;
+        var countedDigit = digitCalls;
+        assert.match(text, /^1周目:/, "1行目が「1周目:」で始まらない: " + text);
+        assert.ok(countedDigit >= TOTAL_EMPTY, "数字の判定が空マス数に満たない: " + countedDigit);
+        assert.ok(
+          countedCell === countedDigit || countedCell === countedDigit + 1,
+          "マス選びと数字の回数が対応していない: cell=" + countedCell + " digit=" + countedDigit
+        );
+        await page.screenshot({ path: path.join(outDir, mode + "-07-confidence-order.png") });
+        return text + " / cell=" + countedCell + " digit=" + countedDigit;
+      } finally {
+        page.off("request", counter);
+        await page.click("#reset-btn");
+        // 順番トグルは reset() をまたいで保持されるので、後続のチェックのために「左上から」に戻す
+        var scanToggle = page.locator("#order-toggle button", { hasText: "左上から" });
+        if ((await scanToggle.count()) > 0) await scanToggle.click();
+      }
     });
 
     // [4] ratelimit モードで赤いエラーボックス → リセットで復帰

@@ -1748,19 +1748,26 @@ var PAGE_HTML = `<!doctype html>
   // 一般化してある(3.3 と同じ考え方)。
   function validateClaudeAnswer(answer, expectedKeys) {
     var keys2 = expectedKeys || DIGITS;
+    // digit(expectedKeys 省略)の文言は #37 のまま。cell は候補マスの文言(Worker の ANSWER_MESSAGES と同じ方針)。
+    var keysMessage = expectedKeys
+      ? "Claude の応答の probabilities が候補マスのキーと一致していません"
+      : "Claude の応答の probabilities が 1〜9 の 9 キーになっていません";
+    var choiceMessage = expectedKeys
+      ? "Claude の応答の choice が候補マスのいずれかではありません"
+      : "Claude の応答の choice が 1〜9 のいずれかではありません";
     if (!answer || typeof answer !== "object") return "Claude の応答が JSON オブジェクトではありません";
     var probabilities = answer.probabilities;
     if (probabilities === null || typeof probabilities !== "object" || Array.isArray(probabilities)) {
       return "Claude の応答に probabilities がありません";
     }
     var keys = Object.keys(probabilities);
-    if (keys.length !== keys2.length) return "Claude の応答の probabilities が期待するキーと一致していません";
+    if (keys.length !== keys2.length) return keysMessage;
     for (var i = 0; i < keys2.length; i++) {
       var k = keys2[i];
-      if (!Object.prototype.hasOwnProperty.call(probabilities, k)) return "Claude の応答の probabilities が期待するキーと一致していません";
+      if (!Object.prototype.hasOwnProperty.call(probabilities, k)) return keysMessage;
       if (typeof probabilities[k] !== "number" || !isFinite(probabilities[k])) return "Claude の応答の probabilities に数値でない値が含まれています";
     }
-    if (typeof answer.choice !== "string" || keys2.indexOf(answer.choice) === -1) return "Claude の応答の choice が期待する候補のいずれかではありません";
+    if (typeof answer.choice !== "string" || keys2.indexOf(answer.choice) === -1) return choiceMessage;
     if (typeof answer.confidence !== "number" || !isFinite(answer.confidence)) return "Claude の応答の confidence が数値ではありません";
     return null;
   }
@@ -2065,6 +2072,7 @@ var PAGE_HTML = `<!doctype html>
       // ヒートマップ用: "r0c2" 形式のキーを "r-c" 形式に変換する。
       var probs = result.probabilities || {};
       var cellProbs = {};
+      var cellProbsMax = 0;
       var probKeys = Object.keys(probs);
       for (var k = 0; k < probKeys.length; k++) {
         var m = /^r(\\d)c(\\d)$/.exec(probKeys[k]);
@@ -2072,8 +2080,10 @@ var PAGE_HTML = `<!doctype html>
         var v = probs[probKeys[k]];
         if (typeof v !== "number" || !isFinite(v)) continue;
         cellProbs[m[1] + "-" + m[2]] = v;
+        if (v > cellProbsMax) cellProbsMax = v;
       }
       state.cellProbs = cellProbs;
+      state.cellProbsMax = cellProbsMax; // ヒートマップの正規化用(マスごとに再計算しない)
       state.lastSelection = {
         r: chosen.row,
         c: chosen.col,
@@ -2083,8 +2093,7 @@ var PAGE_HTML = `<!doctype html>
       };
       var cell = queue.splice(idx, 1)[0];
       state.selecting = false;
-      render();
-      focusCellForDigit(cell, token);
+      focusCellForDigit(cell, token); // この中で render() する
     }, function (err) {
       if (!isCurrent(token)) return;
       if (err && err.name === "AbortError") return;
@@ -2426,12 +2435,12 @@ var PAGE_HTML = `<!doctype html>
     } else if (!isFocused && state.cellProbs && Object.prototype.hasOwnProperty.call(state.cellProbs, key)) {
       // 確信度順モード(Issue #38)のヒートマップ: マス選びの確率が高いほど背景を濃くする。
       // 判定済み(cell あり)・フォーカス中のマスは対象外(上の分岐で既に確定しているため)。
-      var pmax = 0;
-      for (var pk in state.cellProbs) {
-        if (Object.prototype.hasOwnProperty.call(state.cellProbs, pk) && state.cellProbs[pk] > pmax) pmax = state.cellProbs[pk];
-      }
+      // 2 周目以降の候補マスは前の周の不正解値(赤背景)を持つので上の分岐に入り、
+      // ヒートマップは事実上 1 周目(候補がまだ空のとき)だけ出る(SPEC F1)。
+      var pmax = typeof state.cellProbsMax === "number" ? state.cellProbsMax : 0;
       if (pmax > 0) {
-        var alpha = 0.08 + 0.6 * (state.cellProbs[key] / pmax);
+        // 確率が負や pmax 超え(Worker は範囲を検証しない)でも rgba の α を 0〜1 に収める。
+        var alpha = Math.max(0, Math.min(1, 0.08 + 0.6 * (state.cellProbs[key] / pmax)));
         bg = "rgba(125, 211, 252, " + alpha.toFixed(3) + ")";
       }
     }
@@ -2551,7 +2560,7 @@ var PAGE_HTML = `<!doctype html>
       "<span class=\\"muted\\">" + escapeHtml(anthropicKeyHint()) + "</span>" +
       (claudeKeyNotice ? "<span class=\\"claude-notice\\">" + escapeHtml(claudeKeyNotice) + "</span>" : "") +
       "</div>" +
-      "<p class=\\"muted\\">キーはこのブラウザの localStorage にだけ保存し、api.anthropic.com への呼び出し以外には送りません(この Worker には渡りません)。利用料は自分の Anthropic アカウントに課金されます(1 問あたり約 78 回呼びます。この経路にレート制限はありません)。</p>" +
+      "<p class=\\"muted\\">キーはこのブラウザの localStorage にだけ保存し、api.anthropic.com への呼び出し以外には送りません(この Worker には渡りません)。利用料は自分の Anthropic アカウントに課金されます(1 問あたり約 78 回、確信度順ではその倍呼びます。この経路にレート制限はありません)。</p>" +
       "<div class=\\"claude-row\\">" +
       "<label for=\\"claude-model\\">モデル</label>" +
       "<select id=\\"claude-model\\" onchange=\\"setClaudeModel(this.value)\\" " + locked + ">" + options + "</select>" +

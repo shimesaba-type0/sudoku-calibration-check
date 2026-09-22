@@ -2749,3 +2749,148 @@ test("W7: 確信度順でヒートマップの背景と『マス選び: N候補�
   assert.ok(orderToggleMatch, "order-toggle が描画されていない");
   assert.ok(orderToggleMatch[1].indexOf("disabled") !== -1, "実行中に順番トグルが無効化されていない");
 });
+
+test("W8: プロンプト枠は「マス選び」「数字」の2段で、マス選びの失敗(502 の request / abort)を正しく扱う", { timeout: 10000 }, async () => {
+  // 2段表示と lastCellRequest
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.setOrderMode("confidence");
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "W8: マス選びの fetch 待ち");
+  var selectEntry = af.pending.shift();
+  var selectBody = JSON.parse(selectEntry.init.body);
+  var keys = ctx.selectionKeys();
+  var cellRes = makeCellResponse(selectBody.puzzle, keys, keys[0]);
+  var cellJson = await cellRes.json();
+  selectEntry.resolve(makeCellResponse(selectBody.puzzle, keys, keys[0]));
+  await waitFor(function () {
+    return ctx.state.selecting === false && af.pending.length === 1;
+  }, "W8: 数字判定の fetch 待ち");
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(ctx.state.lastCellRequest)), JSON.parse(JSON.stringify(cellJson.request)), "lastCellRequest がマス選びの request と一致しない");
+  var digitEntry = af.pending.shift();
+  var digitBody = JSON.parse(digitEntry.init.body);
+  digitEntry.resolve(makeCorrectResponse(ctx, digitBody.target.row, digitBody.target.col, digitBody.puzzle));
+  await waitFor(function () {
+    return ctx.state.lastRequest !== null;
+  }, "W8: lastRequest 待ち");
+  ctx.render();
+  var html = ctx.appElement.innerHTML;
+  var panel = html.slice(html.indexOf('id="prompt-panel"'), html.indexOf('id="round-log"'));
+  assert.ok(panel.indexOf("マス選び") !== -1 && panel.indexOf("数字") !== -1, "プロンプト枠に「マス選び」「数字」の見出しが無い");
+  assert.equal((panel.match(/<pre class="prompt-json">/g) || []).length, 2, "プロンプト枠の <pre> が2つでない");
+  assert.ok(panel.indexOf("Which empty cell") !== -1, "マス選びの instructions が出ていない");
+  assert.ok(panel.indexOf("Which digit from 1 to 9") !== -1, "数字の instructions が出ていない");
+
+  // マス選びの 502: request がパネルに残り、エラーで止まる
+  var af2 = makeAbortAwareFetch();
+  var ctx2 = runScript(await getPageHtml(), { fetch: af2.fetch });
+  ctx2.setOrderMode("confidence");
+  ctx2.run();
+  await waitFor(function () {
+    return af2.pending.length === 1;
+  }, "W8: 2回目のマス選びの fetch 待ち");
+  var failedRequest = { state: { puzzle: ["........."], note: "x" }, questions: { cell: { type: "choice", instructions: "y", criteria: {} } } };
+  af2.pending.shift().resolve({
+    ok: false,
+    status: 502,
+    json: function () {
+      return Promise.resolve({ error: "AIの呼び出しに失敗しました", raw: "boom", request: failedRequest });
+    },
+  });
+  await waitFor(function () {
+    return ctx2.state.errorMessage !== null;
+  }, "W8: エラー表示待ち");
+  assert.equal(ctx2.state.running, false);
+  assert.equal(ctx2.state.selecting, false, "エラー後も selecting が立ったまま");
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(ctx2.state.lastCellRequest)), failedRequest, "失敗したマス選びの request が残っていない");
+  assert.equal(ctx2.queue.length, ctx2.TOTAL_EMPTY, "エラー時に queue が変わった");
+
+  // マス選び中の reset(): abort され、AbortError はエラー表示にならない
+  var af3 = makeAbortAwareFetch();
+  var ctx3 = runScript(await getPageHtml(), { fetch: af3.fetch });
+  ctx3.setOrderMode("confidence");
+  ctx3.run();
+  await waitFor(function () {
+    return af3.pending.length === 1;
+  }, "W8: 3回目のマス選びの fetch 待ち");
+  var entry3 = af3.pending[0];
+  ctx3.reset();
+  assert.equal(entry3.settled, true, "reset() でマス選びの fetch が abort されていない");
+  for (var i = 0; i < 20; i++) await tick();
+  assert.equal(ctx3.state.errorMessage, null, "AbortError がエラー表示に流れた");
+  assert.equal(ctx3.state.selecting, false);
+  assert.equal(ctx3.state.cellProbs, null);
+});
+
+test("W9: 2周目の数字判定はフォーカスのマスだけ空で、他の候補(前の周の不正解)は推測を残したまま送る(確信度順)", { timeout: 20000 }, async () => {
+  var ctx;
+  var wrongKeys = { "0-2": true, "0-3": true };
+  var wrongAsked = {};
+  var wrongDigits = {};
+  var digitBodies = [];
+  var fetchStub = async function (url, init) {
+    var body = JSON.parse(init.body);
+    if (body.ask === "cell") {
+      var keys = [];
+      for (var r = 0; r < 9; r++) for (var c = 0; c < 9; c++) if (body.puzzle[r][c] === ".") keys.push("r" + r + "c" + c);
+      return makeCellResponse(body.puzzle, keys, keys[0]);
+    }
+    var key = body.target.row + "-" + body.target.col;
+    digitBodies.push({ key: key, puzzle: body.puzzle.slice(), round: ctx.state.round });
+    if (wrongKeys[key] && !wrongAsked[key]) {
+      wrongAsked[key] = true;
+      var correctDigit = ctx.SOLUTION[body.target.row][body.target.col];
+      var wrongDigit = correctDigit === "1" ? "2" : "1";
+      wrongDigits[key] = wrongDigit;
+      var probabilities = {};
+      for (var d = 1; d <= 9; d++) probabilities[String(d)] = String(d) === wrongDigit ? 0.9 : 0.0125;
+      return { ok: true, json: async function () { return { probabilities: probabilities, choice: wrongDigit, confidence: 0.5 }; } };
+    }
+    return makeCorrectResponse(ctx, body.target.row, body.target.col, body.puzzle);
+  };
+  ctx = runScript(await getPageHtml(), { fetch: fetchStub });
+  ctx.setOrderMode("confidence");
+  ctx.setSpeed("fast");
+  ctx.run();
+  await waitFor(function () {
+    return ctx.state.done === true;
+  }, "W9: 完了待ち");
+  assert.equal(ctx.state.roundsToSolve, 2);
+  // 2周目の最初の数字判定(候補は 0-2 と 0-3。マス選びは先頭 r0c2 を選ぶ)
+  var round2 = digitBodies.filter(function (b) { return b.round === 2; });
+  assert.equal(round2.length, 2, "2周目の数字判定が2回でない: " + round2.length);
+  assert.equal(round2[0].key, "0-2");
+  assert.equal(round2[0].puzzle[0][2], ".", "フォーカスのマスが空でない");
+  assert.equal(round2[0].puzzle[0][3], wrongDigits["0-3"], "フォーカス外の候補マスに前の周の推測が残っていない(SPEC F3)");
+  // 2周目の2回目(0-3)のときは 0-2 は既に正解で埋まっている
+  assert.equal(round2[1].key, "0-3");
+  assert.equal(round2[1].puzzle[0][3], ".");
+  assert.equal(round2[1].puzzle[0][2], ctx.SOLUTION[0][2]);
+});
+
+test("W10: 順番トグルは停止中もロックされ、reset() / newPuzzle() をまたいで保持される", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.setOrderMode("confidence");
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "W10: fetch 待ち");
+  ctx.stop();
+  assert.equal(ctx.isPaused(), true);
+  ctx.setOrderMode("scan");
+  assert.equal(ctx.state.orderMode, "confidence", "停止中に順番が切り替わった");
+  ctx.render();
+  assert.ok(/id="order-toggle">\s*<button[^>]*disabled/.test(ctx.appElement.innerHTML), "停止中に順番トグルが無効化されていない");
+  ctx.reset();
+  assert.equal(ctx.state.orderMode, "confidence", "reset() で順番が消えた");
+  ctx.newPuzzle();
+  await waitFor(function () {
+    return ctx.generating === false;
+  }, "W10: 生成待ち");
+  assert.equal(ctx.state.orderMode, "confidence", "newPuzzle() で順番が消えた");
+  ctx.setOrderMode("scan");
+  assert.equal(ctx.state.orderMode, "scan");
+});
