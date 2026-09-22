@@ -261,6 +261,18 @@ Cloudflare 側の都合で変わる。形が違っていたらこの節と `hand
   `newPuzzle()` をまたいで保持し、次回開いたときに `loadClaudeSettings()` で復元する
 - **不変条件**(9 章 1 の Claude 版): Claude に送るボディにも `SOLUTION` 由来の情報を入れない。
   `judgeCell()` がスナップショットを 1 回だけ作って両経路に渡すので、盤面の作り方は共通
+- **確信度順モードのマス選び(Issue #38)**: `askCellClaude(puzzle, signal)` が
+  `buildClaudeCellRequest(puzzle, keys)` のボディで呼ぶ。`keys` は `selectionKeys()`
+  (`queue` を行優先に並べた `"r<row>c<col>"` の配列)。`system` は `CLAUDE_CELL_SYSTEM`
+  (`CELL_NOTE` ベース)、`messages[0].content` は `CELL_INSTRUCTIONS` + 改行 + `{ puzzle }`
+  (`target` は無い)、スキーマは `buildClaudeCellSchema(keys)`(`choice.enum` /
+  `probabilities.required` が `keys`。呼び出しのたびに候補が変わるので毎回組み立てる)。
+  `thinking` / `max_tokens` の規則は `buildClaudeRequest` と同じ(コードも共有: どちらも
+  `claudeThinkingConfig` を呼ぶ)。応答の検証は `validateClaudeAnswer(answer, expectedKeys)` /
+  `parseClaudeAnswer(data, expectedKeys)` を `keys` 付きで呼ぶ形に一般化した(省略時は
+  `DIGITS`。Worker の `validateAnswer` が `expectedKeys` を取るのと同じ考え方)。`choice`
+  (`"r0c2"`)は正規表現 `/^r(\d)c(\d)$/` で座標に分解して `cell: { row, col }` として返す
+  (`askCellJev` が Worker のレスポンスの `cell` をそのまま返すのと同じ形に揃える)
 
 ## 4. フロントエンド設計(`PAGE_HTML` 内の `<script>`)
 
@@ -291,7 +303,16 @@ var state = {
   modelMode: "jev",    // "jev" | "claude"。どのモデルに聞くか(3.6、Issue #37)。reset() で維持
   claudeModel: "claude-opus-5", // Claude 経路のモデル ID(CLAUDE_MODELS のどれか)
   claudeThinking: true, // Claude 経路で thinking を使うか
-  calibModelFilter: "all" // 較正図のモデルフィルタ("all" | 記録の m の値)。reset() で維持
+  calibModelFilter: "all", // 較正図のモデルフィルタ("all" | 記録の m の値)。reset() で維持
+  orderMode: "scan",   // "scan"(左上から) | "confidence"(確信度順、Issue #38)。
+                       // speedMode と同様 reset() / newPuzzle() をまたいで保持。localStorage には保存しない
+  selecting: false,    // 確信度順のマス選び中か(askCell の応答待ち)
+  cellProbs: null,     // ヒートマップ用 { "r-c": p, ... }。マス選び直後だけ持ち、
+                       // commitFocused() で消える(次のマス選びまで出さない)
+  lastSelection: null, // 直近のマス選び1件 { r, c, confidence, candidates, p }。
+                       // p は probabilities[choice](= 選ばれたマス自身の確率)
+  lastCellRequest: null // 直近のマス選びでモデルに送ったリクエスト(Jev なら
+                       // askCellJev の応答の request、Claude なら送ったボディ)
 };
 // 描画に不要な進行管理はモジュール変数
 var queue = [];                 // この周でまだ判定していないマス [{r,c}]
@@ -332,6 +353,8 @@ var inflightController = null;  // in-flight の /api/judge 用 AbortController(
 | `newPuzzle()` | 「新しい問題」ボタン。`generating` を立てて `reset()`(= 世代トークンを進めて進行中のループを無効化し、in-flight の `/api/judge` も `abort()` する。Issue #19)し、`reset()` で維持される `state.difficulty` から目標ヒント数(`DIFFICULTY_GIVENS[state.difficulty]`)を決めてから `setTimeout(…, 0)` で `generatePuzzleWithRetry()` を呼んで生成し、`GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize` を差し替えて再描画。生成は同期で「むずかしい」の3回試行でも概ね数十 ms 以下(実測: 10回で 200ms 未満) |
 | `countEmpty(grid)` / `boxIndex` / `gridToCells` / `cellsToGrid` / `shuffled` | 上記の下請け。盤面の2つの表現(9行の文字列配列 ⇔ 81要素の数値配列。0 が空)の変換と、Fisher-Yates シャッフル |
 | `buildSnapshot()` | `GIVEN` + `state.values`(正誤問わず)から9行の文字列配列を作る。未確定は `.`。**判定対象のマスだけは `.` にして送る(他のマスの過去の推測は正誤問わず残す)**。Worker 側も 3.3 でこれを検証する |
+| `buildSelectionSnapshot()` | 確信度順モード(Issue #38)のマス選びに送る盤面。`buildSnapshot()` と同じ組み立て方だが、`state.focusedKey` ではなく **`queue` に入っている全マス** を `.` にする。こうすると Worker(`/api/judge` の `ask:"cell"`)/ Claude が列挙する「空マス」が、その周でまだ確定していないマスとちょうど一致する(2周目以降は前の周の不正解の推測が残ったままだと空マスとして数えられないため) |
+| `selectionKeys()` | `queue` を行優先(`r`→`c`)にソートし `"r<row>c<col>"` の配列にする純粋関数。Claude 経路のマス選びのスキーマ(`choice.enum` / `probabilities.required`)に使う(Jev 経路は Worker が同じ集合・同じ順序を作るので使わない) |
 | `formatRoundSummary(round, correct, total)` | 周回ログの1行「N周目: M中K正解 (P%)」を組み立てる純粋関数。`total` が0でも割り算しない |
 | `nextQueue(roundWrong)` | 次の周の `queue` を作る純粋関数。配列も要素も複製して返す(`roundWrong = []` の影響を受けないため) |
 | `shouldStop(round, incorrectCount)` | 周の終わりの判断を返す純粋関数。`"solved"`(不正解0)/ `"limit"`(`MAX_ROUNDS` に到達)/ `"continue"` |
@@ -340,22 +363,30 @@ var inflightController = null;  // in-flight の /api/judge 用 AbortController(
 | `judgeCell(r,c,signal)` | `buildSnapshot()` を **ここで 1 回だけ** 作り、`state.modelMode` に応じて `judgeCellJev` / `judgeCellClaude` に渡す(両経路で盤面の作り方を共通にする)。戻り値はどちらも `{ probabilities, choice, confidence, request }` |
 | `judgeCellJev(puzzle,r,c,signal)` | `/api/judge` を `fetch`(`signal` をそのまま渡す。`focusNext` が渡す `inflightController.signal`)。非2xxは `Error` にして投げる(502 の `request` は `err.request` に載せる) |
 | `judgeCellClaude(puzzle,r,c,signal)` | `loadAnthropicKey()` が無ければ即 `Error`。`buildClaudeRequest()` のボディで `api.anthropic.com` を直接 `fetch`(3.6)。非 2xx・`refusal`・形式不正・ネットワーク失敗は `Error` に `request`(ボディ)を載せて投げる |
-| `buildClaudeRequest(puzzle,r,c)` / `claudeThinkingConfig(model,on)` / `parseClaudeAnswer(data)` / `validateClaudeAnswer(answer)` | Claude 経路のリクエスト組み立て(3.6)、モデル別 thinking、応答からの JSON 取り出し、Worker の `validateAnswer` と同じ検証 |
+| `buildClaudeRequest(puzzle,r,c)` / `claudeThinkingConfig(model,on)` / `parseClaudeAnswer(data,expectedKeys)` / `validateClaudeAnswer(answer,expectedKeys)` | Claude 経路のリクエスト組み立て(3.6)、モデル別 thinking、応答からの JSON 取り出し、Worker の `validateAnswer` と同じ検証。`expectedKeys` は省略時 `DIGITS`(Issue #38 で候補キー集合を引数に取る形へ一般化。Worker の `validateAnswer` と同じ考え方) |
+| `askCell(signal)` | 確信度順モード(Issue #38)のマス選び1回。`buildSelectionSnapshot()` を **ここで1回だけ** 作り、`state.modelMode` に応じて `askCellJev` / `askCellClaude` に渡す。戻り値はどちらも `{ probabilities, choice, confidence, request, cell }` |
+| `askCellJev(puzzle,signal)` | `/api/judge` に `{ puzzle, ask: "cell" }` を `fetch`(`target` は付けない)。`judgeCellJev` と同じ形でエラーを投げる |
+| `askCellClaude(puzzle,signal)` | `selectionKeys()` で候補キーを作り、`buildClaudeCellRequest(puzzle,keys)` のボディで `api.anthropic.com` を `fetch`(3.6)。`choice`(`"r0c2"`)を正規表現で座標に分解し `cell` として返す。分解できない(=候補外の応答)場合もエラーとして投げる |
+| `buildClaudeCellRequest(puzzle,keys)` / `buildClaudeCellSchema(keys)` | 確信度順のマス選び(Claude 経路)のリクエスト組み立て(3.6)。`buildClaudeRequest` と同じ `thinking` / `max_tokens` の規則を共有する |
 | `loadAnthropicKey()` / `saveAnthropicKey(key)` / `saveAnthropicKeyFromInput()` / `clearAnthropicKey()` / `anthropicKeyHint()` | キーの読み書き(`scc.anthropic_key.v1`)。画面には末尾 4 文字だけ |
 | `loadClaudeSettings()` / `saveClaudeSettings()` / `setModelMode(mode)` / `setClaudeModel(model)` / `setClaudeThinking(on)` / `modelSettingsLocked()` / `currentModelId()` | モデル設定(`scc.claude_settings.v1`)。実行中・停止中(`isPaused()`)はロックして切り替えない。`currentModelId()` は記録の `m` に入れる識別子 |
-| `focusNext()` | 先頭で `runToken` を捕まえ、`queue` から1つ取り出しフォーカス→(リクエストごとに新しい `AbortController` を `inflightController` に作って)`judgeCell`→バー表示・`result.request` があれば `state.lastRequest` に保存(Issue #34)→(待ち)→`commitFocused`→(待ち)→再帰。`queue` が空なら `finalizeRound`。`judgeCell` が `AbortError` で reject したときは(世代トークンの判定と同じ扱いで)無視して `return` し、`showError` には流さない(4.3、Issue #19)。それ以外の失敗で `err.request` があれば(`judgeCell` が 502 の `request` を載せる)`state.lastRequest` に保存して `lastRequestFailed=true` にしてから `showError`(Issue #34) |
-| `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong`/`state.lastJudgment` を更新。`pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない。正誤が確定するこの時点で `appendRecord()` を呼び、集計ビュー用の1件(`m: currentModelId()` 付き)を記録する |
+| `setOrderMode(mode)` | 順番トグル(Issue #38)。`modelSettingsLocked()` と同じ条件でロックする(周の途中でマスの選び方が混ざらないように)。`localStorage` には保存しない |
+| `focusNext()` | 先頭で `runToken` を捕まえ、`queue` が空なら `finalizeRound()`。`state.orderMode === "confidence"` なら `selectNextCell(token)` に委譲して `return`。そうでなければ(scan)`queue` から1つ取り出して `focusCellForDigit(cell, token)` を呼ぶ |
+| `selectNextCell(token)` | 確信度順モード(Issue #38)のマス選び。`state.selecting=true` にして描画 →(リクエストごとに新しい `AbortController` を `inflightController` に作って)`askCell` → `result.cell` が `queue` に無ければ `showError("選ばれたマスが候補にありません: …")` して `return` → `result.probabilities`(`"r0c2"` 形式)を `"r-c"` 形式に変換して `state.cellProbs` に(ヒートマップ用)、`state.lastSelection` に `{ r, c, confidence, candidates: probabilities のキー数, p: probabilities[choice] }` を保存 → `result.request` があれば `state.lastCellRequest` に保存 → `queue.splice(idx,1)` で選ばれたマスを取り除き `state.selecting=false` → `focusCellForDigit(cell, token)`。`AbortError` は無視、それ以外の失敗は `err.request` があれば `state.lastCellRequest` に保存してから `showError` |
+| `focusCellForDigit(cell,token)` | 1マスの数字判定本体(従来の `focusNext()` の中身そのもの。Issue #38 で `focusNext` / `selectNextCell` の両方から呼べるように抽出した)。フォーカス→(新しい `AbortController` で)`judgeCell`→バー表示・`result.request` があれば `state.lastRequest` に保存(Issue #34)→(待ち)→`commitFocused`→(待ち)→`focusNext()` で次へ。`judgeCell` が `AbortError` で reject したときは(世代トークンの判定と同じ扱いで)無視して `return` し、`showError` には流さない(4.3、Issue #19)。それ以外の失敗で `err.request` があれば(`judgeCell` が 502 の `request` を載せる)`state.lastRequest` に保存して `lastRequestFailed=true` にしてから `showError`(Issue #34) |
+| `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong`/`state.lastJudgment` を更新。`pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない。正誤が確定するこの時点で `appendRecord()` を呼び、集計ビュー用の1件(`m: currentModelId()` 付き)を記録する。`state.cellProbs` もここで `null` に戻す(Issue #38。次のマス選びまでヒートマップを出さない) |
 | `finalizeRound()` | ログ追記→`shouldStop` の結果で完了 / 強制終了 / 次の周(`queue = nextQueue(roundWrong)`)。「次の周」のときは、between-round の `setTimeout` を張る**前**に `state.round` / `queue` / `roundSize` / `roundTally` を更新する。この順序のおかげで、待ち時間中に `stop()` されても次の周の状態が既に確定している(下記 `stop()`、Issue #32) |
-| `stop()` | 実行中の停止(SPEC F1、Issue #32)。`reset()` と同じく `runToken` を進めて in-flight の `/api/judge`(`inflightController.abort()`)と予約済みの `setTimeout` を無効化するが、`reset()` と違って **`state.values` / `state.round` / `state.roundLog` / `roundTally` / `roundSize` / `queue` / `started` は捨てない**。`state.focusedKey` があれば(= 判定中のマスがまだ `commitFocused()` されていない)、その結果を破棄して記録(`appendRecord`)にも残さず、`queue.unshift({r,c})` で queue の先頭に戻す(再開したら同じマスをもう一度聞く。SPEC F2)。周をまたぐ待ち時間中(`finalizeRound()` の between-round の `setTimeout` 待ち)に呼ばれた場合は、その時点で `focusedKey` は既に `null`(`commitFocused()` で消えている)なので何もすることがなく、次の周の先頭から再開する(`finalizeRound()` の更新順序による。SPEC F3)。`state.done` / `state.errorMessage` のときは何もしない(両者は常に `running=false` とセットで立つので `state.running` を見るだけで判定できる) |
-| `run()` | 初回のみ queue を全空マスで初期化し `focusNext` を開始。`started` が既に true なら(= `stop()` した後の再開)queue を作り直さず `focusNext()` を呼ぶだけなので、`stop()` が保った進行状態からそのまま続く |
-| `reset()` | `runToken` を進め、`inflightController` があれば `abort()` して in-flight の `/api/judge` を打ち切り、進行管理と `state` を初期化(`speedMode` / `difficulty` は維持。`lastRequest` も `null` に戻す)(Issue #19、#21、#34) |
+| `stop()` | 実行中の停止(SPEC F1、Issue #32)。`reset()` と同じく `runToken` を進めて in-flight の `/api/judge`(`inflightController.abort()`)と予約済みの `setTimeout` を無効化するが、`reset()` と違って **`state.values` / `state.round` / `state.roundLog` / `roundTally` / `roundSize` / `queue` / `started` は捨てない**。`state.focusedKey` があれば(= 判定中のマスがまだ `commitFocused()` されていない)、その結果を破棄して記録(`appendRecord`)にも残さず、`queue.unshift({r,c})` で queue の先頭に戻す(再開したら同じマスをもう一度聞く。SPEC F2)。周をまたぐ待ち時間中(`finalizeRound()` の between-round の `setTimeout` 待ち)に呼ばれた場合は、その時点で `focusedKey` は既に `null`(`commitFocused()` で消えている)なので何もすることがなく、次の周の先頭から再開する(`finalizeRound()` の更新順序による。SPEC F3)。`state.done` / `state.errorMessage` のときは何もしない(両者は常に `running=false` とセットで立つので `state.running` を見るだけで判定できる)。**確信度順モード中の停止(Issue #38)**: `state.selecting`(マス選び中)なら無条件で `state.selecting=false` / `state.cellProbs=null` にする。選ばれたマスはまだ `queue` から取り除いていない(選び終わって `splice` して初めて取り除く)ので、`focusedKey` が無い限り再キューは不要。再開(`run()`)はマス選びからやり直す |
+| `run()` | 初回のみ queue を全空マスで初期化し `focusNext` を開始。`started` が既に true なら(= `stop()` した後の再開)queue を作り直さず `focusNext()` を呼ぶだけなので、`stop()` が保った進行状態からそのまま続く(確信度順モードで停止していた場合も、queue は変わっていないのでマス選びからやり直す形で自然に再開する) |
+| `reset()` | `runToken` を進め、`inflightController` があれば `abort()` して in-flight の `/api/judge` を打ち切り、進行管理と `state` を初期化(`speedMode` / `difficulty` / `orderMode` は維持。`lastRequest` / `lastCellRequest` / `lastSelection` も `null` に戻す)(Issue #19、#21、#34、#38) |
 | `showError(message)` | `runToken` を進め、`inflightController` があれば `abort()` して `state.errorMessage` を立て、`running=false` で止める(不変条件4、Issue #19) |
 | `setSpeed(mode)` | `state.speedMode` を切り替えて再描画。実行中でも切り替えられる(4.4) |
 | `setDifficulty(mode)` | `state.difficulty`(`"easy"` / `"normal"` / `"hard"`)を切り替えて再描画。変えただけでは盤面は変わらず、次の `newPuzzle()` の目標ヒント数に効く(Issue #21) |
 | `render()` | `state` から DOM(グリッド・統計・バー・ログ・集計パネル・バナー・ボタン)を **全部 innerHTML で再生成**。周回ログのスクロール位置だけは引き継ぐ |
-| `render*()` | `renderGrid` / `renderLegend` / `renderControls`(モデルトグル含む)/ `renderClaudeSettings`(Claude のときだけ)/ `renderErrorBox` / `renderStats`(+`statCard`)/ `renderCurrentPanel`(+`coordLabel` / `renderBars`)/ `renderPromptPanel` / `renderRoundLog` / `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`。それぞれHTML文字列を返すだけで、DOMには触らない |
-| `renderPromptPanel()` | 「現在の判定」パネルの直下の「モデルに送ったプロンプト」枠(SPEC F1、Issue #34)。`state.lastRequest` があれば `coordLabel`(`lastRequest.state.target` の座標。`lastRequestFailed` なら「(このプロンプトで失敗)」を添える)と、`JSON.stringify(lastRequest, null, 2)` を `escapeHtml` して `<pre class="prompt-json">` に表示する。`null` なら「まだ判定していません」。Jev 経路では Worker の `handleJudge` が返す `request`、Claude 経路ではブラウザが送ったリクエストボディ(`buildClaudeRequest`。ヘッダー = キーは含まない)をそのまま表示する。Jev のペイロードをフロント側で組み立て直さない(二重管理を避けるため) |
-| `buildCellStyle()` | マスの状態(given/pending/correct/incorrect + focused)からインラインstyle文字列を返す |
+| `render*()` | `renderGrid` / `renderLegend`(確信度順のときだけヒートマップの凡例を1項目足す。Issue #38)/ `renderControls`(モデルトグル・順番トグル含む)/ `renderClaudeSettings`(Claude のときだけ)/ `renderErrorBox` / `renderStats`(+`statCard`)/ `renderCurrentPanel`(+`coordLabel` / `renderBars` / `renderSelectionLine`)/ `renderPromptPanel`(+`renderRequestBlock`)/ `renderRoundLog` / `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`。それぞれHTML文字列を返すだけで、DOMには触らない |
+| `renderSelectionLine()` | 確信度順モード(Issue #38)の「マス選び: N 候補中 r行目c列目(p%)/ confidence q%」行。`state.lastSelection` が無ければ空文字列。`renderCurrentPanel()` が `state.focusedKey` があるとき(= マス選びが終わって数字判定中)にだけ先頭に差し込む |
+| `renderPromptPanel()` / `renderRequestBlock(req,failed,heading)` | 「現在の判定」パネルの直下の「モデルに送ったプロンプト」枠(SPEC F1、Issue #34、#38)。`renderRequestBlock` が1件ぶんの表示(座標・失敗注記・見出し・`<pre>` の JSON)を組み立てる下請け。左上からモード(`orderMode !== "confidence"`)は従来どおり `state.lastRequest` 1件だけを `heading=null` で表示。**確信度順モード**は `state.lastCellRequest`(見出し「マス選び」)→ `state.lastRequest`(見出し「数字」)の順で2段に並べる(どちらも無ければ従来と同じ「まだ判定していません」)。座標(`req.state.target`)・`lastRequestFailed` なら「(このプロンプトで失敗)」を添える処理は共通。Jev 経路では Worker の `handleJudge` が返す `request`、Claude 経路ではブラウザが送ったリクエストボディをそのまま表示し、フロント側で組み立て直さない(二重管理を避けるため) |
+| `buildCellStyle()` | マスの状態(given/pending/correct/incorrect + focused)からインラインstyle文字列を返す。確信度順モード(Issue #38)では、`state.cellProbs` にそのマスの確率があり(未判定・非フォーカス)、`α = 0.08 + 0.6 * p / pmax`(`pmax` は `cellProbs` の最大値)の `rgba(125, 211, 252, α)` を背景にする(ヒートマップ) |
 | `escapeHtml(text)` | `innerHTML` に入れる前に `& < > " '` を実体参照にする |
 | `fnv1a32(text)` / `puzzleId()` | 集計ビュー(SPEC F1 拡張2)の問題ID用の簡易ハッシュ。32bit FNV-1a を8桁16進で返す。`puzzleId()` は `GIVEN` の9行を結合した文字列をハッシュ化する |
 | `loadRecords()` | `localStorage`(キー `scc.records.v1`)から読む。戻り値は `{ ok, records }`。`ok:false` は「読めなかった」(`localStorage` が無い、または `getItem` が例外)ときだけで、`records` は空のまま呼び出し側に「保存してよい空」だと誤解させない。保存が無い・JSON が壊れている・配列でない、はいずれも `ok:true, records:[]`(壊れていた場合は元の文字列を退避キー `scc.records.v1.broken` に逃がしてから空で作り直す)。**`ok` を見ずに `records` だけ使わないこと**(PR #25 レビュー指摘 should-fix 1) |
@@ -391,6 +422,28 @@ idle ──run()──▶ focusNext()
                  │ focusedKey があれば(未 commit)queue の先頭に戻し、pendingCommit を破棄
                  ▼
   paused ──run()──▶ focusNext()(started が true なので queue を作り直さず続きから)
+````
+
+**確信度順モード(Issue #38)は `focusNext()` の先頭にマス選びが入る。** `state.orderMode
+=== "confidence"` のときだけ、`focusNext()` は `queue` から直接取り出さず `selectNextCell()`
+に委譲する:
+
+````text
+focusNext()(orderMode==="confidence"、queueに残あり)
+                 │ token = runToken
+                 ▼
+            selectNextCell(token)
+                 │ selecting=true, focusedKey=null, cellProbs=null, render()
+                 ▼
+              askCell()  ── 失敗 ──▶ showError(), 停止
+                 │ 成功(result.cell が queue に無ければ showError)
+                 ▼
+      cellProbs=…, lastSelection=…, queue.splice(idx,1), selecting=false, render()
+                 ▼
+            focusCellForDigit(cell, token)  ── 以降は上の1マス判定と同じ
+
+  (マス選び中に)──stop()──▶ selecting=false, cellProbs=null(queueは変更しない)
+  paused ──run()──▶ focusNext() ── orderMode==="confidence" のマス選びからやり直す
 ````
 
 **停止/再開(`stop()`、Issue #32、SPEC F1〜F3)。** `stop()` は `reset()` と同じく世代
@@ -461,6 +514,13 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
   Issue #34)。502 で失敗した判定の `request` は「(このプロンプトで失敗)」付きで表示し、
   `request` の無いエラー(400/429/503)では直前の値が残る。`<pre>` は `white-space: pre-wrap`
   で長い `note` を折り返す(1 判定あたりレスポンスは約 1KB 増える。定数 `NOTE` が大半)
+- **確信度順モード(Issue #38)** は `state.orderMode` だけで分岐し、`buildCellStyle` /
+  `renderCurrentPanel` / `renderPromptPanel` / `renderLegend` / `renderControls` の既存の
+  関数にロジックを足す形にしてある(専用のコンポーネントを新設しない)。ヒートマップは
+  `state.cellProbs` が無ければ何もしない(= 左上からモードでは常に空)ので、モードで
+  分岐しなくても自然に出ない。`state.orderMode` はモデルトグルと同じ `modelSettingsLocked()`
+  でロックし、`localStorage` には保存しない(`speedMode` と違い、実行のたびに選び直す
+  性質のものではなく、ページを開き直したときに毎回既定の「左上から」に戻ってよいと判断した)
 
 ## 5. データ
 
@@ -538,7 +598,7 @@ new_sqlite_classes = ["RateLimitCounter"]
 
 ## 9. 変更時の不変条件
 
-1. Jev に渡す `state`、および Claude に渡すリクエストボディに `SOLUTION` 由来の情報を入れない(どちらも `judgeCell()` が作る同じスナップショット)
+1. Jev に渡す `state`、および Claude に渡すリクエストボディに `SOLUTION` 由来の情報を入れない(`judgeCell()` が作る同じスナップショット。確信度順モードのマス選び(`askCell()`)も `buildSelectionSnapshot()` を使い、同じく `SOLUTION` を渡さない。Issue #38)
 2. 正解したマスは以後の周で再判定しない
 3. `probabilities` は必ず `"1"`〜`"9"` の順で表示する(確率順に並べ替えない。見比べやすさ優先)
 4. エラー時は必ず `running=false` にして止める(無限ループ・無駄な課金を防ぐ)
@@ -605,4 +665,12 @@ new_sqlite_classes = ["RateLimitCounter"]
     - `render()`: 記録が蓄積済み(5,000件)でも、初回の `render()` 以降は `localStorage.getItem` を呼ばない(`recordsCache` で使い回すこと。should-fix 2)
     - `exportRecords`: `Blob` に渡した JSON(`version`/`exported_at`/`records`)が `loadRecords().records` の内容と一致し、`exported_at` が ISO 文字列であること。`<a>` が `appendChild` → `removeChild` で対になっていること(モックの `Blob` / `URL.createObjectURL` / `document.createElement`)
     - `clearRecords`: `confirm()` が `true` を返すモックなら記録が0件になり、`false` を返すモックなら消えないこと
+  - **確信度順モード**(`test/page.test.js` W1〜W7、Issue #38)。S/T 系と同じ `runScript` / `makeAbortAwareFetch` / `waitFor` を使う。`makeCellResponse(puzzle,keys,chosenKey)` / `makeClaudeCellResponse(keys,chosenKey)` を新設(Jev / Claude それぞれのマス選び応答のモック)
+    - W1: `orderMode` の既定が `"scan"` で、左上からモードは1マス1フェッチ・`ask` を送らないこと(従来どおり)
+    - W2: 確信度順の1ステップは2フェッチ。1つ目が `ask:"cell"`・`target` 無し・`puzzle` は `queue` の全マスが `.`。応答の `cell` にフォーカスが立ち、`queue` から取り除かれ、`state.cellProbs` / `state.lastSelection` が入ること。2つ目が選ばれたマスの `target` で、`commitFocused()` 後に `cellProbs` が消えること
+    - W3: 応答の `cell` が `queue` に無ければ `showError` で停止し、`running=false` になること
+    - W4: マス選び中の `stop()` は fetch を abort し `queue` の長さを変えないこと、`run()` で再開するとマス選びからやり直すこと。数字判定中の `stop()` は従来どおり `queue` の先頭に戻ること
+    - W5: 2周目(1周目で1マス不正解になるスタブ)のマス選びの候補(`ask:"cell"` の `puzzle` の空マス)が不正解マスだけになること。周回ログの形式は従来どおり
+    - W6: Claude 経路のマス選びのリクエストが `api.anthropic.com` へ行き、スキーマの `choice.enum` / `probabilities.required` が `selectionKeys()` と一致し、`system` が `CELL_NOTE` を含むこと(vm レルムの配列は `Array.prototype.slice.call` で host 側に移し替えてから比較する。hostRows と同じ理由)
+    - W7: 確信度順でヒートマップの背景(`rgba(125, 211, 252`)がグリッドに出て、選択後にパネルへ「マス選び: N 候補中」が出ること。実行中は順番トグルが `disabled` になること
 - CI(`.github/workflows/ci.yml`)は push と PR で `npm ci` → `npm test` → `npm run check` を実行する。`check` は `wrangler deploy --dry-run` で、認証なしで動く
