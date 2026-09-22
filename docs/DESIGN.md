@@ -110,7 +110,7 @@ Durable Object は同じ名前のインスタンスが世界に1つしか存在�
      - 空マス(`.`)が1つ以上あること。1つも無ければ聞くものが無いので 400
 4. `criteria` と「期待するキー集合」(`expectedKeys`)を `ask` ごとに生成する
    - `ask:"digit"`: `{ "1": "the digit 1", ..., "9": "the digit 9" }`。`expectedKeys` は `DIGITS`
-   - `ask:"cell"`: `emptyCells(puzzle)` が返す空マスを **行優先の順** に並べ、`{ "r0c2": "row 0, column 2 (zero-based)", ... }`。キーは `"r" + row + "c" + col`。`expectedKeys` はそのキー配列。Jev の `choice` は選択肢を255個まで取れるので、空マスが最大81個でも1回で聞ける
+   - `ask:"cell"`: `emptyCells(puzzle)` が返す空マスを **行優先の順** に並べ、`{ "r0c2": "row 0, column 2 (zero-based)", ... }`。キーは `"r" + row + "c" + col`。`expectedKeys` はそのキー配列。Jev の `choice` は選択肢を255個まで取れるので、空マスは最大64個(埋まっているマスが17個以上という共通条件のため)なので1回で聞ける
 5. `env.AI.run("typesafe/jev", payload)`(`payload = { state, questions }`。質問キーは `ask` と同じ `digit` / `cell`、`state` は `ask:"cell"` のとき `target` を持たない。下記参照)を呼ぶ。例外は 502(`raw` に例外メッセージを200文字まで入れ、`console.error` でログを残す)。**この 502 にも `request: payload` を添える**(Issue #34。フロントが「何を送って失敗したか」を確認できるように)
 6. 返ってきたレスポンスから `answers[ask]` を取り出して検証し(`extractAnswer(result, key)` → `validateAnswer(answer, expectedKeys, messages)`)、次のどれかを満たさなければ 502(`raw` に生レスポンスを、**`request: payload` も**添えて返す。デバッグ用・Issue #34)
    - レスポンスがオブジェクトである
