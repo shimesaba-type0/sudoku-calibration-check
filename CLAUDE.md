@@ -76,16 +76,16 @@ npm run dev                 # ローカル起動。AIバインディングはリ
 8. 分からないこと・仕様の曖昧さは推測で埋めず、報告の中で質問として挙げる
 9. 実装は Issue 単位で進め、PR にしてテストとレビューを通してからマージする。手順とモデルの使い分けは `docs/HANDOFF.md` に従う
 
-## 現在の状態(2026-09-21)
+## 現在の状態(2026-09-22)
 
-- v0.1 を Issue 単位で実装中。進捗は GitHub の Issues / PR を参照(`docs/HANDOFF.md` の「現在地」も併せて更新する)
-- デプロイ済み: https://sudoku-calibration-check.takashi-kono-rb.workers.dev 。フロントエンド(Issue #3)もマージ済みで、v0.1 の機能はすべて実装済み。実環境での UI 確認(SPEC 6章の「デプロイ後」の項目)はマージ後のデプロイで行う
-- **Jev は 2026-09-21 に Worker 経由で実環境検証済み**(Issue #4)。レスポンスは AI Gateway のラッパー付きだった(`docs/DESIGN.md` 3.4)。`confidence` は `probabilities[choice]` と一致せず、同じ入力でも `choice` が揺れる
-- レート制限のカウンタは Durable Object(`RATE_LIMITER` / `RateLimitCounter`)。`wrangler deploy` が `[[migrations]]` から作るので、ネームスペース作成のような手作業は不要(Issue #10 で Workers KV から移行。KV は結果整合で全体上限が分散アクセスに効かなかった)。PR #14 でマージ・デプロイ済み。`GET /api/status` で残数を読める(#18)
-- マージ済み PR: #7(Worker 本体)、#9(Jev 実レスポンス形式 + KV id)、#11(#7/#9 のレビュー指摘)、#13(フロントエンド)、#14(レート制限を Durable Object に置き換え)、#22(モデル方針)、#23(`/api/status`)
-- 数独ジェネレーター/ソルバー(#5)は実装済み。「新しい問題」ボタンで毎回違う問題を出せる。これに伴い Worker 側の入力検証から固定問題(`GIVEN`)前提の項目を外した(`docs/DESIGN.md` 3.3)
-- 集計ビュー(信頼度較正図)(#6)は実装済み。判定結果を `localStorage`(`scc.records.v1`)に蓄積し、`pc` / `conf` それぞれの帯ごとの正解率を較正図として表示する。JSONエクスポート・記録の消去も可能
-- リセット/新しい問題/エラー時に in-flight の `/api/judge` を `AbortController` で中断する(Issue #19)。`docs/DESIGN.md` 4.2/4.3、`docs/SPEC.md` F5 を参照
-- 難易度トグル(#21、やさしい36/ふつう30/むずかしい25ヒント)は `claude/issue-21-difficulty` ブランチで実装済み(未マージ)。`docs/SPEC.md` F1/F4'、`docs/DESIGN.md` 4.1/4.2/5章を参照
-- Playwright E2E スモーク(#17)は PR #24 でマージ済み(`npm run e2e`)
+- v0.1 と SPEC 7 章の拡張 1・2・5(最小版)まで **すべてマージ・デプロイ済み**。進捗は GitHub の Issues / PR を参照(`docs/HANDOFF.md` の「現在地」も併せて更新する)
+- デプロイ済み: https://sudoku-calibration-check.takashi-kono-rb.workers.dev (Version `2b8eb12c`、2026-09-22)。`npm run e2e -- --url <URL>` の本番モード(ヘッダー 3 つ + 最速で 3 判定)が PASS
+- **Jev は 2026-09-21 に Worker 経由で実環境検証済み**(Issue #4)。レスポンスは AI Gateway のラッパー付き(`docs/DESIGN.md` 3.4)。`confidence` は `probabilities[choice]` と一致せず、同じ入力でも `choice` が揺れる
+- レート制限のカウンタは Durable Object(`RATE_LIMITER` / `RateLimitCounter`)。`wrangler deploy` が `[[migrations]]` から作るので、ネームスペース作成のような手作業は不要(Issue #10 で Workers KV から移行。KV は結果整合で全体上限が分散アクセスに効かなかった)。`GET /api/status` で残数を読める(#18)
+- マージ済み PR: #7(Worker 本体)、#9(Jev 実レスポンス形式 + KV id)、#11(#7/#9 のレビュー指摘)、#13(フロントエンド)、#14(DO レート制限)、#15(ジェネレーター/ソルバー)、#22(モデル方針)、#23(`/api/status`)、#24(E2E スモーク)、#25(集計ビュー)、#26(README)、#27(AbortController + 振る舞いテスト)、#28(難易度)
+- 数独ジェネレーター/ソルバー(#5)と難易度トグル(#21、やさしい 36 / ふつう 30 / むずかしい 25 ヒント)。Worker 側の入力検証から固定問題(`GIVEN`)前提の項目は外れている(`docs/DESIGN.md` 3.3)
+- 集計ビュー(信頼度較正図)(#6): 判定結果を `localStorage`(`scc.records.v1`)に蓄積し、`pc` / `conf` それぞれの帯ごとの正解率を較正図として表示。JSON エクスポート・記録の消去あり
+- リセット/新しい問題/エラー時に in-flight の `/api/judge` を `AbortController` で中断する(#19)。周回ロジックの振る舞いテスト(S1〜S4)あり
+- Playwright E2E スモーク(#17): `npm run e2e`(モック)/ `npm run e2e -- --url <URL>`(本番、最大 3 判定)。プロキシ環境では `E2E_PROXY` / `E2E_IGNORE_HTTPS_ERRORS=1`
+- 既知の未実装: なし(SPEC 7 章の拡張 3(Claude API)と 4(ログ異常検知への転用)は依頼があるまで着手しない)
 - 要判断(オーナー): IP 単位のレート制限(30 回/時)の緩和可否は Issue #20 を参照。上限を緩める変更は作業ルール4によりオーナーの判断が必要
