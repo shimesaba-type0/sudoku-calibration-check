@@ -333,6 +333,35 @@ Cloudflare 側の都合で変わる。形が違っていたらこの節と `hand
   `DIGITS`。Worker の `validateAnswer` が `expectedKeys` を取るのと同じ考え方)。`choice`
   (`"r0c2"`)は正規表現 `/^r(\d)c(\d)$/` で座標に分解して `cell: { row, col }` として返す
   (`askCellJev` が Worker のレスポンスの `cell` をそのまま返すのと同じ形に揃える)
+- **一括モードの1周ぶん(Issue #48)**: `askAllClaude(puzzle, signal)` が
+  `buildClaudeAllRequest(puzzle, keys)` のボディで呼ぶ。`keys` は `selectionKeys()`
+  (`queue` を行優先に並べた `"r<row>c<col>"` の配列、確信度順のマス選びと同じ)。`system` は
+  `CLAUDE_ALL_SYSTEM`(`ALL_NOTE` ベース + 「マスごとに choice/probabilities/confidence の
+  3つ組を答えよ」という指示)、`messages[0].content` は `CLAUDE_ALL_INSTRUCTIONS`(全マスまとめて
+  聞く1本の質問文。Worker の `ALL_INSTRUCTIONS_TEMPLATE` はマス1つぶんの文言なので、Claude の
+  1本のユーザーメッセージには使わずフロント側で別に用意した)+ 改行 + `{ puzzle }`(`target` は
+  無い)。スキーマは `buildClaudeAllSchema(keys)`(`keys` の各キーを `required` に持つオブジェクトで、
+  各値は digit 判定と同じ形 `{ choice(enum 1〜9), probabilities(1〜9 が required), confidence }`。
+  呼び出しのたびに候補(= その周の `queue`)が変わるので毎回組み立てる)。
+  - **`max_tokens` の下限**: 一括は出力が大きい(最大64マス×9確率ぶんの JSON)ので、既存の
+    設定(digit 判定用の `CLAUDE_ANSWER_MAX_TOKENS`=1024 / `CLAUDE_ADAPTIVE_MAX_TOKENS`=16000 /
+    Haiku の `budget_tokens + CLAUDE_ANSWER_MAX_TOKENS`)と、一括専用の最低値
+    (`CLAUDE_ALL_ANSWER_MAX_TOKENS`=16000 / `CLAUDE_ALL_ADAPTIVE_MAX_TOKENS`=24000 /
+    `CLAUDE_ALL_HAIKU_MAX_TOKENS`=12000)の **大きい方**(`Math.max`)を使う。思考なしは常に
+    一括の最低値がそのまま勝つ(1024 < 16000)。adaptive も同様(16000 < 24000)。Haiku の
+    思考ありは `budget_tokens(2048) + 1024 = 3072` のままだと、51マス分の JSON 本体を
+    書き切る前に `stop_reason: max_tokens` で切れる見込みが高いため(`ask:"where"` /
+    `ask:"all"` の Worker 側実測(3.4)から、空マス51個ぶんの出力は数千トークン規模になると
+    分かっている)、12000 を下限にした。**実キーでの疎通(この値で本当に足りるか)はオーナーの
+    ブラウザで確認する**(CLAUDE.md、セッションにキーが無いため未検証)
+  - 応答の検証は `validateClaudeAllAnswer(answer, expectedKeys)` /
+    `parseClaudeAllAnswer(data, expectedKeys)`(`extractClaudeText(data)` で stop_reason の
+    チェックとテキストブロックの取り出しを `parseClaudeAnswer` と共有する)。`answer` は
+    `expectedKeys`(= `keys`)をちょうど持つオブジェクトで、各値が
+    `validateClaudeAnswer(answer[key], DIGITS)` と同じ基準を満たすこと。どのマスで落ちたかが
+    わかるよう、文言の先頭にそのマスのキーを添える(Worker の `ask:"all"` の 502 の文言(3.3)
+    と同じ考え方)。戻り値は `askAllJev` と同じ形 `{ cells, request }`(`cells` はマスのキー →
+    `{ choice, probabilities, confidence }`)
 
 ## 4. フロントエンド設計(`PAGE_HTML` 内の `<script>`)
 
@@ -364,7 +393,7 @@ var state = {
   claudeModel: "claude-opus-5", // Claude 経路のモデル ID(CLAUDE_MODELS のどれか)
   claudeThinking: true, // Claude 経路で thinking を使うか
   calibModelFilter: "all", // 較正図のモデルフィルタ("all" | 記録の m の値)。reset() で維持
-  orderMode: "scan",   // "scan"(左上から) | "confidence"(確信度順、Issue #38)。
+  orderMode: "scan",   // "scan"(左上から) | "confidence"(確信度順、Issue #38) | "all"(一括、Issue #48)。
                        // speedMode と同様 reset() / newPuzzle() をまたいで保持。localStorage には保存しない
   selecting: false,    // 確信度順のマス選び中か(askCell の応答待ち)
   cellProbs: null,     // ヒートマップ用 { "r-c": p, ... }。マス選び直後だけ持ち、
@@ -373,6 +402,10 @@ var state = {
                        // p は probabilities[choice](= 選ばれたマス自身の確率)
   lastCellRequest: null, // 直近のマス選びでモデルに送ったリクエスト(Jev なら
                        // askCellJev の応答の request、Claude なら送ったボディ)
+  allFetching: false,  // 一括モード(Issue #48)の askAll() 呼び出し中か。応答が届くまでは
+                       // 座標もバーも無い(renderCurrentPanel が「一括で判定中…」を出す)
+  lastAllRequest: null, // 直近の一括呼び出し { request, failed, count }(Issue #48)。
+                       // renderPromptPanel が「一括」1段(質問N問の要約 + 折りたたみ)で表示する
   pauseReason: null    // 一時的な失敗による停止の理由文言(Issue #43)。stop()(手動)
                        // では null のまま。run() / reset() / newPuzzle() / stop() で
                        // null に戻る。isPaused() かつこれが非 null のときだけ
@@ -386,6 +419,11 @@ var roundSize = TOTAL_EMPTY;    // この周の対象マス数(「この周の�
 var generating = false;         // 問題を生成している最中か(4.2 newPuzzle)
 var started = false;
 var pendingCommit = null;       // API結果を受けて確定待ちの1件
+var allResults = null;          // 一括モード(Issue #48)のこの周のキャッシュ。null = まだ askAll()
+                                 // していない。応答が届いたら "r-c" 形式のキー →
+                                 // { choice, probabilities, confidence } に変換して持つ。停止/再開では
+                                 // 保つ(再度呼ばない)。周が変わる(finalizeRound)・reset()/newPuzzle()・
+                                 // showError() で null に戻す
 var runToken = 0;               // 実行の世代。reset() / showError() で +1 する(4.3)
 var inflightController = null;  // in-flight の /api/judge 用 AbortController(4.3、Issue #19)
 var embedMode = false;          // GET /?embed=1 で true(比較モードの iframe。Issue #46)。
@@ -405,7 +443,7 @@ var compareGenerating = false;  // 「新しい問題」(比較シェル版)で�
   puzzle: "<81文字>" | undefined, // 形式(9行×9文字、"1"〜"9"と"."のみ)が正しいときだけセット。
                                    // 採用は applyPuzzleFromString() が一意解を確認してから
   model:  "jev" | "claude" | undefined,
-  order:  "scan" | "confidence" | undefined,
+  order:  "scan" | "confidence" | "all" | undefined,
   speed:  "slow" | "fast" | undefined,
   embed:  true | false             // "1" と一致したときだけ true
 }
@@ -457,26 +495,35 @@ var compareGenerating = false;  // 「新しい問題」(比較シェル版)で�
 | `askCellJev(puzzle,signal)` | `/api/judge` に `{ puzzle, ask: "cell" }` を `fetch`(`target` は付けない)。`judgeCellJev` と同じ形でエラーを投げる(429 / 503 の `transient` / `retryAfter` も同じ `markJevTransientError()` で付く) |
 | `askCellClaude(puzzle,signal)` | `selectionKeys()` で候補キーを作り、`buildClaudeCellRequest(puzzle,keys)` のボディで `api.anthropic.com` を `fetch`(3.6)。`choice`(`"r0c2"`)を正規表現で座標に分解し `cell` として返す。分解できない(=候補外の応答)場合もエラーとして投げる(429 / 529 / 5xx・ネットワーク失敗の `transient` は `judgeCellClaude` と同じ) |
 | `buildClaudeCellRequest(puzzle,keys)` / `buildClaudeCellSchema(keys)` | 確信度順のマス選び(Claude 経路)のリクエスト組み立て(3.6)。`buildClaudeRequest` と同じ `thinking` / `max_tokens` の規則を共有する |
+| `askAll(signal)` | 一括モード(Issue #48)の1周ぶん。`buildSelectionSnapshot()` を **ここで1回だけ** 作り、`state.modelMode` に応じて `askAllJev` / `askAllClaude` に渡す。戻り値はどちらも `{ cells, request }`(`cells` はマスのキー → `{ choice, probabilities, confidence }`) |
+| `askAllJev(puzzle,signal)` | `/api/judge` に `{ puzzle, ask: "all" }` を `fetch`(`target` も `digit` も付けない)。`judgeCellJev` / `askCellJev` と同じ形でエラーを投げる(429 / 503 の `transient` / `retryAfter` も同じ `markJevTransientError()` で付く) |
+| `askAllClaude(puzzle,signal)` | `selectionKeys()` で候補キーを作り、`buildClaudeAllRequest(puzzle,keys)` のボディで `api.anthropic.com` を `fetch`(3.6)。`parseClaudeAllAnswer` で検証し、戻り値は `askAllJev` と同じ形 `{ cells, request }`(429 / 529 / 5xx・ネットワーク失敗の `transient` は `judgeCellClaude` と同じ) |
+| `buildClaudeAllRequest(puzzle,keys)` / `buildClaudeAllSchema(keys)` | 一括モード(Claude 経路)のリクエスト組み立て(3.6)。`max_tokens` は既存の規則と一括専用の最低値の `Math.max` |
+| `extractClaudeText(data)` | Messages API の応答から `stop_reason` のチェックとテキストブロックの取り出しだけを行う共通部分。`parseClaudeAnswer` / `parseClaudeAllAnswer` が共有する(重複していた抽出ロジックを一本化。Issue #48) |
+| `validateClaudeAllAnswer(answer,expectedKeys)` / `parseClaudeAllAnswer(data,expectedKeys)` | 一括モードの応答検証(3.6)。`answer` は `expectedKeys`(= その周の `queue` のキー)をちょうど持つオブジェクトで、各値が `validateClaudeAnswer(answer[key], DIGITS)` と同じ基準を満たすこと。どのマスで落ちたかが文言に出る |
 | `loadAnthropicKey()` / `saveAnthropicKey(key)` / `saveAnthropicKeyFromInput()` / `clearAnthropicKey()` / `anthropicKeyHint()` | キーの読み書き(`scc.anthropic_key.v1`)。画面には末尾 4 文字だけ |
 | `loadClaudeSettings()` / `saveClaudeSettings()` / `setModelMode(mode)` / `setClaudeModel(model)` / `setClaudeThinking(on)` / `modelSettingsLocked()` / `currentModelId()` | モデル設定(`scc.claude_settings.v1`)。実行中・停止中(`isPaused()`)はロックして切り替えない。`currentModelId()` は記録の `m` に入れる識別子 |
-| `setOrderMode(mode)` | 順番トグル(Issue #38)。`modelSettingsLocked()` と同じ条件でロックする(周の途中でマスの選び方が混ざらないように)。`localStorage` には保存しない |
-| `focusNext()` | 先頭で `runToken` を捕まえ、`queue` が空なら `finalizeRound()`。`state.orderMode === "confidence"` なら `selectNextCell(token)` に委譲して `return`。そうでなければ(scan)`queue` から1つ取り出して `focusCellForDigit(cell, token)` を呼ぶ |
+| `setOrderMode(mode)` | 順番トグル(Issue #38・#48)。`"scan"` / `"confidence"` / `"all"` のいずれか。`modelSettingsLocked()` と同じ条件でロックする(周の途中でマスの選び方が混ざらないように)。`localStorage` には保存しない |
+| `focusNext()` | 先頭で `runToken` を捕まえ、`queue` が空なら `finalizeRound()`。`state.orderMode === "confidence"` なら `selectNextCell(token)`、`"all"` なら `focusNextAll(token)` に委譲して `return`。そうでなければ(scan)`queue` から1つ取り出して `focusCellForDigit(cell, token)` を呼ぶ |
 | `selectNextCell(token)` | 確信度順モード(Issue #38)のマス選び。`state.selecting=true` にして描画 →(リクエストごとに新しい `AbortController` を `inflightController` に作って)`askCell` → `result.request` があれば先に `state.lastCellRequest` に保存(失敗しても「マス選び」のプロンプトを表示できるように)→ `result.cell` が `queue` に無ければ `showError("選ばれたマスが候補にありません: …")` して `return` → `result.probabilities`(`"r0c2"` 形式)を `"r-c"` 形式に変換して `state.cellProbs`(と最大値 `state.cellProbsMax`。ヒートマップ用)に、`state.lastSelection` に `{ r, c, confidence, candidates: probabilities のキー数, p: probabilities[choice] }` を保存 → `queue.splice(idx,1)` で選ばれたマスを取り除き `state.selecting=false` → `focusCellForDigit(cell, token)`(この中で描画)。`AbortError` は無視、それ以外の失敗は `err.request` があれば `state.lastCellRequest` に保存し、`err.transient`(Issue #43)なら `pauseForTransientError(err)` に分岐して `return`、そうでなければ従来どおり `showError` |
 | `focusCellForDigit(cell,token)` | 1マスの数字判定本体(従来の `focusNext()` の中身そのもの。Issue #38 で `focusNext` / `selectNextCell` の両方から呼べるように抽出した)。フォーカス→(新しい `AbortController` で)`judgeCell`→バー表示・`result.request` があれば `state.lastRequest` に保存(Issue #34)→(待ち)→`commitFocused`→(待ち)→`focusNext()` で次へ。`judgeCell` が `AbortError` で reject したときは(世代トークンの判定と同じ扱いで)無視して `return` し、`showError` には流さない(4.3、Issue #19)。それ以外の失敗で `err.request` があれば(`judgeCell` が 502 の `request` を載せる)`state.lastRequest` に保存して `lastRequestFailed=true` にしてから、`err.transient`(Issue #43)なら `pauseForTransientError(err)` に分岐して `return`、そうでなければ従来どおり `showError`(Issue #34) |
-| `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong`/`state.lastJudgment` を更新。`pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない。正誤が確定するこの時点で `appendRecord()` を呼び、集計ビュー用の1件(`m: currentModelId()` 付き)を記録する。`state.cellProbs` もここで `null` に戻す(Issue #38。次のマス選びまでヒートマップを出さない) |
-| `finalizeRound()` | ログ追記→`shouldStop` の結果で完了 / 強制終了 / 次の周(`queue = nextQueue(roundWrong)`)。「次の周」のときは、between-round の `setTimeout` を張る**前**に `state.round` / `queue` / `roundSize` / `roundTally` を更新する。この順序のおかげで、待ち時間中に `stop()` されても次の周の状態が既に確定している(下記 `stop()`、Issue #32) |
+| `focusNextAll(token)` | 一括モード(Issue #48)の周の入口。`allResults`(この周のキャッシュ)が `null`(= まだ `askAll()` していない)なら `askAllRound(token)` を呼ぶ。既にあれば(応答済み、または停止/再開で戻ってきた)`queue` から1つ取り出して `focusCellFromCache(cell, token)` に渡す |
+| `askAllRound(token)` | 一括モードの周ぶんの呼び出し。`state.allFetching=true` にして描画 →(新しい `AbortController` で)`askAll` → `result.request` があれば `state.lastAllRequest = { request, failed:false, count }`(`count` は呼び出し時点の `queue.length`)を保存 → `result.cells`(`"r0c2"` 形式のキー)を `"r-c"` 形式に変換して `allResults` に持ち `state.allFetching=false` → `focusNextAll(token)` で1マス目へ。失敗は `err.request` があれば `state.lastAllRequest = { request, failed:true, count }`、`err.transient`(Issue #43)なら `pauseForTransientError(err)`、それ以外は従来どおり `showError`(`queue` は変えていないので、いずれの再開も同じ周のまま `askAllRound()` をやり直す) |
+| `focusCellFromCache(cell,token)` | 一括モードの1マスぶん。`focusCellForDigit` と同じ「フォーカス→バー表示→確定→次へ」の流れだが、`judgeCell()` を呼ばず `allResults[key]` から読むだけなので `fetch` は発生しない(1周1回の呼び出しで済ませるのが目的)。`SLOW_BEFORE_COMMIT_MS` 等の速度モードの待ちは共通(スロー/最速の見え方も既存どおり) |
+| `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong`/`state.lastJudgment` を更新。`pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない。正誤が確定するこの時点で `appendRecord()` を呼び、集計ビュー用の1件を記録する。`m` は `currentModelId()`(一括モードは `"typesafe/jev/all"` または `currentModelId() + "/all"`。`o` も `"all"` を添える。Issue #48)。`state.cellProbs` もここで `null` に戻す(Issue #38。次のマス選びまでヒートマップを出さない) |
+| `finalizeRound()` | 冒頭で一括モード(Issue #48)のこの周のキャッシュ(`allResults`)を `null` に戻す(次の周は改めて1回聞く)。ログ追記→`shouldStop` の結果で完了 / 強制終了 / 次の周(`queue = nextQueue(roundWrong)`)。「次の周」のときは、between-round の `setTimeout` を張る**前**に `state.round` / `queue` / `roundSize` / `roundTally` を更新する。この順序のおかげで、待ち時間中に `stop()` されても次の周の状態が既に確定している(下記 `stop()`、Issue #32) |
 | `stop()` | 実行中の停止(SPEC F1、Issue #32)。`reset()` と同じく `runToken` を進めて in-flight の `/api/judge`(`inflightController.abort()`)と予約済みの `setTimeout` を無効化するが、`reset()` と違って **`state.values` / `state.round` / `state.roundLog` / `roundTally` / `roundSize` / `queue` / `started` は捨てない**。`state.focusedKey` があれば(= 判定中のマスがまだ `commitFocused()` されていない)、その結果を破棄して記録(`appendRecord`)にも残さず、`queue.unshift({r,c})` で queue の先頭に戻す(再開したら同じマスをもう一度聞く。SPEC F2)。周をまたぐ待ち時間中(`finalizeRound()` の between-round の `setTimeout` 待ち)に呼ばれた場合は、その時点で `focusedKey` は既に `null`(`commitFocused()` で消えている)なので何もすることがなく、次の周の先頭から再開する(`finalizeRound()` の更新順序による。SPEC F3)。`state.done` / `state.errorMessage` のときは何もしない(両者は常に `running=false` とセットで立つので `state.running` を見るだけで判定できる)。**確信度順モード中の停止(Issue #38)**: `state.selecting`(マス選び中)なら無条件で `state.selecting=false` / `state.cellProbs=null` にする。選ばれたマスはまだ `queue` から取り除いていない(選び終わって `splice` して初めて取り除く)ので、`focusedKey` が無い限り再キューは不要。再開(`run()`)はマス選びからやり直す。手動停止には理由が無いので `state.pauseReason=null` にする(下記 `pauseForTransientError()` と区別する。Issue #43)。実体は `haltRun(null)` |
-| `haltRun(reason)` | `stop()` と `pauseForTransientError()` の共通処理。`state.running` でなければ何もしない。`runToken` を進めて in-flight を abort、`running=false`、判定中のマスは `queue` の先頭に戻し `pendingCommit` を破棄、`selecting=false` / `cellProbs=null` にし、`state.pauseReason=reason`(手動停止は `null`)にして描画する。`state.errorMessage` は立てない(= `isPaused()` は true になる) |
+| `haltRun(reason)` | `stop()` と `pauseForTransientError()` の共通処理。`state.running` でなければ何もしない。`runToken` を進めて in-flight を abort、`running=false`、判定中のマスは `queue` の先頭に戻し `pendingCommit` を破棄、`selecting=false` / `cellProbs=null` / `state.allFetching=false` にし(一括モードのキャッシュ `allResults` はここでは **保つ**。Issue #48)、`state.pauseReason=reason`(手動停止は `null`)にして描画する。`state.errorMessage` は立てない(= `isPaused()` は true になる) |
 | `pauseForTransientError(err)` | 一時的な失敗による停止(Issue #43、SPEC F5)。`judgeCell*` / `askCell*` が `err.transient=true` で投げてきたときに `showError()` の代わりに呼ぶ。`haltRun(buildPauseReason(err))` を呼ぶだけ(= **`stop()` と同じ後始末**)。`buildPauseReason(err)` が組み立てる理由文言(`"一時的な失敗で停止しました: " + err.message`。`err.retryAfter` が数値なら `"(N秒後に再試行できます)"` を挟む)を `state.pauseReason` にセットする。`state.values` / `roundLog` / `roundTally` / `roundSize` / `queue` / `started` は `stop()` と同じく捨てない。記録(`appendRecord`)は呼ばない(判定が確定していないため) |
-| `run()` | 初回のみ queue を全空マスで初期化し `focusNext` を開始。`started` が既に true なら(= `stop()` / `pauseForTransientError()` した後の再開)queue を作り直さず `focusNext()` を呼ぶだけなので、保たれた進行状態からそのまま続く(確信度順モードで停止していた場合も、queue は変わっていないのでマス選びからやり直す形で自然に再開する)。冒頭で `state.pauseReason=null` にする(一時的な失敗からの再開で理由表示を消す。手動停止からの再開はもともと `null` なので無害。Issue #43) |
-| `reset()` | `runToken` を進め、`inflightController` があれば `abort()` して in-flight の `/api/judge` を打ち切り、進行管理と `state` を初期化(`speedMode` / `difficulty` / `orderMode` は維持。`lastRequest` / `lastCellRequest` / `lastSelection` / `pauseReason` も `null` に戻す)(Issue #19、#21、#34、#38、#43) |
-| `showError(message)` | `runToken` を進め、`inflightController` があれば `abort()` して `state.errorMessage` を立て、`running=false` で止める(不変条件4、Issue #19)。以前の `pauseReason` が残っていても `null` に戻す(エラー停止が優先されるので理由の表示は不要。Issue #43) |
+| `run()` | 初回のみ queue を全空マスで初期化し `focusNext` を開始。`started` が既に true なら(= `stop()` / `pauseForTransientError()` した後の再開)queue を作り直さず `focusNext()` を呼ぶだけなので、保たれた進行状態からそのまま続く(確信度順モードで停止していた場合も、queue は変わっていないのでマス選びからやり直す形で自然に再開する。一括モードも同様で、`allResults` が残っていればキャッシュから、無ければ `askAllRound()` からやり直す)。冒頭で `state.pauseReason=null` にする(一時的な失敗からの再開で理由表示を消す。手動停止からの再開はもともと `null` なので無害。Issue #43) |
+| `reset()` | `runToken` を進め、`inflightController` があれば `abort()` して in-flight の `/api/judge` を打ち切り、進行管理と `state` を初期化(`speedMode` / `difficulty` / `orderMode` は維持。`lastRequest` / `lastCellRequest` / `lastSelection` / `lastAllRequest` / `pauseReason` も `null` に戻す。一括モードのキャッシュ `allResults` も `null` に戻す)(Issue #19、#21、#34、#38、#43、#48) |
+| `showError(message)` | `runToken` を進め、`inflightController` があれば `abort()` して `state.errorMessage` を立て、`running=false` で止める(不変条件4、Issue #19)。以前の `pauseReason` が残っていても `null` に戻す(エラー停止が優先されるので理由の表示は不要。Issue #43)。一括モードのキャッシュ(`allResults` / `state.allFetching`)も捨てる(復帰はリセットのみなので、途中から再開することはない。Issue #48) |
 | `setSpeed(mode)` | `state.speedMode` を切り替えて再描画。実行中でも切り替えられる(4.4) |
 | `setDifficulty(mode)` | `state.difficulty`(`"easy"` / `"normal"` / `"hard"`)を切り替えて再描画。変えただけでは盤面は変わらず、次の `newPuzzle()` の目標ヒント数に効く(Issue #21) |
 | `render()` | `state` から DOM(グリッド・統計・バー・ログ・集計パネル・バナー・ボタン)を **全部 innerHTML で再生成**。周回ログのスクロール位置だけは引き継ぐ |
-| `render*()` | `renderGrid` / `renderLegend`(確信度順のときだけヒートマップの凡例を1項目足す。Issue #38)/ `renderControls`(モデルトグル・順番トグル含む)/ `renderClaudeSettings`(Claude のときだけ)/ `renderErrorBox` / `renderStats`(+`statCard`)/ `renderCurrentPanel`(+`coordLabel` / `renderBars` / `renderSelectionLine`)/ `renderPromptPanel`(+`renderRequestBlock`)/ `renderRoundLog` / `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`。それぞれHTML文字列を返すだけで、DOMには触らない |
+| `render*()` | `renderGrid` / `renderLegend`(確信度順のときだけヒートマップの凡例を1項目足す。Issue #38)/ `renderControls`(モデルトグル・順番トグル含む)/ `renderClaudeSettings`(Claude のときだけ)/ `renderErrorBox` / `renderStats`(+`statCard`)/ `renderCurrentPanel`(+`coordLabel` / `renderBars` / `renderSelectionLine`)/ `renderPromptPanel`(+`renderRequestBlock` / `renderAllRequestBlock`)/ `renderRoundLog` / `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`。それぞれHTML文字列を返すだけで、DOMには触らない |
 | `renderSelectionLine()` | 確信度順モード(Issue #38)の「マス選び: N 候補中 r行目c列目(p%)/ confidence q%」行。`state.lastSelection` が無ければ空文字列。`renderCurrentPanel()` が `state.focusedKey` があるとき(= マス選びが終わって数字判定中)にだけ先頭に差し込む |
-| `renderPromptPanel()` / `renderRequestBlock(req,failed,heading)` | 「現在の判定」パネルの直下の「モデルに送ったプロンプト」枠(SPEC F1、Issue #34、#38)。`renderRequestBlock` が1件ぶんの表示(座標・失敗注記・見出し・`<pre>` の JSON)を組み立てる下請け。左上からモード(`orderMode !== "confidence"`)は従来どおり `state.lastRequest` 1件だけを `heading=null` で表示。**確信度順モード**は `state.lastCellRequest`(見出し「マス選び」)→ `state.lastRequest`(見出し「数字」)の順で2段に並べる(どちらも無ければ従来と同じ「まだ判定していません」)。座標(`req.state.target`)・`lastRequestFailed` なら「(このプロンプトで失敗)」を添える処理は共通。Jev 経路では Worker の `handleJudge` が返す `request`、Claude 経路ではブラウザが送ったリクエストボディをそのまま表示し、フロント側で組み立て直さない(二重管理を避けるため) |
+| `renderPromptPanel()` / `renderRequestBlock(req,failed,heading)` / `renderAllRequestBlock(allReq)` | 「現在の判定」パネルの直下の「モデルに送ったプロンプト」枠(SPEC F1、Issue #34、#38、#48)。`renderRequestBlock` が1件ぶんの表示(座標・失敗注記・見出し・`<pre>` の JSON)を組み立てる下請け。左上からモード(`orderMode` が `"confidence"` でも `"all"` でもないとき)は従来どおり `state.lastRequest` 1件だけを `heading=null` で表示。**確信度順モード**は `state.lastCellRequest`(見出し「マス選び」)→ `state.lastRequest`(見出し「数字」)の順で2段に並べる(どちらも無ければ従来と同じ「まだ判定していません」)。座標(`req.state.target`)・`lastRequestFailed` なら「(このプロンプトで失敗)」を添える処理は共通。**一括モード**は `state.lastAllRequest`(`{ request, failed, count }`)を `renderAllRequestBlock` に渡し、「一括: 質問 N 問」の要約行 + `<details>` の折りたたみで表示する(1周ぶんの `request` は空マスの数だけ質問を含み大きいため)。Jev 経路では Worker の `handleJudge` が返す `request`、Claude 経路ではブラウザが送ったリクエストボディをそのまま表示し、フロント側で組み立て直さない(二重管理を避けるため) |
 | `buildCellStyle()` | マスの状態(given/pending/correct/incorrect + focused)からインラインstyle文字列を返す。確信度順モード(Issue #38)では、`state.cellProbs` にそのマスの確率があり(未判定・非フォーカス)、`α = 0.08 + 0.6 * p / pmax`(`pmax` は `cellProbs` の最大値)の `rgba(125, 211, 252, α)` を背景にする(ヒートマップ) |
 | `escapeHtml(text)` | `innerHTML` に入れる前に `& < > " '` を実体参照にする |
 | `fnv1a32(text)` / `puzzleId()` | 集計ビュー(SPEC F1 拡張2)の問題ID用の簡易ハッシュ。32bit FNV-1a を8桁16進で返す。`puzzleId()` は `GIVEN` の9行を結合した文字列をハッシュ化する |
@@ -555,6 +602,43 @@ focusNext()(orderMode==="confidence"、queueに残あり)
   (マス選び中に)──stop()──▶ selecting=false, cellProbs=null(queueは変更しない、pauseReason=null)
   paused ──run()──▶ focusNext() ── orderMode==="confidence" のマス選びからやり直す(pauseReason=null)
 ````
+
+**一括モード(Issue #48)は周の最初の呼び出しだけ `fetch` が挟まる。** `state.orderMode
+=== "all"` のときは `focusNext()` は `focusNextAll()` に委譲し、この周でまだ `askAll()`
+していなければ(`allResults === null`)1回だけ呼んでから、以降は `queue` を1つずつ
+キャッシュ(`allResults`)から確定する(`fetch` なし):
+
+````text
+focusNext()(orderMode==="all"、queueに残あり)
+                 │ token = runToken
+                 ▼
+            focusNextAll(token)
+                 │ allResults === null?
+        ┌────yes─┴─no─────────────────┐
+        ▼                             ▼
+   askAllRound(token)          cell = queue.shift()
+   │ allFetching=true, render()       │
+   ▼                                  ▼
+ askAll()  ── 失敗(transient) ──▶ pauseForTransientError(err), paused(queueは変更しない)
+   │        ── 失敗(それ以外)   ──▶ showError(), 停止
+   │ 成功
+   ▼
+ allResults=…("r0c2"→"r-c"に変換), allFetching=false
+   │
+   ▼
+ focusNextAll(token) ── queue.shift() → focusCellFromCache(cell, token)
+                                          │ focusCellForDigit と同じ
+                                          │ フォーカス→バー→確定→次へ
+                                          ▼ (judgeCell は呼ばない = fetch なし)
+                                        focusNext()
+
+  (askAllRound の呼び出し中に)──stop()──▶ allFetching=false(queueは変更しない、allResultsは保つ)
+  (focusCellFromCache 確定待ち中に)──stop()──▶ 従来どおり queue の先頭に戻す(allResultsは保つ)
+  paused ──run()──▶ focusNext() ── allResults があればキャッシュから続き、無ければ askAllRound() をやり直す
+````
+
+`allResults` は周が変わる(`finalizeRound()`)たびに `null` に戻すので、次の周は必ず改めて
+1回 `askAll()` する。リセット/新しい問題/エラーでも `null` に戻す(`reset()` / `showError()`)。
 
 **停止/再開(`stop()`、Issue #32、SPEC F1〜F3)。** `stop()` は `reset()` と同じく世代
 (`runToken`)を進めて in-flight の `fetch` / 予約済みの `setTimeout` を無効化するが、
@@ -635,6 +719,15 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
   分岐しなくても自然に出ない。`state.orderMode` はモデルトグルと同じ `modelSettingsLocked()`
   でロックし、`localStorage` には保存しない(`speedMode` と違い、実行のたびに選び直す
   性質のものではなく、ページを開き直したときに毎回既定の「左上から」に戻ってよいと判断した)
+- **一括モード(Issue #48)** も同じ考え方で `state.orderMode === "all"` の分岐を
+  `renderCurrentPanel`(`state.allFetching` のときだけ「一括で判定中…(N マス)」を出す)・
+  `renderPromptPanel`(`renderAllRequestBlock`)・`renderControls` / `renderCompareTopbarHtml`
+  の順番トグルに足しただけで、専用のコンポーネントは新設していない。ヒートマップ
+  (`state.cellProbs`)は一括モードでは一度も立たないので `buildCellStyle` に変更は無い。
+  マス自体の確定(フォーカス→バー→確定→次へ)は `focusCellFromCache` が
+  `focusCellForDigit` と同じ描画経路(`state.focusedKey` / `state.currentProbs` /
+  `pendingCommit`)を使うので、`renderGrid` / `renderCurrentPanel` の本体側は
+  モードを意識しない
 
 ## 5. データ
 
@@ -807,4 +900,13 @@ new_sqlite_classes = ["RateLimitCounter"]
     - X2: `model=claude&order=confidence&speed=fast` で初期 `state` が変わること。`localStorage`(`scc.claude_settings.v1`)には一切書き戻らないこと。既定(`location.pathname==="/"`、`search:""`)では従来どおり(`jev`/`scan`/`slow`)であること
     - X3: `embed=1` でコントロール・Claude設定・較正図・プロンプト枠・見出し(h1)が描かれず、グリッド・統計は描かれること。`message` の `run`/`stop`/`reset`/`newPuzzle` が同一オリジンのときだけ効き、他オリジンは無視されること。`render()` のたびに `status` が `window.parent.postMessage(payload, location.origin)` されること(第2引数が origin であることを含む)
     - X4: `/compare` で2つの `iframe.compare-frame`(`model=jev` / `model=claude`)と上部バーが描かれること。「実行」(`compareRun()`)で両 `iframe.contentWindow.postMessage` に `{type:"run"}` が飛ぶこと。子からの `status` メッセージ(`event.source` で送信元を判定)で該当する見出し(`compareEls.statusJev` / `statusClaude`)だけが更新され、他オリジンの `status` は無視されること
+  - **一括モード**(`test/page.test.js` Z1〜Z8、Issue #48)。S/T/W/Y 系と同じ `runScript` / `makeAbortAwareFetch` / `waitFor` / `makeManualTimers` を使う。`makeAllResponse(ctx,puzzle,keys,wrongKeys)` を新設(Jev の `ask:"all"` 応答のモック。`wrongKeys` に挙げたキーだけ不正解の数字を返す。W5 の `makeCellResponse` と同じ考え方)
+    - Z1: 一括の1周は `fetch` 1回で `ask:"all"`・`target`/`digit` 無し、盤面は `buildSelectionSnapshot()` と一致し `SOLUTION` の各行を含まないこと。正解のみの応答なら1回の呼び出しで1周が完了すること
+    - Z2: 応答後に全マス(`TOTAL_EMPTY` 件)が順に確定し、記録が `TOTAL_EMPTY` 件・すべて `m: "typesafe/jev/all"` / `o: "all"` になること
+    - Z3: 一括の呼び出し中(`askAllRound` の `fetch` 待ち)の `stop()` は in-flight を abort し `queue` の長さを変えず、`run()` で再開するともう一度 `fetch` すること。応答後、確定途中(`focusCellFromCache` の確定前の待ち)の `stop()` は queue の先頭に戻り、`run()` で再開しても `fetch` せずキャッシュ(`allResults`)から続いて完走すること(`makeManualTimers()` で確定前の待ちタイマーを制御して検証)
+    - Z4: Jev の 429(`Retry-After` ヘッダー)は停止扱い(`pauseReason` に秒数を含む)。`queue` の長さは変わらず、`state.allFetching` は `false` に戻ること。`run()` で再開するともう一度 `ask:"all"` の `fetch` をすること
+    - Z5: Claude 経路のスキーマ(`buildClaudeAllRequest` / `buildClaudeAllSchema`。候補キー(その周の `queue`)がそれぞれ `required` で、各値は digit 判定と同じ形)、`system` に `ALL_NOTE` の文言を含むこと、`max_tokens` の下限(思考なし16000・adaptive 24000・Haiku(budget 2048)12000。`buildClaudeAllRequest` を直接呼んで検証)、`target` を送らないこと。応答検証(`validateClaudeAllAnswer`)はキーが1つ欠けていればエラー、揃っていれば通ること。`run()` 経由でもキー欠けの応答がエラーで停止すること
+    - Z6: 2周目の一括は不正解マスだけを候補にする(`buildSelectionSnapshot()` で空マスがその1マスだけになる)こと。周回ログの形式は従来どおり
+    - Z7: URL `order=all` で `state.orderMode` が `"all"` になること、`setOrderMode("all")` が効き順番トグルに「一括」ボタン(`onclick="setOrderMode('all')"`)が出ること。比較シェル(`/compare`)の順番トグルにも「一括」があり、`compareSetOrderMode("all")` で `state.orderMode` が変わり `compareIframeSrc()` の組み立てに `order=all` が反映されること
+    - Z8: Claude 経路の一括で全マスが確定し、記録の `m` が `claude-opus-5+think/all`・`o` が `"all"` になること、キーが DOM に出ないこと。Jev 経路で `cells` に対象マスが欠けた応答は、1 マスも確定・記録せず `queue` も減らさずにエラー停止すること(`askAllRound` がキャッシュに入れる前に queue の全キーを確かめる)
 - CI(`.github/workflows/ci.yml`)は push と PR で `npm ci` → `npm test` → `npm run check` を実行する。`check` は `wrangler deploy --dry-run` で、認証なしで動く

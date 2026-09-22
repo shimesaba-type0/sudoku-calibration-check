@@ -3616,3 +3616,464 @@ test("X4: /compare は2つの iframe(jev/claude)と上部バーを描き、「�
   });
   assert.equal(ctx.compareEls.statusJev.innerHTML, "__untouched__", "他オリジンの status で更新されてしまった");
 });
+
+// ---------------------------------------------------------------------------
+// 一括モード(Issue #48、SPEC 3章 F1・F3)。S/T/W/Y 系と同じ runScript /
+// makeAbortAwareFetch / waitFor / makeManualTimers を使う。
+// ---------------------------------------------------------------------------
+
+/**
+ * /api/judge の ask:"all" 応答モック(Jev 経路)。keys(queue のキー、"r0c2" 形式)の
+ * 全部に choice/probabilities/confidence を作る。wrongKeys に挙げたキーだけ不正解の
+ * 数字を返す(W5 の makeCellResponse と同じ考え方)。
+ */
+function makeAllResponse(ctx, puzzle, keys, wrongKeys) {
+  var wrongSet = {};
+  (wrongKeys || []).forEach(function (k) {
+    wrongSet[k] = true;
+  });
+  var criteria = {};
+  for (var d = 1; d <= 9; d++) criteria[String(d)] = "the digit " + d;
+  var cells = {};
+  var questions = {};
+  keys.forEach(function (key) {
+    var m = /^r(\d)c(\d)$/.exec(key);
+    var row = Number(m[1]);
+    var col = Number(m[2]);
+    var correctDigit = ctx.SOLUTION[row][col];
+    var choice = correctDigit;
+    if (wrongSet[key]) {
+      var others = ["1", "2", "3", "4", "5", "6", "7", "8", "9"].filter(function (dd) {
+        return dd !== correctDigit;
+      });
+      choice = others[0];
+    }
+    var probabilities = {};
+    for (var d2 = 1; d2 <= 9; d2++) probabilities[String(d2)] = String(d2) === choice ? 0.9 : 0.0125;
+    cells[key] = { choice: choice, probabilities: probabilities, confidence: 0.5 };
+    questions[key] = {
+      type: "choice",
+      instructions: "Which digit from 1 to 9 belongs in the empty cell at row " + row + ", column " + col + " (zero-based)?",
+      criteria: criteria,
+    };
+  });
+  var body = {
+    cells: cells,
+    request: {
+      state: { puzzle: puzzle, note: "puzzle is a 9x9 Sudoku grid, no target this time (mock, all)" },
+      questions: questions,
+    },
+  };
+  return {
+    ok: true,
+    json: async function () {
+      return body;
+    },
+  };
+}
+
+test("Z1: 一括の1周は fetch 1回(ask:\"all\")、盤面は buildSelectionSnapshot() と一致し SOLUTION を含まない", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.setOrderMode("all");
+  assert.equal(ctx.state.orderMode, "all");
+
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Z1: fetch 待ち");
+  assert.equal(ctx.state.allFetching, true, "state.allFetching が立っていない");
+  var entry = af.pending.shift();
+  var body = JSON.parse(entry.init.body);
+  assert.equal(body.ask, "all", "ask:\"all\" を送っていない");
+  assert.equal(body.target, undefined, "ask:\"all\" で target を送っている");
+  assert.equal(body.digit, undefined, "ask:\"all\" で digit を送っている");
+  assert.deepStrictEqual(hostRows(body.puzzle), hostRows(ctx.buildSelectionSnapshot()), "盤面が buildSelectionSnapshot() と一致しない");
+  var bodyText = JSON.stringify(body);
+  hostRows(ctx.SOLUTION).forEach(function (row) {
+    assert.ok(bodyText.indexOf(row) === -1, "SOLUTION の行が送信盤面に含まれている: " + row);
+  });
+  assert.equal(af.pending.length, 0, "一括なのに複数回 fetch している");
+
+  var keys = ctx.selectionKeys();
+  entry.resolve(makeAllResponse(ctx, body.puzzle, keys));
+  await waitFor(function () {
+    return ctx.state.done === true;
+  }, "Z1: 完了待ち");
+  assert.equal(af.pending.length, 0, "1周(51マス)の完走に複数回 fetch している");
+});
+
+test("Z2: 一括の応答後に全マスが順に確定し、記録の m が \"typesafe/jev/all\"・o が \"all\" になる", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.setOrderMode("all");
+  ctx.setSpeed("fast");
+
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Z2: fetch 待ち");
+  var entry = af.pending.shift();
+  var body = JSON.parse(entry.init.body);
+  var keys = ctx.selectionKeys();
+  entry.resolve(makeAllResponse(ctx, body.puzzle, keys));
+
+  await waitFor(function () {
+    return ctx.state.done === true;
+  }, "Z2: 完了待ち");
+  assert.equal(Object.keys(ctx.state.values).length, ctx.TOTAL_EMPTY, "全マスが確定していない");
+  var records = ctx.getRecords();
+  assert.equal(records.length, ctx.TOTAL_EMPTY, "記録の件数が空マス数と一致しない");
+  records.forEach(function (rec) {
+    assert.equal(rec.m, "typesafe/jev/all", "記録の m が typesafe/jev/all でない: " + rec.m);
+    assert.equal(rec.o, "all", "記録の o が all でない: " + rec.o);
+  });
+  assert.equal(af.pending.length, 0, "一括なのに複数回 fetch している");
+});
+
+test(
+  "Z3: 一括の呼び出し中の stop() は再開で呼び直し、確定途中の stop() は再開でキャッシュから続き fetch しない",
+  { timeout: 10000 },
+  async () => {
+    var af = makeAbortAwareFetch();
+    var timers = makeManualTimers();
+    var ctx = runScript(await getPageHtml(), { fetch: af.fetch, setTimeout: timers.setTimeout });
+    ctx.setOrderMode("all");
+
+    ctx.run();
+    await waitFor(function () {
+      return af.pending.length === 1;
+    }, "Z3: 1回目の fetch 待ち");
+    var entry1 = af.pending.shift();
+    var queueLenBefore = ctx.queue.length;
+    ctx.stop();
+    assert.equal(entry1.settled, true, "呼び出し中の stop() で fetch が abort されていない");
+    assert.equal(ctx.state.allFetching, false, "stop() 後も一括の呼び出し中表示が残っている");
+    assert.equal(ctx.isPaused(), true);
+    assert.equal(ctx.queue.length, queueLenBefore, "呼び出し中の stop() で queue の長さが変わった");
+
+    ctx.run();
+    await waitFor(function () {
+      return af.pending.length === 1;
+    }, "Z3: 再開後にもう一度 fetch する(呼び直す)のを待つ");
+    var entry2 = af.pending.shift();
+    var body2 = JSON.parse(entry2.init.body);
+    var keys = ctx.selectionKeys();
+    entry2.resolve(makeAllResponse(ctx, body2.puzzle, keys));
+
+    await waitFor(function () {
+      return ctx.state.focusedKey !== null;
+    }, "Z3: 応答後の最初のマスへのフォーカス待ち");
+    assert.equal(af.pending.length, 0, "一括の応答後にキャッシュから確定するはずが余計な fetch をしている");
+    var firstFocused = ctx.state.focusedKey;
+    assert.equal(timers.length(), 1, "確定前の待ちタイマーが積まれていない");
+
+    // 確定途中(beforeCommit の待ち)で stop()
+    ctx.stop();
+    assert.equal(ctx.state.running, false);
+    assert.equal(ctx.queue[0].r + "-" + ctx.queue[0].c, firstFocused, "確定途中のマスが queue の先頭に戻っていない");
+    assert.equal(af.pending.length, 0, "確定途中の stop() で余計な fetch が飛んだ");
+
+    // 再開。allResults(キャッシュ)にまだ結果があるので、fetch せずキャッシュから続く
+    ctx.run();
+    assert.equal(af.pending.length, 0, "確定途中からの再開で fetch し直している(キャッシュを使っていない)");
+    assert.equal(ctx.state.focusedKey, firstFocused, "再開後に同じマスへフォーカスしていない");
+
+    // 残りは手動タイマーを進めて完走させる(この周は最初に成功した1回の fetch だけで済むはず)
+    for (var i = 0; i < 1000 && !ctx.state.done; i++) {
+      if (timers.length() === 0) throw new Error("Z3: 進めるタイマーが無い(スタック)");
+      timers.fireNext();
+    }
+    assert.equal(ctx.state.done, true, "一括モードの1周が完走しなかった");
+    assert.equal(af.pending.length, 0, "完走までに余計な fetch が飛んだ(一括なのに複数回呼んでいる)");
+    assert.equal(Object.keys(ctx.state.values).length, ctx.TOTAL_EMPTY);
+  }
+);
+
+test("Z4: 一括モードで Jev の 429 は停止扱いになる(queue は変わらず、再開は呼び直す)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.setOrderMode("all");
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Z4: fetch 待ち");
+  var entry = af.pending.shift();
+  entry.resolve({
+    ok: false,
+    status: 429,
+    headers: {
+      get: function (name) {
+        return name === "Retry-After" ? "45" : null;
+      },
+    },
+    json: function () {
+      return Promise.resolve({ error: "アクセス元(IP)ごとのレート制限を超えました" });
+    },
+  });
+  await waitFor(function () {
+    return ctx.isPaused();
+  }, "Z4: 429 の停止待ち");
+  assert.equal(ctx.state.errorMessage, null, "429 でエラーボックスが立った");
+  assert.ok(ctx.state.pauseReason && ctx.state.pauseReason.indexOf("45") !== -1, "pauseReason に Retry-After の秒数が含まれない: " + ctx.state.pauseReason);
+  assert.equal(ctx.queue.length, ctx.TOTAL_EMPTY, "429 の停止で queue の長さが変わった");
+  assert.equal(ctx.state.allFetching, false, "429 の停止後も一括の呼び出し中表示が残っている");
+
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Z4: 再開後にもう一度 fetch する");
+  var entry2 = af.pending.shift();
+  var body2 = JSON.parse(entry2.init.body);
+  assert.equal(body2.ask, "all", "再開後の呼び出しが ask:\"all\" でない");
+});
+
+test(
+  "Z5: 一括モードの Claude 経路(スキーマの required キー・system の ALL_NOTE・max_tokens の下限)と応答検証(キー欠け→エラー)",
+  { timeout: 10000 },
+  async () => {
+    var ctx = runScript(await getPageHtml(), {});
+    ctx.setModelMode("claude");
+    var puzzle = ctx.buildSnapshot();
+    var keys = ["r0c0", "r0c1", "r1c0"];
+
+    // max_tokens の下限(既存の設定との Math.max。docs/DESIGN.md 3.6)
+    ctx.setClaudeThinking(false);
+    var offBody = ctx.buildClaudeAllRequest(puzzle, keys);
+    assert.equal(offBody.max_tokens, 16000, "思考なしの一括の最低値が16000になっていない");
+
+    ctx.setClaudeThinking(true); // 既定モデル(opus)は adaptive
+    var adaptiveBody = ctx.buildClaudeAllRequest(puzzle, keys);
+    assert.equal(adaptiveBody.max_tokens, 24000, "adaptive の一括の最低値が24000になっていない");
+
+    ctx.setClaudeModel("claude-haiku-4-5");
+    var haikuBody = ctx.buildClaudeAllRequest(puzzle, keys);
+    assert.equal(haikuBody.max_tokens, 12000, "Haiku(budget 2048)の一括の最低値が12000になっていない");
+
+    // スキーマ: 候補キーがそれぞれ required で、各値は digit 判定と同じ形
+    var schema = offBody.output_config.format.schema;
+    assert.deepStrictEqual(Object.keys(schema.properties).sort(), keys.slice().sort(), "スキーマの properties が候補キーと一致しない");
+    assert.deepStrictEqual(Array.from(schema.required).sort(), keys.slice().sort(), "スキーマの required が候補キーと一致しない");
+    assert.equal(schema.additionalProperties, false);
+    var cellSchema = schema.properties[keys[0]];
+    // schema.required 等は vm レルムの配列なので、host 側の配列に移し替えてから比較する
+    // (hostRows と同じ理由。W6 のコメント参照)。
+    assert.deepStrictEqual(Array.from(cellSchema.required), ["choice", "probabilities", "confidence"]);
+    assert.deepStrictEqual(Array.from(cellSchema.properties.choice.enum).sort(), ["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
+    assert.deepStrictEqual(Array.from(cellSchema.properties.probabilities.required).sort(), ["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
+    assert.equal(cellSchema.additionalProperties, false);
+
+    assert.ok(typeof offBody.system === "string" && offBody.system.indexOf("Each question is about one empty cell") !== -1, "system が ALL_NOTE を含んでいない");
+    var content = offBody.messages[0].content;
+    var sent = JSON.parse(content.slice(content.indexOf("\n") + 1));
+    assert.ok(!Object.prototype.hasOwnProperty.call(sent, "target"), "一括なのに target を送っている");
+
+    // 応答検証(純粋関数): キーが1つ欠けていればエラー、揃っていれば通る
+    var badAnswer = {};
+    keys.forEach(function (k, i) {
+      if (i === 0) return;
+      badAnswer[k] = { choice: "1", probabilities: { "1": 1, "2": 0, "3": 0, "4": 0, "5": 0, "6": 0, "7": 0, "8": 0, "9": 0 }, confidence: 0.5 };
+    });
+    assert.ok(ctx.validateClaudeAllAnswer(badAnswer, keys) !== null, "キー欠けの応答が検証を通ってしまった");
+    var goodAnswer = {};
+    keys.forEach(function (k) {
+      goodAnswer[k] = { choice: "1", probabilities: { "1": 1, "2": 0, "3": 0, "4": 0, "5": 0, "6": 0, "7": 0, "8": 0, "9": 0 }, confidence: 0.5 };
+    });
+    assert.equal(ctx.validateClaudeAllAnswer(goodAnswer, keys), null, "揃っている応答が検証で弾かれた");
+
+    // run() 経由でも同じ検証が効く(キー欠けの応答はエラーで停止する)
+    var af = makeAbortAwareFetch();
+    var ctx2 = runScript(await getPageHtml(), { fetch: af.fetch });
+    assert.equal(ctx2.saveAnthropicKey(TEST_KEY), true);
+    ctx2.setModelMode("claude");
+    ctx2.setOrderMode("all");
+    ctx2.run();
+    await waitFor(function () {
+      return af.pending.length === 1;
+    }, "Z5: run() 経由の fetch 待ち");
+    var entry = af.pending.shift();
+    assert.equal(entry.url, ANTHROPIC_URL, "呼び先が api.anthropic.com でない");
+    var liveBody = JSON.parse(entry.init.body);
+    var liveKeys = Array.prototype.slice.call(ctx2.selectionKeys()).map(String);
+    assert.deepStrictEqual(Object.keys(liveBody.output_config.format.schema.properties).sort(), liveKeys.slice().sort(), "スキーマの properties が queue のキーと一致しない(live)");
+    var liveSent = JSON.parse(liveBody.messages[0].content.slice(liveBody.messages[0].content.indexOf("\n") + 1));
+    assert.deepStrictEqual(hostRows(liveSent.puzzle), hostRows(ctx2.buildSelectionSnapshot()), "盤面が buildSelectionSnapshot() と一致しない(live)");
+    // Claude 経路の送信ボディにも SOLUTION の行が含まれない(不変条件1)
+    hostRows(ctx2.SOLUTION).forEach(function (row) {
+      assert.ok(entry.init.body.indexOf(row) === -1, "SOLUTION の行が Claude への送信ボディに含まれている: " + row);
+    });
+    assert.ok(entry.init.body.indexOf(TEST_KEY) === -1, "API キーがボディに混ざっている");
+
+    var missingKeyAnswer = {};
+    liveKeys.forEach(function (k, i) {
+      if (i === 0) return; // 先頭のキーを欠かす
+      missingKeyAnswer[k] = { choice: "1", probabilities: { "1": 1, "2": 0, "3": 0, "4": 0, "5": 0, "6": 0, "7": 0, "8": 0, "9": 0 }, confidence: 0.5 };
+    });
+    entry.resolve({
+      ok: true,
+      status: 200,
+      json: function () {
+        return Promise.resolve({
+          id: "msg_z5",
+          type: "message",
+          role: "assistant",
+          model: "claude-opus-5",
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: JSON.stringify(missingKeyAnswer) }],
+          usage: { input_tokens: 9000, output_tokens: 4000 },
+        });
+      },
+    });
+    await waitFor(function () {
+      return ctx2.state.errorMessage !== null;
+    }, "Z5: キー欠けでエラー待ち");
+    assert.equal(ctx2.state.running, false);
+  }
+);
+
+test("Z6: 一括モードの2周目は不正解マスだけを聞く(候補が不正解マス1つだけになる)", { timeout: 20000 }, async () => {
+  var ctx;
+  var wrongKey = "r0c2"; // GIVEN の最初の空マス(helpers.js の GIVEN と同一の固定問題)
+  var allCalls = [];
+  var round = 0;
+  var fetchStub = async function (url, init) {
+    var body = JSON.parse(init.body);
+    assert.equal(body.ask, "all", "一括モードなのに ask:\"all\" 以外のリクエストが飛んだ");
+    allCalls.push(body);
+    round += 1;
+    var keys = ctx.selectionKeys();
+    var wrongKeys = round === 1 ? [wrongKey] : [];
+    return makeAllResponse(ctx, body.puzzle, keys, wrongKeys);
+  };
+  ctx = runScript(await getPageHtml(), { fetch: fetchStub });
+  ctx.setOrderMode("all");
+  ctx.setSpeed("fast");
+
+  ctx.run();
+  await waitFor(function () {
+    return ctx.state.done === true;
+  }, "Z6: 完了待ち");
+
+  assert.equal(ctx.state.roundsToSolve, 2, "2周で完了したことになっていない");
+  assert.equal(allCalls.length, 2, "一括の呼び出しが2回(1周目+2周目)でない: " + allCalls.length);
+
+  var round2Body = allCalls[1];
+  var dots = [];
+  for (var r = 0; r < 9; r++) {
+    for (var c = 0; c < 9; c++) {
+      if (round2Body.puzzle[r][c] === ".") dots.push("r" + r + "c" + c);
+    }
+  }
+  assert.deepEqual(dots, [wrongKey], "2周目の一括の候補が不正解マスだけになっていない: " + JSON.stringify(dots));
+
+  assert.equal(ctx.state.roundLog.length, 2, "周回ログが2行でない");
+  assert.match(ctx.state.roundLog[0], /^1周目: 51中50正解 \(98%\)$/, "1周目のログ形式が違う: " + ctx.state.roundLog[0]);
+  assert.match(ctx.state.roundLog[1], /^2周目: 1中1正解 \(100%\)$/, "2周目のログ形式が違う: " + ctx.state.roundLog[1]);
+});
+
+test("Z7: URL パラメータ order=all、setOrderMode(\"all\")、比較シェルの順番トグルとURL組み立てに「一括」がある", async () => {
+  var html = await getPageHtml();
+  var ctx = runScript(html, {
+    location: { pathname: "/", search: "?order=all", origin: "https://example.com" },
+  });
+  assert.equal(ctx.state.orderMode, "all", "order=all が反映されていない");
+
+  var ctx2 = runScript(html);
+  assert.equal(ctx2.state.orderMode, "scan");
+  ctx2.setOrderMode("all");
+  assert.equal(ctx2.state.orderMode, "all", "setOrderMode(\"all\") が効かない");
+  ctx2.render();
+  var orderToggleMatch = ctx2.appElement.innerHTML.match(/<div id="order-toggle">([\s\S]*?)<\/div>/);
+  assert.ok(orderToggleMatch, "order-toggle が描画されていない");
+  assert.ok(orderToggleMatch[1].indexOf("一括") !== -1, "順番トグルに「一括」ボタンが無い");
+  assert.ok(orderToggleMatch[1].indexOf("setOrderMode('all')") !== -1, "「一括」ボタンの onclick が setOrderMode('all') でない");
+
+  // 比較シェル(/compare、Issue #46)の順番トグルにも「一括」がある
+  var fakeDoc = makeCompareDocument();
+  var ctxCompare = runScript(html, {
+    location: { pathname: "/compare", search: "", origin: "https://example.com" },
+    document: fakeDoc,
+  });
+  assert.ok(ctxCompare.appElement.innerHTML.indexOf("compareSetOrderMode('all')") !== -1, "比較シェルの順番トグルに「一括」が無い");
+  ctxCompare.compareSetOrderMode("all");
+  assert.equal(ctxCompare.state.orderMode, "all", "比較シェルの compareSetOrderMode('all') が効かない");
+  assert.ok(ctxCompare.compareIframeSrc("jev").indexOf("order=all") !== -1, "比較シェルの iframe URL 組み立てに order=all が反映されない");
+});
+
+test("Z8: 一括モードの Claude 経路で全マスが確定し、記録の m が \"claude-opus-5+think/all\"・o が \"all\" になる。応答に対象マスが欠けていれば1マスも確定・記録しない", { timeout: 10000 }, async () => {
+  function claudeAllResponse(ctx, keys, omitFirst) {
+    var answer = {};
+    keys.forEach(function (k, i) {
+      if (omitFirst && i === 0) return;
+      var m = /^r(\d)c(\d)$/.exec(k);
+      var digit = ctx.SOLUTION[Number(m[1])][Number(m[2])];
+      var probabilities = {};
+      for (var d = 1; d <= 9; d++) probabilities[String(d)] = String(d) === digit ? 0.6 : 0.05;
+      answer[k] = { choice: digit, probabilities: probabilities, confidence: 0.4 };
+    });
+    return {
+      ok: true,
+      status: 200,
+      json: function () {
+        return Promise.resolve({
+          id: "msg_z8",
+          type: "message",
+          role: "assistant",
+          model: "claude-opus-5",
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: JSON.stringify(answer) }],
+          usage: { input_tokens: 9000, output_tokens: 4000 },
+        });
+      },
+    };
+  }
+
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  assert.equal(ctx.saveAnthropicKey(TEST_KEY), true);
+  ctx.setModelMode("claude");
+  ctx.setOrderMode("all");
+  ctx.setSpeed("fast");
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "Z8: fetch 待ち");
+  var entry = af.pending.shift();
+  var keys = Array.prototype.slice.call(ctx.selectionKeys()).map(String);
+  entry.resolve(claudeAllResponse(ctx, keys, false));
+  await waitFor(function () {
+    return ctx.state.done === true;
+  }, "Z8: 完了待ち");
+  var records = ctx.getRecords();
+  assert.equal(records.length, ctx.TOTAL_EMPTY, "記録の件数が空マス数と一致しない");
+  records.forEach(function (rec) {
+    assert.equal(rec.m, "claude-opus-5+think/all", "記録の m が claude-opus-5+think/all でない: " + rec.m);
+    assert.equal(rec.o, "all", "記録の o が all でない: " + rec.o);
+  });
+  assert.equal(af.pending.length, 0, "一括なのに複数回 fetch している");
+  ctx.render();
+  assert.ok(!ctx.appElement.innerHTML.includes(TEST_KEY), "innerHTML にキーが出ている");
+
+  // Jev 経路でも、cells に対象マスが欠けていれば 1 マスも確定・記録せずエラーになる(レビュー S2)
+  var af2 = makeAbortAwareFetch();
+  var ctx2 = runScript(await getPageHtml(), { fetch: af2.fetch });
+  ctx2.setOrderMode("all");
+  ctx2.run();
+  await waitFor(function () {
+    return af2.pending.length === 1;
+  }, "Z8: Jev の fetch 待ち");
+  var entry2 = af2.pending.shift();
+  var body2 = JSON.parse(entry2.init.body);
+  var keys2 = ctx2.selectionKeys();
+  var res2 = makeAllResponse(ctx2, body2.puzzle, keys2);
+  var payload2 = await res2.json();
+  delete payload2.cells[String(keys2[keys2.length - 1])]; // 末尾のマスを欠かす
+  entry2.resolve({ ok: true, status: 200, json: function () { return Promise.resolve(payload2); } });
+  await waitFor(function () {
+    return ctx2.state.errorMessage !== null;
+  }, "Z8: 欠けでエラー待ち");
+  assert.ok(ctx2.state.errorMessage.indexOf("対象マスの回答がありません") !== -1, "文言が違う: " + ctx2.state.errorMessage);
+  assert.equal(Object.keys(ctx2.state.values).length, 0, "欠けた応答なのにマスが確定した");
+  assert.equal(ctx2.getRecords().length, 0, "欠けた応答なのに記録が増えた");
+  assert.equal(ctx2.queue.length, ctx2.TOTAL_EMPTY, "欠けた応答なのに queue が減った");
+});

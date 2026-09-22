@@ -168,6 +168,51 @@ async function startMockServer(mode) {
           return;
         }
 
+        // ask:"all"(一括モード、Issue #48)。body.puzzle の空マス全部について choice を
+        // まとめて返す(1呼び出しで1周ぶん)。
+        if (body && body.ask === "all") {
+          var allEmptyCells = [];
+          for (var ar = 0; ar < 9; ar++) {
+            for (var ac = 0; ac < 9; ac++) {
+              if (body.puzzle && body.puzzle[ar] && body.puzzle[ar][ac] === ".") {
+                allEmptyCells.push({ key: "r" + ar + "c" + ac, row: ar, col: ac });
+              }
+            }
+          }
+          if (allEmptyCells.length === 0) {
+            res.writeHead(400, { "content-type": "application/json; charset=utf-8" });
+            res.end(JSON.stringify({ error: "空マスがありません(モック)" }));
+            return;
+          }
+          var allCriteria = {};
+          DIGITS.forEach(function (d) { allCriteria[d] = "the digit " + d; });
+          var allCells = {};
+          var allQuestions = {};
+          allEmptyCells.forEach(function (cell) {
+            var correctDigit = SOLUTION[cell.row][cell.col];
+            var choice = correctDigit;
+            if (mode === "mixed" && Math.random() >= 0.7) {
+              var others = DIGITS.filter(function (d) { return d !== correctDigit; });
+              choice = others[Math.floor(Math.random() * others.length)];
+            }
+            var probabilities = {};
+            DIGITS.forEach(function (d) { probabilities[d] = d === choice ? 0.9 : 0.0125; });
+            allCells[cell.key] = { choice: choice, probabilities: probabilities, confidence: 0.5 };
+            allQuestions[cell.key] = {
+              type: "choice",
+              instructions: "Which digit from 1 to 9 belongs in the empty cell at row " + cell.row + ", column " + cell.col + " (zero-based)?",
+              criteria: allCriteria,
+            };
+          });
+          var allRequest = {
+            state: { puzzle: body.puzzle, note: "puzzle is a 9x9 Sudoku grid, no target this time (mock, all)" },
+            questions: allQuestions,
+          };
+          res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+          res.end(JSON.stringify({ cells: allCells, request: allRequest }));
+          return;
+        }
+
         if (!body || !body.target || typeof body.target.row !== "number" || typeof body.target.col !== "number") {
           res.writeHead(400, { "content-type": "application/json; charset=utf-8" });
           res.end(JSON.stringify({ error: "target が不正です(モック)" }));
@@ -439,6 +484,54 @@ async function runMockMode(chromium, executablePath, mode) {
         // 順番トグルは reset() をまたいで保持されるので、後続のチェックのために「左上から」に戻す
         var scanToggle = page.locator("#order-toggle button", { hasText: "左上から" });
         if ((await scanToggle.count()) > 0) await scanToggle.click();
+      }
+    });
+
+    // [9] 一括モード(Issue #48)。順番トグルを「一括」に切り替えて最速で実行し、1周ぶんの
+    // ログが出ること・/api/judge がちょうど1回(ask:"all")だけ呼ばれることを確認する。
+    // モックのレート制限カウンタはスクリプト全体で共有(サーバー起動からの累計)なので、
+    // ratelimit モードではここに来る前に他のチェックで既に上限(3件目)を超えていることがあり、
+    // 一括の唯一の1回が429になってしまう([7] と同じ理由でこのモードでは対象外にする)。
+    await runCheck(9, "一括で1周目のログが出る(/api/judge は1回)", async function () {
+      if (mode === "ratelimit") {
+        throw new Skip("ratelimit モードは既に上限を超えており呼び出し数を検証できない");
+      }
+      var judgeCalls = 0;
+      var allCounter = function (req) {
+        if (req.url().indexOf("/api/judge") === -1) return;
+        judgeCalls += 1;
+      };
+      // 固定問題(モックが正解を知っている盤面)に戻す
+      await page.goto(mockServer.baseUrl + "/", { waitUntil: "load" });
+      page.on("request", allCounter);
+      try {
+        var allToggle = page.locator("#order-toggle button", { hasText: "一括" });
+        var allCount = await allToggle.count();
+        if (allCount === 0) {
+          throw new Skip("順番トグルに「一括」が無い(Issue #48 のフロントマージ前)");
+        }
+        await allToggle.click();
+        await page.locator("#speed-toggle button", { hasText: "最速" }).click();
+        await page.click("#run-btn");
+        var logItem = page.locator("#round-log li").first();
+        await logItem.waitFor({ state: "visible", timeout: 30000 });
+        var text = await logItem.textContent();
+        var counted = judgeCalls;
+        assert.match(text, /^1周目:/, "1行目が「1周目:」で始まらない: " + text);
+        // mixed モードは1周目に不正解が出ることがあり、その場合は1周目のログが表示された
+        // 直後には既に2周目ぶんの呼び出し(1回)が始まっていることがある(between-round の
+        // 待ちが80msと短いため)。「1マスごとに呼んでいない(空マス数51より遥かに少ない)」
+        // ことを検証できれば十分なので、上限は緩めに取る。
+        // 1周1回なので、1マスごとに呼んでいれば数十回になる。mixed は 2〜3 周走るので上限は余裕を持たせる
+        assert.ok(counted >= 1 && counted <= 5, "一括モードなのに /api/judge の呼び出し回数が想定と違う(1マスごとに呼んでいる?): " + counted);
+        await page.screenshot({ path: path.join(outDir, mode + "-09-all-order.png") });
+        return text + " / judge=" + counted;
+      } finally {
+        page.off("request", allCounter);
+        await page.click("#reset-btn");
+        // 順番トグルは reset() をまたいで保持されるので、後続のチェックのために「左上から」に戻す
+        var scanToggleBack = page.locator("#order-toggle button", { hasText: "左上から" });
+        if ((await scanToggleBack.count()) > 0) await scanToggleBack.click();
       }
     });
 
