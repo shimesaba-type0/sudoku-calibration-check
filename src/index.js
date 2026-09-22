@@ -754,7 +754,8 @@ var PAGE_HTML = `<!doctype html>
   .prompt-json {
     overflow: auto;
     max-height: 320px;
-    white-space: pre;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
     font-family: "IBM Plex Mono", "Courier New", monospace;
     font-size: 12px;
     color: var(--muted);
@@ -1192,7 +1193,8 @@ var PAGE_HTML = `<!doctype html>
     errorMessage: null,
     stoppedAtLimit: false,
     lastJudgment: null, // 直前に確定した1件(最速モードでも結果が見えるように残す)
-    lastRequest: null // 直近の判定で Worker が Jev に渡したペイロード(request、Issue #34)
+    lastRequest: null, // 直近の判定で Worker が Jev に渡したペイロード(request、Issue #34)
+    lastRequestFailed: false // lastRequest が失敗した判定(502)のものなら true(Issue #34)
   };
   // 描画に不要な進行管理はモジュール変数(docs/DESIGN.md 4.1)
   var queue = [];
@@ -1226,13 +1228,20 @@ var PAGE_HTML = `<!doctype html>
     });
     if (res.ok) return res.json();
     var message = "HTTP " + res.status;
+    var data = null;
     try {
-      var data = await res.json();
+      data = await res.json();
       if (data && typeof data.error === "string") message = data.error;
     } catch (e) {
       // JSONでないボディはそのまま HTTP <status> にフォールバック
     }
-    throw new Error(message);
+    var error = new Error(message);
+    // 502 には Worker が Jev に渡したペイロード(request)が付く(Issue #34)。
+    // 「何を送って失敗したか」をパネルに出せるよう、エラーに載せて呼び出し元へ渡す。
+    if (data && data.request && typeof data.request === "object") {
+      error.request = data.request;
+    }
+    throw error;
   }
 
   // -------------------------------------------------------------------
@@ -1370,6 +1379,7 @@ var PAGE_HTML = `<!doctype html>
       // 次の判定が確定するまで(エラー時もそのまま)残す。
       if (result.request && typeof result.request === "object") {
         state.lastRequest = result.request;
+        state.lastRequestFailed = false;
       }
       pendingCommit = { r: cell.r, c: cell.c, choice: result.choice, confidence: result.confidence, probabilities: result.probabilities };
       render();
@@ -1389,6 +1399,12 @@ var PAGE_HTML = `<!doctype html>
       // reset() / showError() による abort() が原因の AbortError はユーザーへの
       // エラー表示にしない。世代トークンの判定と同じ「古い世代は無視する」扱い(Issue #19)。
       if (err && err.name === "AbortError") return;
+      // 502 に付いてきた request(Jev に渡したペイロード)は「このプロンプトで失敗」
+      // としてパネルに残す(Issue #34)。request の無い 400/429/503 は直前の値のまま。
+      if (err && err.request && typeof err.request === "object") {
+        state.lastRequest = err.request;
+        state.lastRequestFailed = true;
+      }
       showError(err && err.message ? err.message : String(err));
     }).catch(function (err) {
       // 成功ハンドラ(render など)が投げた場合。API エラーとは区別して表示する。
@@ -1567,7 +1583,8 @@ var PAGE_HTML = `<!doctype html>
       errorMessage: null,
       stoppedAtLimit: false,
       lastJudgment: null,
-      lastRequest: null
+      lastRequest: null,
+      lastRequestFailed: false
     };
     queue = [];
     roundWrong = [];
@@ -1817,8 +1834,11 @@ var PAGE_HTML = `<!doctype html>
     }
     var target = req.state && req.state.target;
     var usedFor = "";
+    var failedNote = state.lastRequestFailed ? "(このプロンプトで失敗)" : "";
     if (target && typeof target.row === "number" && typeof target.col === "number") {
-      usedFor = "<p class=\\"muted\\">" + escapeHtml(coordLabel(target.row, target.col)) + " の判定に使用</p>";
+      usedFor = "<p class=\\"muted\\">" + escapeHtml(coordLabel(target.row, target.col)) + " の判定に使用" + failedNote + "</p>";
+    } else if (failedNote) {
+      usedFor = "<p class=\\"muted\\">" + failedNote + "</p>";
     }
     return head + usedFor +
       "<pre class=\\"prompt-json\\">" + escapeHtml(JSON.stringify(req, null, 2)) + "</pre>" + tail;

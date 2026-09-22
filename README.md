@@ -91,11 +91,12 @@ npm run deploy
 | --- | --- | --- |
 | `/` | GET | フロントエンド一式(HTML)。数独グリッド、判定パネル、周回ログ、「新しい問題」ボタン(ブラウザ側で唯一解の問題を生成) |
 | `/api/status` | GET | レート制限の残数を読むだけで返す(カウンタは加算しない。`Cache-Control: no-store`) |
-| `/api/judge` | POST | 盤面と対象マスを受け取り、`{ probabilities, choice, confidence }` を返す |
+| `/api/judge` | POST | 盤面と対象マスを受け取り、`{ probabilities, choice, confidence, request }` を返す |
 
 `confidence` は **Jev が返す独自の確信度** で、`probabilities[choice]` とは一致しません
 (実測では 0.20 に対して 0.10 など)。較正が本当かを確かめるのに使うのは `probabilities` の
-ほうです(`docs/SPEC.md` 4章 / `docs/DESIGN.md` 3.4)。
+ほうです(`docs/SPEC.md` 4章 / `docs/DESIGN.md` 3.4)。`request` は Worker が Jev に渡した
+ペイロードそのもので、画面の「Jev に送ったプロンプト」枠がそのまま表示します(502 にも付きます)。
 
 それ以外のパスは 404 です。`/api/judge` は `content-type: application/json` 以外を 415 で
 弾き、CORS ヘッダーも付けていないため、他サイトのページからは呼べません。

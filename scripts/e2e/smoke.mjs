@@ -149,7 +149,15 @@ async function startMockServer(mode) {
         });
 
         res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
-        res.end(JSON.stringify({ probabilities: probabilities, choice: choice, confidence: 0.5 }));
+        // Worker の契約(SPEC 4章)に合わせて request(Jev に渡したペイロード)も返す(Issue #34)。
+        // note / instructions の文言は本番の Worker と同じである必要はなく、形だけ揃える。
+        var criteria = {};
+        DIGITS.forEach(function (d) { criteria[d] = "the digit " + d; });
+        var request = {
+          state: { puzzle: body.puzzle, target: body.target, note: "puzzle is a 9x9 Sudoku grid (mock)" },
+          questions: { digit: { type: "choice", instructions: "Which digit from 1 to 9 belongs in the target cell of this Sudoku grid?", criteria: criteria } },
+        };
+        res.end(JSON.stringify({ probabilities: probabilities, choice: choice, confidence: 0.5, request: request }));
         return;
       }
 
@@ -307,6 +315,12 @@ async function runMockMode(chromium, executablePath, mode) {
       await barFill.first().waitFor({ state: "visible", timeout: 10000 });
       var barCount = await barFill.count();
       assert.ok(barCount >= 1, "確率バーが出ていない");
+      // 「Jev に送ったプロンプト」枠(Issue #34)にレスポンスの request が出ている
+      var promptPanel = page.locator("#prompt-panel");
+      await promptPanel.waitFor({ state: "visible", timeout: 10000 });
+      var promptText = await promptPanel.innerText();
+      assert.ok(promptText.includes("Which digit from 1 to 9"), "プロンプト枠に instructions が出ていない");
+      assert.ok(promptText.includes("の判定に使用"), "プロンプト枠に対象マスが出ていない");
       await page.screenshot({ path: path.join(outDir, mode + "-05-focus-bars.png") });
 
       await page.click("#reset-btn");

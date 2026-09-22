@@ -1868,3 +1868,101 @@ test("U3: reset() で #prompt-panel が初期文言に戻る", { timeout: 10000 
   );
   assert.ok(!html.includes("instructions"), "reset() 後も instructions の文言が残っている");
 });
+
+test("U4: 502 に付いた request は「このプロンプトで失敗」として #prompt-panel に出る(request の無いエラーは直前の値を残す)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "U4: 1件目の fetch 待ち");
+  var entry = af.pending.shift();
+  var body = JSON.parse(entry.init.body);
+  var failedRequest = makeRequestPayload(body.puzzle, body.target.row, body.target.col);
+  entry.resolve({
+    ok: false,
+    status: 502,
+    json: function () {
+      return Promise.resolve({ error: "AIの呼び出しに失敗しました", raw: "boom", request: failedRequest });
+    },
+  });
+
+  await waitFor(function () {
+    return ctx.state.errorMessage !== null;
+  }, "U4: エラー表示待ち");
+
+  assert.equal(ctx.state.running, false, "エラー後も running のまま");
+  assert.deepStrictEqual(
+    JSON.parse(JSON.stringify(ctx.state.lastRequest)),
+    failedRequest,
+    "502 の request が state.lastRequest に入っていない"
+  );
+  assert.equal(ctx.state.lastRequestFailed, true, "lastRequestFailed が true になっていない");
+  ctx.render();
+  var html = ctx.appElement.innerHTML;
+  var expectedLabel = (body.target.row + 1) + "行目 " + (body.target.col + 1) + "列目";
+  assert.ok(html.includes(expectedLabel + " の判定に使用(このプロンプトで失敗)"), "失敗の注記が出ていない");
+  assert.ok(html.includes("&lt;") === false, "エスケープ対象の無い JSON に &lt; が出ている");
+
+  // request の無いエラー(429 相当)は直前の値をそのまま残す
+  ctx.reset();
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "U4: 2件目の fetch 待ち");
+  var entry2 = af.pending.shift();
+  var body2 = JSON.parse(entry2.init.body);
+  entry2.resolve(makeCorrectResponse(ctx, body2.target.row, body2.target.col, body2.puzzle));
+  await waitFor(function () {
+    return ctx.state.lastRequest !== null;
+  }, "U4: lastRequest が設定されるまで");
+  var kept = ctx.state.lastRequest;
+  assert.equal(ctx.state.lastRequestFailed, false, "成功後に lastRequestFailed が false に戻っていない");
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "U4: 3件目の fetch 待ち");
+  af.pending.shift().resolve({
+    ok: false,
+    status: 429,
+    json: function () {
+      return Promise.resolve({ error: "レート制限" });
+    },
+  });
+  await waitFor(function () {
+    return ctx.state.errorMessage !== null;
+  }, "U4: 2回目のエラー表示待ち");
+  assert.strictEqual(ctx.state.lastRequest, kept, "request の無いエラーで lastRequest が変わった");
+  assert.equal(ctx.state.lastRequestFailed, false, "request の無いエラーで lastRequestFailed が立った");
+});
+
+test("U5: request に HTML 特殊文字が含まれても #prompt-panel でエスケープされる", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "U5: 1件目の fetch 待ち");
+  var entry = af.pending.shift();
+  var body = JSON.parse(entry.init.body);
+  var response = makeCorrectResponse(ctx, body.target.row, body.target.col, body.puzzle);
+  var payload = makeRequestPayload(body.puzzle, body.target.row, body.target.col);
+  payload.state.note = "<script>alert(1)</script> & \"quoted\"";
+  response.json = function () {
+    return Promise.resolve({
+      probabilities: (function () { var p = {}; for (var d = 1; d <= 9; d++) p[String(d)] = d === Number(ctx.SOLUTION[body.target.row][body.target.col]) ? 0.9 : 0.0125; return p; })(),
+      choice: ctx.SOLUTION[body.target.row][body.target.col],
+      confidence: 0.5,
+      request: payload,
+    });
+  };
+  entry.resolve(response);
+  await waitFor(function () {
+    return ctx.state.lastRequest !== null;
+  }, "U5: lastRequest が設定されるまで");
+  ctx.render();
+  var pre = ctx.appElement.innerHTML.split('<pre class="prompt-json">')[1].split("</pre>")[0];
+  assert.ok(!pre.includes("<script>"), "<script> がそのまま出ている");
+  assert.ok(pre.includes("&lt;script&gt;"), "< > がエスケープされていない");
+  assert.ok(pre.includes("&amp;"), "& がエスケープされていない");
+});

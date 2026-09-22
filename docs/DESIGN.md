@@ -227,6 +227,8 @@ var state = {
                        // レスポンスの request をそのまま保持。3.3 手順7)。「Jev に送った
                        // プロンプト」パネル(renderPromptPanel)が表示する。停止中・
                        // エラー時も消さず、reset() / newPuzzle() でだけ null に戻す(Issue #34)
+  lastRequestFailed: false // lastRequest が失敗した判定(502 の request)のものなら true。
+                       // 成功応答で false に戻り、パネルに「(このプロンプトで失敗)」を添える
 };
 // 描画に不要な進行管理はモジュール変数
 var queue = [];                 // この周でまだ判定していないマス [{r,c}]
@@ -273,7 +275,7 @@ var inflightController = null;  // in-flight の /api/judge 用 AbortController(
 | `isCurrent(token)` | `state.running && token === runToken`。古い世代のコールバックを弾く(4.3) |
 | `isPaused()` | `started && !state.running && !state.done && !state.errorMessage`。「実行を始めた後、停止していて、完了もエラーもしていない」状態(SPEC F1、Issue #32)。`renderControls()` の「再開」ラベルと `renderCurrentPanel()` の「停止中」表示で使う |
 | `judgeCell(r,c,signal)` | `buildSnapshot()` を作って `/api/judge` を `fetch`(`signal` をそのまま渡す。`focusNext` が渡す `inflightController.signal`)。非2xxは `Error` にして投げる |
-| `focusNext()` | 先頭で `runToken` を捕まえ、`queue` から1つ取り出しフォーカス→(リクエストごとに新しい `AbortController` を `inflightController` に作って)`judgeCell`→バー表示・`result.request` があれば `state.lastRequest` に保存(Issue #34)→(待ち)→`commitFocused`→(待ち)→再帰。`queue` が空なら `finalizeRound`。`judgeCell` が `AbortError` で reject したときは(世代トークンの判定と同じ扱いで)無視して `return` し、`showError` には流さない(4.3、Issue #19) |
+| `focusNext()` | 先頭で `runToken` を捕まえ、`queue` から1つ取り出しフォーカス→(リクエストごとに新しい `AbortController` を `inflightController` に作って)`judgeCell`→バー表示・`result.request` があれば `state.lastRequest` に保存(Issue #34)→(待ち)→`commitFocused`→(待ち)→再帰。`queue` が空なら `finalizeRound`。`judgeCell` が `AbortError` で reject したときは(世代トークンの判定と同じ扱いで)無視して `return` し、`showError` には流さない(4.3、Issue #19)。それ以外の失敗で `err.request` があれば(`judgeCell` が 502 の `request` を載せる)`state.lastRequest` に保存して `lastRequestFailed=true` にしてから `showError`(Issue #34) |
 | `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong`/`state.lastJudgment` を更新。`pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない。正誤が確定するこの時点で `appendRecord()` を呼び、集計ビュー用の1件を記録する |
 | `finalizeRound()` | ログ追記→`shouldStop` の結果で完了 / 強制終了 / 次の周(`queue = nextQueue(roundWrong)`)。「次の周」のときは、between-round の `setTimeout` を張る**前**に `state.round` / `queue` / `roundSize` / `roundTally` を更新する。この順序のおかげで、待ち時間中に `stop()` されても次の周の状態が既に確定している(下記 `stop()`、Issue #32) |
 | `stop()` | 実行中の停止(SPEC F1、Issue #32)。`reset()` と同じく `runToken` を進めて in-flight の `/api/judge`(`inflightController.abort()`)と予約済みの `setTimeout` を無効化するが、`reset()` と違って **`state.values` / `state.round` / `state.roundLog` / `roundTally` / `roundSize` / `queue` / `started` は捨てない**。`state.focusedKey` があれば(= 判定中のマスがまだ `commitFocused()` されていない)、その結果を破棄して記録(`appendRecord`)にも残さず、`queue.unshift({r,c})` で queue の先頭に戻す(再開したら同じマスをもう一度聞く。SPEC F2)。周をまたぐ待ち時間中(`finalizeRound()` の between-round の `setTimeout` 待ち)に呼ばれた場合は、その時点で `focusedKey` は既に `null`(`commitFocused()` で消えている)なので何もすることがなく、次の周の先頭から再開する(`finalizeRound()` の更新順序による。SPEC F3)。`state.done` / `state.errorMessage` のときは何もしない(両者は常に `running=false` とセットで立つので `state.running` を見るだけで判定できる) |
@@ -284,7 +286,7 @@ var inflightController = null;  // in-flight の /api/judge 用 AbortController(
 | `setDifficulty(mode)` | `state.difficulty`(`"easy"` / `"normal"` / `"hard"`)を切り替えて再描画。変えただけでは盤面は変わらず、次の `newPuzzle()` の目標ヒント数に効く(Issue #21) |
 | `render()` | `state` から DOM(グリッド・統計・バー・ログ・集計パネル・バナー・ボタン)を **全部 innerHTML で再生成**。周回ログのスクロール位置だけは引き継ぐ |
 | `render*()` | `renderGrid` / `renderLegend` / `renderControls` / `renderErrorBox` / `renderStats`(+`statCard`)/ `renderCurrentPanel`(+`coordLabel` / `renderBars`)/ `renderPromptPanel` / `renderRoundLog` / `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`。それぞれHTML文字列を返すだけで、DOMには触らない |
-| `renderPromptPanel()` | 「現在の判定」パネルの直下の「Jev に送ったプロンプト」枠(SPEC F1、Issue #34)。`state.lastRequest` があれば `coordLabel`(`lastRequest.state.target` の座標)と、`JSON.stringify(lastRequest, null, 2)` を `escapeHtml` して `<pre class="prompt-json">` に表示する。`null` なら「まだ判定していません」。Worker の `handleJudge` が返す `request` をそのまま表示するだけで、フロント側でペイロードを組み立て直さない(二重管理を避けるため) |
+| `renderPromptPanel()` | 「現在の判定」パネルの直下の「Jev に送ったプロンプト」枠(SPEC F1、Issue #34)。`state.lastRequest` があれば `coordLabel`(`lastRequest.state.target` の座標。`lastRequestFailed` なら「(このプロンプトで失敗)」を添える)と、`JSON.stringify(lastRequest, null, 2)` を `escapeHtml` して `<pre class="prompt-json">` に表示する。`null` なら「まだ判定していません」。Worker の `handleJudge` が返す `request` をそのまま表示するだけで、フロント側でペイロードを組み立て直さない(二重管理を避けるため) |
 | `buildCellStyle()` | マスの状態(given/pending/correct/incorrect + focused)からインラインstyle文字列を返す |
 | `escapeHtml(text)` | `innerHTML` に入れる前に `& < > " '` を実体参照にする |
 | `fnv1a32(text)` / `puzzleId()` | 集計ビュー(SPEC F1 拡張2)の問題ID用の簡易ハッシュ。32bit FNV-1a を8桁16進で返す。`puzzleId()` は `GIVEN` の9行を結合した文字列をハッシュ化する |
@@ -386,9 +388,11 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
   (`onclick="run()"`、無効化しない)、それ以外(未実行・完了・エラー・生成中)は「実行」
   (完了・エラー・生成中は無効化)を出す
 - 「Jev に送ったプロンプト」パネル(`renderPromptPanel`)は「現在の判定」パネルとは独立して
-  `state.lastRequest` だけを見る。停止中・エラー中でも直前の値をそのまま出し続け、
+  `state.lastRequest`(と `lastRequestFailed`)だけを見る。停止中・エラー中でも直前の値をそのまま出し続け、
   `isPaused()` のような特別扱いはしない(消えるのは `reset()` / `newPuzzle()` のときだけ。
-  Issue #34)
+  Issue #34)。502 で失敗した判定の `request` は「(このプロンプトで失敗)」付きで表示し、
+  `request` の無いエラー(400/429/503)では直前の値が残る。`<pre>` は `white-space: pre-wrap`
+  で長い `note` を折り返す(1 判定あたりレスポンスは約 1KB 増える。定数 `NOTE` が大半)
 
 ## 5. データ
 

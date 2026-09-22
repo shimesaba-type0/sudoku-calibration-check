@@ -79,14 +79,15 @@ npm run dev                 # ローカル起動。AIバインディングはリ
 ## 現在の状態(2026-09-22)
 
 - v0.1 と SPEC 7 章の拡張 1・2・5(最小版)まで **すべてマージ・デプロイ済み**。進捗は GitHub の Issues / PR を参照(`docs/HANDOFF.md` の「現在地」も併せて更新する)
-- デプロイ済み: https://sudoku-calibration-check.takashi-kono-rb.workers.dev (Version `2b8eb12c`、2026-09-22)。`npm run e2e -- --url <URL>` の本番モード(ヘッダー 3 つ + 最速で 3 判定)が PASS
+- デプロイ済み: https://sudoku-calibration-check.takashi-kono-rb.workers.dev (2026-09-22。Version は `docs/HANDOFF.md` 6 章の最新行を参照)。`npm run e2e -- --url <URL>` の本番モード(ヘッダー 3 つ + 最速で 3 判定)が PASS
 - **Jev は 2026-09-21 に Worker 経由で実環境検証済み**(Issue #4)。レスポンスは AI Gateway のラッパー付き(`docs/DESIGN.md` 3.4)。`confidence` は `probabilities[choice]` と一致せず、同じ入力でも `choice` が揺れる
 - レート制限のカウンタは Durable Object(`RATE_LIMITER` / `RateLimitCounter`)。`wrangler deploy` が `[[migrations]]` から作るので、ネームスペース作成のような手作業は不要(Issue #10 で Workers KV から移行。KV は結果整合で全体上限が分散アクセスに効かなかった)。`GET /api/status` で残数を読める(#18)
-- マージ済み PR: #7(Worker 本体)、#9(Jev 実レスポンス形式 + KV id)、#11(#7/#9 のレビュー指摘)、#13(フロントエンド)、#14(DO レート制限)、#15(ジェネレーター/ソルバー)、#22(モデル方針)、#23(`/api/status`)、#24(E2E スモーク)、#25(集計ビュー)、#26(README)、#27(AbortController + 振る舞いテスト)、#28(難易度)
+- マージ済み PR: #7(Worker 本体)、#9(Jev 実レスポンス形式 + KV id)、#11(#7/#9 のレビュー指摘)、#13(フロントエンド)、#14(DO レート制限)、#15(ジェネレーター/ソルバー)、#22(モデル方針)、#23(`/api/status`)、#24(E2E スモーク)、#25(集計ビュー)、#26(README)、#27(AbortController + 振る舞いテスト)、#28(難易度)、#33(停止/再開)、#35(Jev に送ったプロンプトの表示枠)
 - 数独ジェネレーター/ソルバー(#5)と難易度トグル(#21、やさしい 36 / ふつう 30 / むずかしい 25 ヒント)。Worker 側の入力検証から固定問題(`GIVEN`)前提の項目は外れている(`docs/DESIGN.md` 3.3)
 - 集計ビュー(信頼度較正図)(#6): 判定結果を `localStorage`(`scc.records.v1`)に蓄積し、`pc` / `conf` それぞれの帯ごとの正解率を較正図として表示。JSON エクスポート・記録の消去あり
 - リセット/新しい問題/エラー時に in-flight の `/api/judge` を `AbortController` で中断する(#19)。周回ロジックの振る舞いテスト(S1〜S4)あり
 - Playwright E2E スモーク(#17): `npm run e2e`(モック)/ `npm run e2e -- --url <URL>`(本番、最大 3 判定)。プロキシ環境では `E2E_PROXY` / `E2E_IGNORE_HTTPS_ERRORS=1`
+- 実行中に「停止」で止め、「再開」で続きから動かせる(#32)。盤面・周回・ログは保持し、判定中だったマスは再開時にもう一度聞く。振る舞いテスト T1〜T6 あり
 - 既知の未実装: なし(SPEC 7 章の拡張 3(Claude API)と 4(ログ異常検知への転用)は依頼があるまで着手しない)
 - IP 単位のレート制限は 2026-09-22 にオーナー判断(Issue #20)で 30 → 120 回/時に緩和済み(1 問 ≈ 78 判定を 1 時間で完走できるように)。全体 500 回/時は据え置き
-- Jev に送ったプロンプトの表示枠(#34)。`/api/judge` のレスポンス(200・502)に `request`(Worker が `env.AI.run` に渡した payload)を添え、フロントの「現在の判定」パネル直下に表示する
+- Jev に送ったプロンプトの表示枠(#34)。`/api/judge` のレスポンス(200・502)に `request`(Worker が `env.AI.run` に渡した payload)を添え、フロントの「現在の判定」パネル直下に表示する。502 の分は「(このプロンプトで失敗)」付き。振る舞いテスト U1〜U5 あり
