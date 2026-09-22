@@ -48,11 +48,13 @@ var NOTE =
 
 var INSTRUCTIONS = "Which digit from 1 to 9 belongs in the target cell of this Sudoku grid?";
 
-// 質問の種類(リクエストの ask フィールド。docs/SPEC.md 4章 / Issue #38)。
+// 質問の種類(リクエストの ask フィールド。docs/SPEC.md 4章 / Issue #38 / Issue #45)。
 // "digit" … 従来どおり target のマスの数字(1〜9)を聞く
 // "cell"  … target を取らず、空マスのうち「最も確定しやすいマス」を聞く
+// "where" … target を取らず、指定された digit が各空マスに入るかを noul でまとめて聞く
 var ASK_DIGIT = "digit";
 var ASK_CELL = "cell";
+var ASK_WHERE = "where";
 
 // ask:"cell" 用の固定文。NOTE と同じくルールを伝えるための説明だが、target が無く、
 // 代わりに空マスの一覧が criteria として与えられることを伝える。NOTE の文面は変えない。
@@ -71,6 +73,34 @@ var CELL_INSTRUCTIONS =
   "Which empty cell of this Sudoku grid can be filled in with the most certainty? " +
   "Pick the cell whose digit you are most confident about.";
 
+// ask:"where"(数字ごとモード。Issue #45)用の固定文。NOTE / CELL_NOTE と同じくルールを
+// 伝えるための説明だが、target は無く、代わりに「聞いている数字」が digit として渡る。
+// 質問は空マスごとに1つで、そのマスにその数字が入るかを noul で聞く。
+// NOTE / CELL_NOTE の文面は変えない(ask:"digit" / ask:"cell" の挙動を1文字も変えないため)。
+var WHERE_NOTE =
+  "puzzle is a 9x9 Sudoku grid given as 9 strings of 9 characters each, " +
+  "top row first. A digit character is a cell that is already filled in; " +
+  "'.' is an empty cell. There is no target cell this time. digit is the digit " +
+  "being asked about. Each question is about one empty cell of the grid, keyed as " +
+  "'r<row>c<col>' with zero-based row and col indices (row 0 is the first string, " +
+  "col 0 is its first character), and asks whether that cell contains digit. " +
+  "Standard Sudoku rules apply: every row, every column and every 3x3 box must " +
+  "contain each of the digits 1 to 9 exactly once. Some of the digits already " +
+  "placed may be wrong.";
+
+// ask:"where" の各質問の文言のテンプレート。{row} / {col} / {digit} を差し替えて使う。
+// フロント(PAGE_HTML)が Claude 経路で同じ文言を組み立てられるよう、**テンプレートそのもの**
+// を定数として持ち、Worker 側(whereInstructions)もこれ1つから組み立てる。
+var WHERE_INSTRUCTIONS_TEMPLATE =
+  "Is the digit {digit} the one that belongs in the empty cell at row {row}, column {col} (zero-based)?";
+
+/** WHERE_INSTRUCTIONS_TEMPLATE に座標と数字を埋めて1問分の instructions を作る。 */
+function whereInstructions(row, col, digit) {
+  return WHERE_INSTRUCTIONS_TEMPLATE.replace("{row}", String(row))
+    .replace("{col}", String(col))
+    .replace("{digit}", String(digit));
+}
+
 // 質問の種類ごとの 502 の理由(validateAnswer に渡す)。digit 側の文言は従来のまま。
 var ANSWER_MESSAGES = {
   digit: {
@@ -82,6 +112,11 @@ var ANSWER_MESSAGES = {
     keys: "AIの応答のprobabilitiesが候補マスのキーと一致していません",
     values: "AIの応答のprobabilitiesに数値でない値が含まれています",
     choice: "AIの応答のchoiceが候補マスのいずれかではありません",
+  },
+  // where は noul なので choice も confidence も無い(answers そのものを検証する)。
+  where: {
+    keys: "AIの応答のanswersが質問したマスのキーと一致していません", // validateNoulAnswers 専用(choice は無い)
+    values: "AIの応答のnoulに数値でない値が含まれています",
   },
 };
 
@@ -376,12 +411,12 @@ var CELL_PATTERN = /^[1-9.]{9}$/;
 
 /**
  * リクエストの ask(質問の種類)を読む。省略時は従来どおり "digit"。
- * 未知の値は null を返し、呼び出し側が 400 にする(docs/SPEC.md 4章 / Issue #38)。
+ * 未知の値は null を返し、呼び出し側が 400 にする(docs/SPEC.md 4章 / Issue #38 / #45)。
  */
 function readAsk(body) {
   if (body === null || typeof body !== "object") return null;
   if (body.ask === undefined) return ASK_DIGIT;
-  if (body.ask === ASK_DIGIT || body.ask === ASK_CELL) return body.ask;
+  if (body.ask === ASK_DIGIT || body.ask === ASK_CELL || body.ask === ASK_WHERE) return body.ask;
   return null;
 }
 
@@ -403,9 +438,10 @@ function emptyCells(puzzle) {
  * 入力検証(docs/DESIGN.md 3.3 手順3)。
  * 問題なければ null、不備があれば日本語の理由を返す。
  *
- * ask:"digit"(既定)と ask:"cell" で見る項目が変わる。puzzle の形式・最小ヒント数は共通で、
- * target は digit のとき必須・cell のとき禁止(付いていたら 400。どちらのつもりの
- * リクエストか曖昧にしないため)。cell は空マスが1個も無ければ聞くものが無いので 400。
+ * ask:"digit"(既定)/ ask:"cell" / ask:"where" で見る項目が変わる。puzzle の形式・
+ * 最小ヒント数は共通で、target は digit のとき必須・cell / where のとき禁止(付いていたら
+ * 400。どちらのつもりのリクエストか曖昧にしないため)。cell / where は空マスが1個も
+ * 無ければ聞くものが無いので 400。where はさらに digit("1"〜"9" の文字列)が必須。
  */
 function validateInput(body, ask) {
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
@@ -414,21 +450,33 @@ function validateInput(body, ask) {
 
   // ask は呼び出し元(handleJudge)が readAsk で 1 回だけ解釈して渡す(レビュー指摘 S1。
   // 2 か所で別々に解釈すると、検証順の変更で null が素通りする余地ができる)。
-  if (ask !== ASK_DIGIT && ask !== ASK_CELL) {
-    return "askはdigitかcellである必要があります";
+  if (ask !== ASK_DIGIT && ask !== ASK_CELL && ask !== ASK_WHERE) {
+    return "askはdigit・cell・whereのいずれかである必要があります";
   }
 
   var puzzle = body.puzzle;
   var target = body.target;
   if (!Array.isArray(puzzle) || puzzle.length !== 9) {
-    // cell では target を取らないので、文言でも target に触れない(S3)。digit の文言は従来どおり。
-    return ask === ASK_CELL ? "puzzle(9行の配列)が必要です" : "puzzle(9行の配列)とtarget({row,col})が必要です";
+    // cell / where では target を取らないので、文言でも target に触れない(S3)。
+    // digit の文言は従来どおり。
+    return ask === ASK_DIGIT
+      ? "puzzle(9行の配列)とtarget({row,col})が必要です"
+      : "puzzle(9行の配列)が必要です";
   }
   if (ask === ASK_DIGIT && (target === null || typeof target !== "object" || Array.isArray(target))) {
     return "puzzle(9行の配列)とtarget({row,col})が必要です";
   }
   if (ask === ASK_CELL && target !== undefined) {
     return "ask:cellではtargetを指定できません(盤面全体から選ぶため)";
+  }
+  if (ask === ASK_WHERE && target !== undefined) {
+    return "ask:whereではtargetを指定できません(盤面全体に聞くため)";
+  }
+
+  // where は「どの数字について聞くか」が必須。数値の 4 や範囲外("0" / "10")は受け付けない
+  // (criteria ではなく質問文にそのまま埋め込むため、曖昧なまま Jev に送らない)。
+  if (ask === ASK_WHERE && (typeof body.digit !== "string" || DIGITS.indexOf(body.digit) === -1)) {
+    return "ask:whereではdigitに1〜9の文字列を指定してください";
   }
 
   for (var r = 0; r < 9; r++) {
@@ -464,8 +512,8 @@ function validateInput(body, ask) {
     return "puzzleの埋まっているマスが少なすぎます(" + MIN_FILLED_CELLS + "個以上必要です)";
   }
 
-  // ask:"cell" は空マスの中から選ばせる質問なので、空マスが無ければ聞くものが無い。
-  if (ask === ASK_CELL && filled === 81) {
+  // ask:"cell" / ask:"where" は空マスについての質問なので、空マスが無ければ聞くものが無い。
+  if ((ask === ASK_CELL || ask === ASK_WHERE) && filled === 81) {
     return "puzzleに空(.)のマスがありません";
   }
 
@@ -522,8 +570,35 @@ function validateAnswer(answer, expectedKeys, messages) {
 }
 
 /**
- * Jev のレスポンスから `answers[key]`(key は "digit" または "cell")を取り出す
- * (docs/DESIGN.md 3.4)。
+ * ask:"where" の回答(noul をマスの数だけ並べたもの)を検証する(Issue #45)。
+ * `answers` のキー集合が `expectedKeys`(空マスのキー)と **ちょうど一致**(個数と各キー)し、
+ * 各要素の `noul` が有限の数値であること。`type` は見ない(choice と同じく緩めに受ける)。
+ * `choice` / `confidence` は noul の回答には無いので検証しない。
+ * 問題なければ null、不備があれば日本語の理由(ANSWER_MESSAGES.where)を返す。
+ */
+function validateNoulAnswers(answers, expectedKeys, messages) {
+  var keys = Object.keys(answers);
+  if (keys.length !== expectedKeys.length) {
+    return messages.keys;
+  }
+  for (var i = 0; i < expectedKeys.length; i++) {
+    var expected = expectedKeys[i];
+    if (!Object.prototype.hasOwnProperty.call(answers, expected)) {
+      return messages.keys;
+    }
+    var entry = answers[expected];
+    if (entry === null || typeof entry !== "object" || Array.isArray(entry)) {
+      return messages.values;
+    }
+    if (typeof entry.noul !== "number" || !Number.isFinite(entry.noul)) {
+      return messages.values;
+    }
+  }
+  return null;
+}
+
+/**
+ * Jev のレスポンスから `answers` オブジェクトそのものを取り出す(docs/DESIGN.md 3.4)。
  *
  * 実環境の `typesafe/jev` は AI Gateway 経由で提供されており、`env.AI.run` は
  * `{ state, result: { model, answers, usage }, gatewayMetadata }` というラッパーを返す。
@@ -531,9 +606,11 @@ function validateAnswer(answer, expectedKeys, messages) {
  * `result.answers` を優先し、`result` がオブジェクトでなければトップレベルの
  * `answers` に落とす。
  *
- * 取り出せたら `{ answer }`、駄目なら `{ error }`(日本語の理由)を返す。
+ * 取り出せたら `{ answers }`、駄目なら `{ error }`(日本語の理由)を返す。
+ * ask:"where"(Issue #45)は質問がマスの数だけあるので、1つの質問キーを取り出す
+ * `extractAnswer` ではなくこちらを直接使う。
  */
-function extractAnswer(response, key) {
+function extractAnswers(response) {
   if (response === null || typeof response !== "object" || Array.isArray(response)) {
     return { error: "AIの応答が予期しない形式です" };
   }
@@ -557,11 +634,22 @@ function extractAnswer(response, key) {
     return { error: "AIの応答が予期しない形式です" };
   }
 
-  if (answers[key] === undefined) {
+  return { answers: answers };
+}
+
+/**
+ * `answers[key]`(key は "digit" または "cell")を取り出す。
+ * 取り出せたら `{ answer }`、駄目なら `{ error }`(日本語の理由)を返す。
+ */
+function extractAnswer(response, key) {
+  var extracted = extractAnswers(response);
+  if (extracted.error !== undefined) return extracted;
+
+  if (extracted.answers[key] === undefined) {
     return { error: "AIの応答が予期しない形式です" };
   }
 
-  return { answer: answers[key] };
+  return { answer: extracted.answers[key] };
 }
 
 function truncate(text) {
@@ -627,7 +715,29 @@ async function handleJudge(request, env) {
   var payload;
   var cellsByKey = null;
 
-  if (ask === ASK_CELL) {
+  if (ask === ASK_WHERE) {
+    // 数字ごと: 空マスごとに noul の質問を1つ作り、「このマスに digit が入るか」を
+    // まとめて1回で聞く(Issue #45)。criteria は使わず、質問キーがマスのキーになる。
+    // target は渡さない(盤面全体に聞く質問なので、対象マスが存在しない)。
+    var whereCells = emptyCells(body.puzzle);
+    var questions = {};
+    for (var wi = 0; wi < whereCells.length; wi++) {
+      var whereCell = whereCells[wi];
+      questions[whereCell.key] = {
+        type: "noul",
+        instructions: whereInstructions(whereCell.row, whereCell.col, body.digit),
+      };
+      expectedKeys.push(whereCell.key);
+    }
+    payload = {
+      state: {
+        puzzle: body.puzzle,
+        digit: body.digit,
+        note: WHERE_NOTE,
+      },
+      questions: questions,
+    };
+  } else if (ask === ASK_CELL) {
     // マス選び: 空マスの一覧を criteria にして「どのマスが最も確定しやすいか」を聞く。
     // target は渡さない(盤面全体から選ばせる質問なので、対象マスが存在しない)。
     var cells = emptyCells(body.puzzle);
@@ -672,7 +782,7 @@ async function handleJudge(request, env) {
     };
   } else {
     // validateInput が弾いているので通常ここには来ない。来ても 500 にせず 400 で返す(S2)。
-    return errorResponse("askはdigitかcellである必要があります", 400, rate.headers);
+    return errorResponse("askはdigit・cell・whereのいずれかである必要があります", 400, rate.headers);
   }
 
   var result;
@@ -693,11 +803,28 @@ async function handleJudge(request, env) {
     );
   }
 
-  var extracted = extractAnswer(result, ask);
-  var badAnswer =
-    extracted.error !== undefined
-      ? extracted.error
-      : validateAnswer(extracted.answer, expectedKeys, ANSWER_MESSAGES[ask]);
+  // where は質問が空マスの数だけあるので `answers` 全体を、digit / cell は
+  // `answers[ask]` 1件を取り出して検証する。
+  var answers = null;
+  var answer = null;
+  var badAnswer;
+  if (ask === ASK_WHERE) {
+    var extractedAll = extractAnswers(result);
+    if (extractedAll.error !== undefined) {
+      badAnswer = extractedAll.error;
+    } else {
+      answers = extractedAll.answers;
+      badAnswer = validateNoulAnswers(answers, expectedKeys, ANSWER_MESSAGES[ask]);
+    }
+  } else {
+    var extracted = extractAnswer(result, ask);
+    if (extracted.error !== undefined) {
+      badAnswer = extracted.error;
+    } else {
+      answer = extracted.answer;
+      badAnswer = validateAnswer(answer, expectedKeys, ANSWER_MESSAGES[ask]);
+    }
+  }
   if (badAnswer !== null) {
     // AI.run が undefined を解決したとき、そのままだと raw のキーごと JSON から消える。
     // デバッグ用に「何が返ってきたか」を必ず残したいので null に寄せる。
@@ -713,7 +840,24 @@ async function handleJudge(request, env) {
     );
   }
 
-  var answer = extracted.answer;
+  if (ask === ASK_WHERE) {
+    // noul には choice も confidence も無いので、マスごとの確率だけを返す(Issue #45)。
+    var whereProbabilities = {};
+    for (var ki = 0; ki < expectedKeys.length; ki++) {
+      whereProbabilities[expectedKeys[ki]] = answers[expectedKeys[ki]].noul;
+    }
+    return jsonResponse(
+      {
+        probabilities: whereProbabilities,
+        digit: body.digit,
+        // env.AI.run に渡したペイロードそのもの(Issue #34)。
+        request: payload,
+      },
+      200,
+      rate.headers
+    );
+  }
+
   var responseBody = {
     probabilities: answer.probabilities,
     choice: answer.choice,

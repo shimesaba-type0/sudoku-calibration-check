@@ -11,11 +11,14 @@ import {
   judgeRequest,
   validBody,
   validCellBody,
+  validWhereBody,
   jevResponse,
   bareJevResponse,
   jevAnswer,
   jevCellAnswer,
   jevCellResponse,
+  jevWhereAnswers,
+  jevWhereResponse,
   emptyCellKeys,
 } from "./helpers.js";
 
@@ -755,4 +758,338 @@ test('ask:"cell" でもレート制限は1呼び出し=1カウント(digit と�
     return call.op === "increment";
   });
   assert.equal(increments.length, 2);
+});
+
+// --- ask:"where"(数字ごと。Issue #45) --------------------------------------
+
+// 期待値は src/index.js の WHERE_NOTE / WHERE_INSTRUCTIONS_TEMPLATE を **意図的に複製**
+// している(cell と同じ流儀。文面をこっそり変えたら落ちるように実装から import しない)。
+var EXPECTED_WHERE_NOTE =
+  "puzzle is a 9x9 Sudoku grid given as 9 strings of 9 characters each, " +
+  "top row first. A digit character is a cell that is already filled in; " +
+  "'.' is an empty cell. There is no target cell this time. digit is the digit " +
+  "being asked about. Each question is about one empty cell of the grid, keyed as " +
+  "'r<row>c<col>' with zero-based row and col indices (row 0 is the first string, " +
+  "col 0 is its first character), and asks whether that cell contains digit. " +
+  "Standard Sudoku rules apply: every row, every column and every 3x3 box must " +
+  "contain each of the digits 1 to 9 exactly once. Some of the digits already " +
+  "placed may be wrong.";
+
+/** WHERE_INSTRUCTIONS_TEMPLATE を埋めた文言(テンプレートごとテスト側に複製している)。 */
+function expectedWhereInstructions(row, col, digit) {
+  return (
+    "Is the digit " +
+    digit +
+    " the one that belongs in the empty cell at row " +
+    row +
+    ", column " +
+    col +
+    " (zero-based)?"
+  );
+}
+
+/** "r3c5" → { row: 3, col: 5 }(キーは1桁なので固定位置で読める)。 */
+function parseCellKey(key) {
+  return { row: Number(key[1]), col: Number(key[3]) };
+}
+
+/** ask:"where" を投げ、モック AI には空マスのキーと一致する noul を返させる。 */
+async function judgeWhere(body) {
+  var target = body || validWhereBody();
+  var keys = emptyCellKeys(target.puzzle || GIVEN);
+  var env = makeEnv({ aiResult: jevWhereResponse(keys) });
+  var res = await worker.fetch(judgeRequest(target), env);
+  var payload = await res.json();
+  return { res: res, body: payload, env: env, keys: keys };
+}
+
+/** GIVEN の空マスに対する where のレスポンスの answers を差し替えて返す。 */
+function withWhereAnswers(answers) {
+  var response = jevWhereResponse(GIVEN_CELL_KEYS);
+  response.result.answers = answers;
+  return response;
+}
+
+/** 与えた AI レスポンスで ask:"where" を1回投げる。 */
+async function postWhere(aiResult, body) {
+  var env = makeEnv({ aiResult: aiResult });
+  var res = await worker.fetch(judgeRequest(body || validWhereBody()), env);
+  return { res: res, body: await res.json(), env: env };
+}
+
+test('ask:"where": payload は target 無し・digit・WHERE_NOTE・空マスごとの noul 質問', async () => {
+  var out = await judgeWhere();
+  assert.equal(out.res.status, 200);
+  assert.equal(out.env.aiCalls.length, 1);
+  assert.equal(out.env.aiCalls[0].model, "typesafe/jev");
+
+  var payload = out.env.aiCalls[0].payload;
+  assert.deepEqual(Object.keys(payload).sort(), ["questions", "state"]);
+  // state は puzzle / digit / note だけ。target は無い(盤面全体に聞く質問なので)
+  assert.deepEqual(Object.keys(payload.state).sort(), ["digit", "note", "puzzle"]);
+  assert.equal("target" in payload.state, false);
+  assert.deepEqual(payload.state.puzzle, GIVEN);
+  assert.equal(payload.state.digit, "4");
+  assert.equal(payload.state.note, EXPECTED_WHERE_NOTE);
+
+  // 質問キーは空マスの一覧で、行優先の順(1マス = 1質問)
+  assert.deepEqual(Object.keys(payload.questions), GIVEN_CELL_KEYS);
+  assert.equal(GIVEN_CELL_KEYS.length, 51, "固定問題の空マスは51個");
+  for (var i = 0; i < GIVEN_CELL_KEYS.length; i++) {
+    var key = GIVEN_CELL_KEYS[i];
+    var question = payload.questions[key];
+    assert.deepEqual(Object.keys(question).sort(), ["instructions", "type"], key);
+    assert.equal(question.type, "noul", key);
+    var at = parseCellKey(key);
+    assert.equal(question.instructions, expectedWhereInstructions(at.row, at.col, "4"), key);
+  }
+  assert.equal(payload.questions.r0c0, undefined, "埋まっているマスは質問にしない");
+  assert.equal(payload.questions.where, undefined, "ask をそのまま質問キーにしない");
+});
+
+test('ask:"where": digit が変われば state と質問文の数字も変わる', async () => {
+  var out = await judgeWhere(validWhereBody({ digit: "9" }));
+  assert.equal(out.res.status, 200);
+  var payload = out.env.aiCalls[0].payload;
+  assert.equal(payload.state.digit, "9");
+  assert.equal(out.body.digit, "9");
+  assert.equal(payload.questions.r0c2.instructions, expectedWhereInstructions(0, 2, "9"));
+  assert.equal(payload.questions.r8c6.instructions, expectedWhereInstructions(8, 6, "9"));
+});
+
+test('ask:"where": 埋まっているマスは質問に入らない(推測入りの盤面)', async () => {
+  var guessed = GIVEN.slice();
+  guessed[0] = "531175111"; // 1行目は全部埋まった状態
+  var out = await judgeWhere(validWhereBody({ puzzle: guessed }));
+  assert.equal(out.res.status, 200);
+  var keys = Object.keys(out.env.aiCalls[0].payload.questions);
+  assert.deepEqual(keys, emptyCellKeys(guessed));
+  for (var i = 0; i < keys.length; i++) {
+    assert.ok(!keys[i].startsWith("r0c"), "埋まっている1行目のマスが質問に入っている: " + keys[i]);
+  }
+});
+
+test('ask:"where": payload に正解表の行が一切含まれない(不変条件1)', async () => {
+  var out = await judgeWhere();
+  var serialized = JSON.stringify(out.env.aiCalls[0].payload);
+  for (var i = 0; i < ANSWER_KEY.length; i++) {
+    assert.ok(
+      !serialized.includes(ANSWER_KEY[i]),
+      "payload に正解表の " + (i + 1) + " 行目が含まれている: " + ANSWER_KEY[i]
+    );
+  }
+});
+
+test('ask:"where": 200 の形(probabilities / digit / request のみ)', async () => {
+  var out = await judgeWhere();
+  assert.equal(out.res.status, 200);
+  assert.equal(out.res.headers.get("content-type"), "application/json; charset=utf-8");
+  assert.deepEqual(Object.keys(out.body).sort(), ["digit", "probabilities", "request"]);
+  // noul には choice も confidence も無いので付けない(cell の cell も付けない)
+  assert.equal("choice" in out.body, false);
+  assert.equal("confidence" in out.body, false);
+  assert.equal("cell" in out.body, false);
+
+  // probabilities のキーは空マスの一覧(行優先)、値は answers の noul そのもの
+  assert.deepEqual(Object.keys(out.body.probabilities), GIVEN_CELL_KEYS);
+  var expected = jevWhereAnswers(GIVEN_CELL_KEYS);
+  for (var i = 0; i < GIVEN_CELL_KEYS.length; i++) {
+    var key = GIVEN_CELL_KEYS[i];
+    assert.equal(out.body.probabilities[key], expected[key].noul, key);
+  }
+
+  // request は env.AI.run に渡したペイロードそのもの(Issue #34)
+  assert.deepStrictEqual(out.body.request, out.env.aiCalls[0].payload);
+});
+
+test('200: ask:"where" で空マスが1個(質問1件)でも動く', async () => {
+  var puzzle = ANSWER_KEY.slice();
+  puzzle[4] = puzzle[4].slice(0, 4) + "." + puzzle[4].slice(5);
+  var out = await judgeWhere(validWhereBody({ puzzle: puzzle }));
+  assert.equal(out.res.status, 200);
+  assert.deepEqual(out.keys, ["r4c4"]);
+  assert.deepEqual(Object.keys(out.env.aiCalls[0].payload.questions), ["r4c4"]);
+  assert.deepEqual(Object.keys(out.body.probabilities), ["r4c4"]);
+  assert.equal(out.body.digit, "4");
+});
+
+test('200: ask:"where" で埋まっているマスが17個ちょうど', async () => {
+  var out = await judgeWhere(validWhereBody({ puzzle: filledPuzzle(17) }));
+  assert.equal(out.res.status, 200);
+  assert.equal(out.env.aiCalls.length, 1);
+  assert.equal(Object.keys(out.env.aiCalls[0].payload.questions).length, 81 - 17);
+});
+
+test('400: ask:"where" に target が付いている', async () => {
+  await expect400("target 付き", validWhereBody({ target: { row: 0, col: 2 } }));
+  await expect400("target が null", validWhereBody({ target: null }));
+  await expect400("target が空オブジェクト", validWhereBody({ target: {} }));
+});
+
+test('400: ask:"where" の digit が 1〜9 の文字列でない', async () => {
+  var bad = [undefined, null, 4, "0", "10", "", "４", " 4", "4 ", "a", ["4"], { digit: "4" }, true];
+  for (var i = 0; i < bad.length; i++) {
+    await expect400("digit=" + JSON.stringify(bad[i]), validWhereBody({ digit: bad[i] }));
+  }
+  // digit キーごと無いときも 400
+  await expect400("digit 欠落", { puzzle: GIVEN.slice(), ask: "where" });
+});
+
+test('400: ask:"where" の digit / target の文言', async () => {
+  var env = makeEnv();
+  var res = await worker.fetch(judgeRequest({ puzzle: GIVEN.slice(), ask: "where" }), env);
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).error, "ask:whereではdigitに1〜9の文字列を指定してください");
+
+  var res2 = await worker.fetch(judgeRequest(validWhereBody({ target: { row: 0, col: 2 } })), env);
+  assert.equal(res2.status, 400);
+  assert.equal(
+    (await res2.json()).error,
+    "ask:whereではtargetを指定できません(盤面全体に聞くため)"
+  );
+  assert.equal(env.aiCalls.length, 0);
+});
+
+test('400: ask:"where" で空マスが1つも無い(全部埋まった盤面)', async () => {
+  await expect400("全部埋まっている", validWhereBody({ puzzle: ANSWER_KEY.slice() }));
+});
+
+test('400: ask:"where" でも埋まっているマスが17個未満なら弾く', async () => {
+  await expect400("16個", validWhereBody({ puzzle: filledPuzzle(16) }));
+  await expect400("0個(全部空)", validWhereBody({ puzzle: filledPuzzle(0) }));
+});
+
+test('400: ask:"where" でも puzzle の形式は従来どおり見る(文言は target に触れない)', async () => {
+  await expect400("8行", validWhereBody({ puzzle: GIVEN.slice(0, 8) }));
+  await expect400("puzzle が文字列", validWhereBody({ puzzle: "53..7...." }));
+  var letter = GIVEN.slice();
+  letter[2] = ".98..x.6.";
+  await expect400("英字を含む行", validWhereBody({ puzzle: letter }));
+
+  var env = makeEnv();
+  var res = await worker.fetch(judgeRequest({ ask: "where", digit: "4" }), env);
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).error, "puzzle(9行の配列)が必要です");
+});
+
+test('200: ask:"where" はラッパー無し(素の { model, answers, usage })でも 200', async () => {
+  var keys = emptyCellKeys(GIVEN);
+  var out = await postWhere({ model: "jev-1.13.0", answers: jevWhereAnswers(keys), usage: { input_tokens: 1, output_tokens: 1 } });
+  assert.equal(out.res.status, 200, JSON.stringify(out.body));
+  assert.deepEqual(Object.keys(out.body.probabilities), keys);
+  assert.equal(out.body.digit, validWhereBody().digit);
+  assert.ok(out.body.request && out.body.request.questions);
+});
+
+test('502: ask:"where" で answers が取り出せない', async () => {
+  var shapes = [
+    { state: "Completed", result: { model: "jev-1.13.0" } },
+    { state: "Completed", result: { model: "jev-1.13.0", answers: null } },
+    { state: "Completed", result: { model: "jev-1.13.0", answers: [] } },
+    { model: "jev-1.13.0" },
+  ];
+  for (var i = 0; i < shapes.length; i++) {
+    var out = await postWhere(shapes[i]);
+    assert.equal(out.res.status, 502, "shape #" + i + ": 502 を期待したが " + out.res.status);
+    assert.equal(out.body.error, "AIの応答が予期しない形式です");
+    assert.ok("raw" in out.body, "shape #" + i + ": raw が無い");
+    assert.deepStrictEqual(out.body.request, out.env.aiCalls[0].payload);
+  }
+});
+
+test('502: ask:"where" で state が Completed でない', async () => {
+  var response = jevWhereResponse(GIVEN_CELL_KEYS);
+  response.state = "Failed";
+  var out = await postWhere(response);
+  assert.equal(out.res.status, 502);
+  assert.equal(out.body.error, "AIの応答が完了していません");
+  assert.deepStrictEqual(out.body.request, out.env.aiCalls[0].payload);
+});
+
+test('502: ask:"where" で answers のキーが空マスと一致しない', async () => {
+  var extra = jevWhereAnswers(GIVEN_CELL_KEYS);
+  extra.r0c0 = { type: "noul", noul: 0.5 }; // 埋まっているマス(質問していない)が増えている
+
+  var missing = jevWhereAnswers(GIVEN_CELL_KEYS);
+  delete missing[GIVEN_CELL_KEYS[GIVEN_CELL_KEYS.length - 1]];
+
+  var renamed = jevWhereAnswers(GIVEN_CELL_KEYS);
+  renamed["0-2"] = renamed.r0c2; // 個数は同じだがキーが違う
+  delete renamed.r0c2;
+
+  var cases = {
+    "質問していないキーが増えている": extra,
+    "キーが1つ欠けている": missing,
+    "キー名が違う(個数は同じ)": renamed,
+    "空の answers": {},
+    "digit 用の応答が返ってきた": { digit: jevAnswer() },
+  };
+  for (var label in cases) {
+    var out = await postWhere(withWhereAnswers(cases[label]));
+    assert.equal(out.res.status, 502, label + ": 502 を期待したが " + out.res.status);
+    assert.equal(out.body.error, "AIの応答のanswersが質問したマスのキーと一致していません");
+    assert.ok("raw" in out.body, label + ": raw が無い");
+    assert.deepStrictEqual(out.body.request, out.env.aiCalls[0].payload);
+  }
+
+  // 参考: 手を加えていない answers はちゃんと 200 になる(上の 502 がキー以外の理由でないこと)
+  var ok = await postWhere(withWhereAnswers(jevWhereAnswers(GIVEN_CELL_KEYS)));
+  assert.equal(ok.res.status, 200);
+});
+
+test('502: ask:"where" で noul が有限の数値でない', async () => {
+  var cases = {
+    文字列: "0.5",
+    NaN: NaN,
+    Infinity: Infinity,
+    真偽値: true,
+    配列: [0.5],
+  };
+  for (var label in cases) {
+    var answers = jevWhereAnswers(GIVEN_CELL_KEYS);
+    answers.r0c2 = { type: "noul", noul: cases[label] };
+    var out = await postWhere(withWhereAnswers(answers));
+    assert.equal(out.res.status, 502, label + ": 502 を期待したが " + out.res.status);
+    assert.equal(out.body.error, "AIの応答のnoulに数値でない値が含まれています");
+  }
+
+  // noul キーごと無い / 回答がオブジェクトでない場合も同じ扱い
+  var noNoul = jevWhereAnswers(GIVEN_CELL_KEYS);
+  noNoul.r0c2 = { type: "noul" };
+  var out2 = await postWhere(withWhereAnswers(noNoul));
+  assert.equal(out2.res.status, 502);
+  assert.equal(out2.body.error, "AIの応答のnoulに数値でない値が含まれています");
+
+  var bare = jevWhereAnswers(GIVEN_CELL_KEYS);
+  bare.r0c2 = 0.5; // 数値だけが返ってきた(オブジェクトでない)
+  var out3 = await postWhere(withWhereAnswers(bare));
+  assert.equal(out3.res.status, 502);
+  assert.equal(out3.body.error, "AIの応答のnoulに数値でない値が含まれています");
+
+  var nulled = jevWhereAnswers(GIVEN_CELL_KEYS);
+  nulled.r0c2 = null;
+  var out4 = await postWhere(withWhereAnswers(nulled));
+  assert.equal(out4.res.status, 502);
+  assert.equal(out4.body.error, "AIの応答のnoulに数値でない値が含まれています");
+});
+
+test('ask:"where" でもレート制限は1呼び出し=1カウント(digit / cell と同じ)', async () => {
+  var limiter = makeRateLimiter();
+  var env = makeEnv({ limiter: limiter, aiResult: jevWhereResponse(GIVEN_CELL_KEYS) });
+  var res = await worker.fetch(judgeRequest(validWhereBody()), env);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("X-RateLimit-Remaining-IP"), "29");
+  assert.equal(res.headers.get("X-RateLimit-Remaining-Global"), "499");
+  // 51マス分をまとめて1回で聞くので、increment はグローバルと IP で1回ずつ
+  var increments = limiter.calls.filter(function (call) {
+    return call.op === "increment";
+  });
+  assert.equal(increments.length, 2);
+});
+
+test("400: where を足したあとも未知の ask は 400", async () => {
+  var bad = ["wheres", "WHERE", "Where", " where", "noul"];
+  for (var i = 0; i < bad.length; i++) {
+    await expect400("ask=" + JSON.stringify(bad[i]), validBody({ ask: bad[i] }));
+  }
 });
