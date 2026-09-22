@@ -116,6 +116,10 @@ function runScript(html, options) {
   var app = { innerHTML: "" };
   var bodyChildren = [];
   var createdBlobs = [];
+  // 呼ばれた setTimeout の delay 引数を記録する(速度モード(#32 T5)や、停止/再開の
+  // 振る舞いテスト(#32 T3)がタイマーの発火タイミングそのものを制御したいときに使う)。
+  // opts.setTimeout が無ければ従来どおり setImmediate で即座に(delay を無視して)実行する。
+  var setTimeoutCalls = [];
   var context = {
     console: console,
     document: {
@@ -138,7 +142,9 @@ function runScript(html, options) {
         },
       },
     },
-    setTimeout: function (fn) {
+    setTimeout: function (fn, delay) {
+      setTimeoutCalls.push(delay);
+      if (opts.setTimeout) return opts.setTimeout(fn, delay);
       return setImmediate(fn);
     },
     // focusNext() がリクエストごとに new AbortController() する(Issue #19)。
@@ -170,6 +176,7 @@ function runScript(html, options) {
   context.appElement = app;
   context.bodyChildren = bodyChildren;
   context.createdBlobs = createdBlobs;
+  context.setTimeoutCalls = setTimeoutCalls;
   return context;
 }
 
@@ -675,7 +682,7 @@ test("難易度ごとの generatePuzzle: 常に一意解・解が一致し、ヒ
   });
 });
 
-test("リセットは実行中でも押せる(SPEC F5)。生成中だけ無効化される", async () => {
+test("リセットは実行中・停止中でも押せる(SPEC F5)。生成中だけ無効化される。実行中は run-btn が「停止」、停止中は「再開」になる(Issue #32)", async () => {
   var ctx = runScript(await getPageHtml());
 
   function resetButtonHtml() {
@@ -686,7 +693,7 @@ test("リセットは実行中でも押せる(SPEC F5)。生成中だけ無効�
   }
   function runButtonHtml() {
     var html = ctx.renderControls();
-    var m = html.match(/<button id="run-btn"[^>]*>/);
+    var m = html.match(/<button id="run-btn"[^>]*>[^<]*<\/button>/);
     assert.ok(m, "run-btn が見つからない");
     return m[0];
   }
@@ -697,15 +704,29 @@ test("リセットは実行中でも押せる(SPEC F5)。生成中だけ無効�
     return m[0];
   }
 
-  // 初期状態: どれも無効化されていない
+  // 初期状態: どれも無効化されていない。ラベルは「実行」
   assert.ok(!resetButtonHtml().includes("disabled"), "初期状態で reset-btn が無効化されている");
+  assert.ok(runButtonHtml().includes(">実行<"), "初期状態で run-btn のラベルが「実行」でない: " + runButtonHtml());
 
-  // 実行中: リセットは押せる。実行/新しい問題は押せない
+  // 実行中: リセットは押せる。run-btn は無効化されず「停止」になり、stop() を呼ぶ。
+  // 新しい問題は押せない(実行中の差し替えは盤面と周回ログの意味を壊すため)。
   ctx.state.running = true;
   assert.ok(!resetButtonHtml().includes("disabled"), "実行中に reset-btn が無効化されている(SPEC F5違反)");
-  assert.ok(runButtonHtml().includes("disabled"), "実行中に run-btn が無効化されていない");
+  assert.ok(!runButtonHtml().includes("disabled"), "実行中に run-btn が無効化されている(停止できなくなる。Issue #32)");
+  assert.ok(runButtonHtml().includes(">停止<"), "実行中に run-btn のラベルが「停止」でない: " + runButtonHtml());
+  assert.ok(runButtonHtml().includes('onclick="stop()"'), "実行中に run-btn が stop() を呼ばない: " + runButtonHtml());
   assert.ok(newPuzzleButtonHtml().includes("disabled"), "実行中に new-puzzle-btn が無効化されていない");
   ctx.state.running = false;
+
+  // 停止中(started 済み・running=false・done/errorMessage でない): run-btn は有効で
+  // ラベルが「再開」になる。リセット・新しい問題も押せる(Issue #32)。
+  ctx.started = true;
+  assert.ok(!resetButtonHtml().includes("disabled"), "停止中に reset-btn が無効化されている");
+  assert.ok(!runButtonHtml().includes("disabled"), "停止中に run-btn が無効化されている");
+  assert.ok(runButtonHtml().includes(">再開<"), "停止中に run-btn のラベルが「再開」でない: " + runButtonHtml());
+  assert.ok(runButtonHtml().includes('onclick="run()"'), "停止中に run-btn が run() を呼ばない: " + runButtonHtml());
+  assert.ok(!newPuzzleButtonHtml().includes("disabled"), "停止中に new-puzzle-btn が無効化されている");
+  ctx.started = false;
 
   // 生成中: リセットも無効化される(差し替え中の盤面と衝突するため)
   ctx.generating = true;
@@ -1453,4 +1474,262 @@ test("S4: reset() で fetch が AbortError で reject されても showError に
   ctx.render();
   var html = ctx.appElement.innerHTML;
   assert.ok(!html.includes('class="error"'), "abort でエラーボックスが表示されている");
+});
+
+// -------------------------------------------------------------------
+// 停止/再開(Issue #32、SPEC F1/F2/F3、DESIGN 4.2 stop() / 4.3 状態遷移)。
+// T1・T2・T4・T5・T6 は makeAbortAwareFetch(宙吊りの fetch)を使い、S1〜S4 と
+// 同じスタイルで in-flight のリクエストを外側から制御する。
+//
+// T3(周の切り替え待ち中の stop())だけは、setTimeout(=setImmediate)が自動発火する
+// 既定の runScript() だと「between-round のタイマーが張られた直後・まだ発火していない」
+// という一瞬の状態を tick() のポーリングだけで確実に捉えるのが難しい(macrotask の
+// 順序に依存してしまう)。そこで opts.setTimeout に makeManualTimers() を渡し、
+// setTimeout が呼ばれても自動では発火させず、テスト側が fireNext() で明示的に1つずつ
+// 発火させる。これで「finalizeRound() が between-round のタイマーを張った直後・まだ
+// 発火させていない」状態を確実に作れる。
+// -------------------------------------------------------------------
+
+/**
+ * 手動発火のタイマー。setTimeout(fn, delay) は fn を即座には実行せず、内部の配列に
+ * 積むだけ。テスト側が fireNext() で先頭から1つずつ明示的に発火させる(T3)。
+ */
+function makeManualTimers() {
+  var scheduled = [];
+  return {
+    setTimeout: function (fn) {
+      scheduled.push(fn);
+    },
+    length: function () {
+      return scheduled.length;
+    },
+    fireNext: function () {
+      if (scheduled.length === 0) throw new Error("manual timer: 発火対象が無い");
+      var fn = scheduled.shift();
+      fn();
+    },
+  };
+}
+
+test("T1: 9マス確定後、10マス目の in-flight 中に stop() すると9件で止まり、10マス目が queue の先頭に戻る", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+
+  ctx.run();
+  for (var i = 0; i < 9; i++) {
+    await waitFor(function () {
+      return af.pending.length === 1;
+    }, "T1: " + i + "件目の fetch 待ち");
+    var entry = af.pending.shift();
+    var body = JSON.parse(entry.init.body);
+    entry.resolve(makeCorrectResponse(ctx, body.target.row, body.target.col));
+    await waitFor(function () {
+      return Object.keys(ctx.state.values).length === i + 1;
+    }, "T1: " + i + "件目の commit 待ち");
+  }
+
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "T1: 10マス目の fetch 待ち");
+  var tenthEntry = af.pending[0];
+  var tenthBody = JSON.parse(tenthEntry.init.body);
+  var tenthCell = { r: tenthBody.target.row, c: tenthBody.target.col };
+  var recordsBeforeStop = ctx.getRecords().length;
+
+  ctx.stop();
+
+  assert.equal(af.pending.length, 1, "stop() 後に新しい fetch が増えている");
+  assert.equal(tenthEntry.settled, true, "stop() で in-flight の fetch が abort されていない");
+  assert.equal(ctx.state.running, false, "state.running が false になっていない");
+  assert.equal(Object.keys(ctx.state.values).length, 9, "state.values が9件でない");
+  assert.equal(ctx.getRecords().length, recordsBeforeStop, "判定中だったマスが記録されてしまっている");
+  assert.equal(ctx.state.focusedKey, null, "フォーカスが残っている");
+  assert.equal(ctx.queue.length, 42, "queue の残り件数が42でない(51 - 9)");
+  assert.equal(ctx.queue[0].r, tenthCell.r, "queue の先頭行が10マス目でない");
+  assert.equal(ctx.queue[0].c, tenthCell.c, "queue の先頭列が10マス目でない");
+});
+
+test("T2: 停止中に run() で再開すると10マス目から続き、fetch 合計51件・記録51件で完了する", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var calls = [];
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+
+  ctx.run();
+  for (var i = 0; i < 9; i++) {
+    await waitFor(function () {
+      return af.pending.length === 1;
+    }, "T2: " + i + "件目の fetch 待ち");
+    var entry = af.pending.shift();
+    var body = JSON.parse(entry.init.body);
+    calls.push(body);
+    entry.resolve(makeCorrectResponse(ctx, body.target.row, body.target.col));
+    await waitFor(function () {
+      return Object.keys(ctx.state.values).length === i + 1;
+    }, "T2: " + i + "件目の commit 待ち");
+  }
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "T2: 10マス目の fetch 待ち");
+
+  ctx.stop();
+  assert.equal(ctx.state.running, false);
+
+  ctx.run(); // 再開。10マス目から続き
+  await driveToCompletion(ctx, af.pending, calls, "T2: 再開後の完了");
+
+  assert.equal(ctx.state.done, true, "state.done が true になっていない");
+  assert.equal(ctx.state.roundsToSolve, 1, "常に正解を返しているので1周で終わるはず");
+  assert.equal(calls.length, 51, "応答に使われた fetch の合計が51でない: " + calls.length);
+  assert.equal(Object.keys(ctx.state.values).length, 51, "commit 数が51でない");
+  assert.equal(ctx.getRecords().length, 51, "記録が51件でない");
+});
+
+test("T3: 周の切り替え待ち中に stop() すると、run() で2周目の先頭から再開する", { timeout: 10000 }, async () => {
+  var ctx;
+  var wrongKey = "0-2"; // GIVEN[0] の最初の空マス(helpers.js の GIVEN と同一の固定問題)
+  var askedWrongOnce = false;
+  var fetchStub = async function (url, init) {
+    var body = JSON.parse(init.body);
+    var key = body.target.row + "-" + body.target.col;
+    if (key === wrongKey && !askedWrongOnce) {
+      askedWrongOnce = true;
+      var correctDigit = ctx.SOLUTION[body.target.row][body.target.col];
+      var wrongDigit = correctDigit === "1" ? "2" : "1";
+      var probabilities = {};
+      for (var d = 1; d <= 9; d++) probabilities[String(d)] = String(d) === wrongDigit ? 0.9 : 0.0125;
+      return {
+        ok: true,
+        json: async function () {
+          return { probabilities: probabilities, choice: wrongDigit, confidence: 0.5 };
+        },
+      };
+    }
+    return makeCorrectResponse(ctx, body.target.row, body.target.col);
+  };
+  var timers = makeManualTimers();
+  ctx = runScript(await getPageHtml(), { fetch: fetchStub, setTimeout: timers.setTimeout });
+
+  var totalCells = ctx.TOTAL_EMPTY;
+  ctx.run();
+  for (var i = 0; i < totalCells; i++) {
+    await tick(); // fetch の Promise チェーンを流し、beforeCommit のタイマーを積ませる
+    assert.equal(timers.length(), 1, "beforeCommit タイマーが積まれていない: " + i + "件目");
+    timers.fireNext(); // commitFocused() を実行し、afterCommit(または周切り替え)のタイマーを積む
+    assert.equal(timers.length(), 1, "afterCommit タイマーが積まれていない: " + i + "件目");
+    timers.fireNext(); // 次のマスへ(最後のマスなら focusNext() → queue空 → finalizeRound())
+  }
+
+  // 1周目の全マスを処理し終えた直後。finalizeRound() は between-round の setTimeout を
+  // 張る前に round / queue / roundSize / roundTally を更新済みなので、この時点で
+  // すでに2周目の状態になっている。between-round のタイマーは積まれているが未発火。
+  assert.equal(ctx.state.round, 2, "finalizeRound() 後に round が2になっていない");
+  assert.equal(ctx.state.running, true, "周の切り替え待ち中はまだ running のはず");
+  assert.equal(ctx.state.focusedKey, null);
+  assert.equal(ctx.queue.length, 1, "1周目の不正解マスが2周目の queue に入っていない");
+  assert.equal(ctx.queue[0].r, 0);
+  assert.equal(ctx.queue[0].c, 2);
+  assert.equal(timers.length(), 1, "周の切り替えタイマーが積まれていない(未発火のはず)");
+
+  ctx.stop();
+  assert.equal(ctx.state.running, false);
+  assert.equal(ctx.state.round, 2, "stop() 後も周は2周目のまま");
+  assert.equal(ctx.queue.length, 1);
+  assert.equal(ctx.queue[0].r, 0);
+  assert.equal(ctx.queue[0].c, 2);
+
+  // stop() は runToken を進めるだけで、実ブラウザ同様に張ったままの between-round
+  // タイマーそのものは残る(このテストの手動タイマーでも発火させずに積んだままにした
+  // ものが1つ残っている)。実際に発火させて、isCurrent() に弾かれて無害なことを
+  // 確認してから片付ける(発火しても state が変わらない)。
+  assert.equal(timers.length(), 1, "stop() 後も between-round タイマーは残っているはず");
+  timers.fireNext();
+  assert.equal(ctx.state.round, 2, "古い世代のタイマーの発火で state が変わってしまった");
+  assert.equal(timers.length(), 0);
+
+  ctx.run(); // 再開。2周目の先頭(前の周の不正解マス)から
+  await tick();
+  assert.equal(timers.length(), 1, "再開後の beforeCommit タイマーが積まれていない");
+  timers.fireNext(); // commitFocused()(2周目は正解を返す)
+  timers.fireNext(); // focusNext() → queue空 → finalizeRound() → solved
+
+  assert.equal(ctx.state.done, true, "state.done が true になっていない");
+  assert.equal(ctx.state.roundsToSolve, 2, "2周で完了したことになっていない");
+  assert.equal(ctx.state.values["0-2"].status, "correct", "2周目でマスが正解になっていない");
+});
+
+test("T4: stop() の後に reset() すると最初から(state.values が空、started === false)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+
+  ctx.run();
+  assert.equal(af.pending.length, 1, "1件目の fetch が飛んでいない");
+
+  ctx.stop();
+  assert.equal(ctx.state.running, false);
+  assert.equal(ctx.started, true, "stop() 後も started が true のままのはず");
+
+  ctx.reset();
+
+  assert.equal(ctx.started, false, "reset() 後も started が true のまま");
+  assert.equal(Object.keys(ctx.state.values).length, 0, "reset() 後も state.values が残っている");
+  assert.equal(ctx.state.round, 1);
+  assert.equal(ctx.queue.length, 0);
+  assert.equal(ctx.state.roundLog.length, 0);
+});
+
+test("T5: 停止中に速度トグルを変えると、再開後の待ち時間(setTimeout の実引数)に反映される", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+
+  ctx.run();
+  assert.equal(af.pending.length, 1, "1件目の fetch が飛んでいない");
+  var firstEntry = af.pending[0];
+
+  ctx.stop();
+  assert.equal(firstEntry.settled, true, "stop() で in-flight の fetch が abort されていない");
+  assert.equal(ctx.state.running, false);
+  assert.equal(ctx.setTimeoutCalls.length, 0, "stop() までに setTimeout が呼ばれてしまっている");
+
+  ctx.setSpeed("fast"); // 停止中に速度を変える
+
+  var pendingBeforeResume = af.pending.length; // abort 済みの1件目は pending 配列に残ったまま
+  ctx.run(); // 再開
+  await waitFor(function () {
+    return af.pending.length === pendingBeforeResume + 1;
+  }, "T5: 再開後の1件目の fetch 待ち");
+  var secondEntry = af.pending[af.pending.length - 1];
+  var body = JSON.parse(secondEntry.init.body);
+  secondEntry.resolve(makeCorrectResponse(ctx, body.target.row, body.target.col));
+
+  await waitFor(function () {
+    return ctx.setTimeoutCalls.length >= 1;
+  }, "T5: 再開後の setTimeout 待ち");
+
+  assert.equal(ctx.setTimeoutCalls[0], 0, "fast モードの確定前の待ち時間(0ms)が反映されていない: " + ctx.setTimeoutCalls[0]);
+});
+
+test("T6: 完了後(state.done)に stop() を呼んでも何も起きない", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var calls = [];
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+
+  ctx.run();
+  await driveToCompletion(ctx, af.pending, calls, "T6: 完了待ち");
+  assert.equal(ctx.state.done, true);
+
+  var valuesBefore = Object.keys(ctx.state.values).length;
+  var roundLogBefore = ctx.state.roundLog.length;
+  var queueBefore = ctx.queue.length;
+  var roundBefore = ctx.state.round;
+  var runTokenBefore = ctx.runToken;
+
+  ctx.stop();
+
+  assert.equal(ctx.state.done, true, "done が変わってしまっている");
+  assert.equal(ctx.state.running, false);
+  assert.equal(Object.keys(ctx.state.values).length, valuesBefore, "state.values が変わってしまっている");
+  assert.equal(ctx.state.roundLog.length, roundLogBefore, "roundLog が変わってしまっている");
+  assert.equal(ctx.queue.length, queueBefore, "queue が変わってしまっている");
+  assert.equal(ctx.state.round, roundBefore, "round が変わってしまっている");
+  assert.equal(ctx.runToken, runTokenBefore, "runToken が進んでしまっている(stop() が何かしている)");
 });

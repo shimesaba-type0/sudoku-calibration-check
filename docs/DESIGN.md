@@ -267,11 +267,13 @@ var inflightController = null;  // in-flight の /api/judge 用 AbortController(
 | `nextQueue(roundWrong)` | 次の周の `queue` を作る純粋関数。配列も要素も複製して返す(`roundWrong = []` の影響を受けないため) |
 | `shouldStop(round, incorrectCount)` | 周の終わりの判断を返す純粋関数。`"solved"`(不正解0)/ `"limit"`(`MAX_ROUNDS` に到達)/ `"continue"` |
 | `isCurrent(token)` | `state.running && token === runToken`。古い世代のコールバックを弾く(4.3) |
+| `isPaused()` | `started && !state.running && !state.done && !state.errorMessage`。「実行を始めた後、停止していて、完了もエラーもしていない」状態(SPEC F1、Issue #32)。`renderControls()` の「再開」ラベルと `renderCurrentPanel()` の「停止中」表示で使う |
 | `judgeCell(r,c,signal)` | `buildSnapshot()` を作って `/api/judge` を `fetch`(`signal` をそのまま渡す。`focusNext` が渡す `inflightController.signal`)。非2xxは `Error` にして投げる |
 | `focusNext()` | 先頭で `runToken` を捕まえ、`queue` から1つ取り出しフォーカス→(リクエストごとに新しい `AbortController` を `inflightController` に作って)`judgeCell`→バー表示→(待ち)→`commitFocused`→(待ち)→再帰。`queue` が空なら `finalizeRound`。`judgeCell` が `AbortError` で reject したときは(世代トークンの判定と同じ扱いで)無視して `return` し、`showError` には流さない(4.3、Issue #19) |
 | `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong`/`state.lastJudgment` を更新。`pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない。正誤が確定するこの時点で `appendRecord()` を呼び、集計ビュー用の1件を記録する |
-| `finalizeRound()` | ログ追記→`shouldStop` の結果で完了 / 強制終了 / 次の周(`queue = nextQueue(roundWrong)`) |
-| `run()` | 初回のみ queue を全空マスで初期化し `focusNext` を開始 |
+| `finalizeRound()` | ログ追記→`shouldStop` の結果で完了 / 強制終了 / 次の周(`queue = nextQueue(roundWrong)`)。「次の周」のときは、between-round の `setTimeout` を張る**前**に `state.round` / `queue` / `roundSize` / `roundTally` を更新する。この順序のおかげで、待ち時間中に `stop()` されても次の周の状態が既に確定している(下記 `stop()`、Issue #32) |
+| `stop()` | 実行中の停止(SPEC F1、Issue #32)。`reset()` と同じく `runToken` を進めて in-flight の `/api/judge`(`inflightController.abort()`)と予約済みの `setTimeout` を無効化するが、`reset()` と違って **`state.values` / `state.round` / `state.roundLog` / `roundTally` / `roundSize` / `queue` / `started` は捨てない**。`state.focusedKey` があれば(= 判定中のマスがまだ `commitFocused()` されていない)、その結果を破棄して記録(`appendRecord`)にも残さず、`queue.unshift({r,c})` で queue の先頭に戻す(再開したら同じマスをもう一度聞く。SPEC F2)。周をまたぐ待ち時間中(`finalizeRound()` の between-round の `setTimeout` 待ち)に呼ばれた場合は、その時点で `focusedKey` は既に `null`(`commitFocused()` で消えている)なので何もすることがなく、次の周の先頭から再開する(`finalizeRound()` の更新順序による。SPEC F3)。`state.done` / `state.errorMessage` のときは何もしない(両者は常に `running=false` とセットで立つので `state.running` を見るだけで判定できる) |
+| `run()` | 初回のみ queue を全空マスで初期化し `focusNext` を開始。`started` が既に true なら(= `stop()` した後の再開)queue を作り直さず `focusNext()` を呼ぶだけなので、`stop()` が保った進行状態からそのまま続く |
 | `reset()` | `runToken` を進め、`inflightController` があれば `abort()` して in-flight の `/api/judge` を打ち切り、進行管理と `state` を初期化(`speedMode` / `difficulty` は維持)(Issue #19、#21) |
 | `showError(message)` | `runToken` を進め、`inflightController` があれば `abort()` して `state.errorMessage` を立て、`running=false` で止める(不変条件4、Issue #19) |
 | `setSpeed(mode)` | `state.speedMode` を切り替えて再描画。実行中でも切り替えられる(4.4) |
@@ -307,12 +309,36 @@ idle ──run()──▶ focusNext()
                  │ (slow:150ms / fast:20ms)
                  ▼
             queue 残あり → focusNext() / 空 → finalizeRound()
+
+  (どの待ちの最中でも) ──stop()──▶ paused
+                 │ runToken+=1, inflightController があれば abort()
+                 │ running=false。values/round/roundLog/roundTally/roundSize/queue/started は保持
+                 │ focusedKey があれば(未 commit)queue の先頭に戻し、pendingCommit を破棄
+                 ▼
+  paused ──run()──▶ focusNext()(started が true なので queue を作り直さず続きから)
 ````
 
-**実行世代(`runToken`)のルール。** `reset()` と `showError()` は `runToken` を1つ進める。
-`focusNext()` / `finalizeRound()` は入口で `var token = runToken;` と世代を捕まえ、その後の
-`then` / 失敗ハンドラ / `setTimeout` のコールバックは **すべて先頭で `isCurrent(token)`
-(= `state.running && token === runToken`)を確認し、偽なら何もせずに return する**。
+**停止/再開(`stop()`、Issue #32、SPEC F1〜F3)。** `stop()` は `reset()` と同じく世代
+(`runToken`)を進めて in-flight の `fetch` / 予約済みの `setTimeout` を無効化するが、
+`reset()` と違って `state`(`values` / `round` / `roundLog` / `errorMessage` 以外の表示用
+フィールド)と `queue` / `roundWrong` / `roundTally` / `roundSize` / `started` を **一切
+初期化しない**。判定中(`state.focusedKey` があり、まだ `commitFocused()` されていない)
+マスがあれば、その結果を破棄して記録(`appendRecord`)にも残さず `queue` の先頭に戻す
+(再開したら同じマスをもう一度聞く。SPEC F2)。周をまたぐ待ち時間(`finalizeRound()` の
+between-round の `setTimeout` 待ち)の最中に呼ばれた場合は、`finalizeRound()` が
+そのタイマーを張る**前**に次の周の `round` / `queue` / `roundSize` / `roundTally` を
+既に更新しているため、`stop()` の時点で `focusedKey` は `null` で何もすることがなく、
+「実行」(= `run()`)で押すとそのまま次の周の先頭から再開する(SPEC F3)。`state.done` /
+`state.errorMessage` のときは何もしない。両者は `finalizeRound()` / `showError()` で常に
+`running=false` とセットで立つので、`stop()` は `state.running` を見るだけで判定できる
+(`if (!state.running) return;`)。
+
+**実行世代(`runToken`)のルール。** `reset()` と `showError()` と `stop()` は `runToken` を
+1つ進める。`focusNext()` / `finalizeRound()` は入口で `var token = runToken;` と世代を捕まえ、
+その後の `then` / 失敗ハンドラ / `setTimeout` のコールバックは **すべて先頭で
+`isCurrent(token)`(= `state.running && token === runToken`)を確認し、偽なら何もせずに
+return する**。`stop()` は `state.running` を `false` にするので、`isCurrent()` は
+`runToken` を進めるかどうかによらずこれだけで古い世代を弾ける。
 
 `state` はオブジェクトごと差し替えられるが、飛んでいる `fetch` の Promise や予約済みの
 `setTimeout` は生き続けてモジュール変数を読むため、`state.running` を見るだけでは足りない。
@@ -322,10 +348,11 @@ idle ──run()──▶ focusNext()
 世代トークンはこれを一箇所で断ち切るための仕組みなので、非同期のコールバックを足すときは
 必ず同じガードを付ける。
 
-**in-flight の abort(Issue #19)。** `runToken` は「古い世代の結果を無視する」だけで、
+**in-flight の abort(Issue #19、#32)。** `runToken` は「古い世代の結果を無視する」だけで、
 Jev への問い合わせそのものは止めない。リセット/新しい問題(`newPuzzle()` は内部で
-`reset()` を呼ぶ)/エラーでは、`runToken` を進めるのと同じタイミングで `inflightController.abort()`
-も呼び、in-flight の `/api/judge` を実際に打ち切る(無駄な待ち時間とレート制限消費を防ぐ)。
+`reset()` を呼ぶ)/エラー/停止(`stop()`)では、`runToken` を進めるのと同じタイミングで
+`inflightController.abort()` も呼び、in-flight の `/api/judge` を実際に打ち切る(無駄な
+待ち時間とレート制限消費を防ぐ)。
 
 なお API 失敗は `then(onOk, onErr)` の第2引数で受け、成功ハンドラ側で投げた例外は後ろの
 `catch` で別の文言(「画面の更新に失敗しました」)にする。描画のバグを API エラーとして
@@ -347,6 +374,12 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
   張り直す必要はない、という割り切り)
 - 「この周の進捗」の分母 `roundSize` は開始前・リセット後も空マス数(51)にしておく。
   `0 / 0` と出すと「対象が無い」ように見えるため
+- 停止中(`isPaused()`)は「現在の判定」パネルを「停止中(残り N マス)」(N は `queue.length`)
+  に差し替える。フォーカスの枠線は `stop()` が `state.focusedKey` を `null` にするので
+  `buildCellStyle` 側の既存ロジックで自然に消える(新しく分岐を足していない。Issue #32)。
+  実行ボタン(`#run-btn`)は実行中は「停止」(`onclick="stop()"`)、停止中は「再開」
+  (`onclick="run()"`、無効化しない)、それ以外(未実行・完了・エラー・生成中)は「実行」
+  (完了・エラー・生成中は無効化)を出す
 
 ## 5. データ
 
@@ -469,6 +502,13 @@ new_sqlite_classes = ["RateLimitCounter"]
     - S3: in-flight で `newPuzzle()`。古い結果が新しい盤面に commit されないこと
     - S4: `reset()` で fetch が `AbortError` で reject されても `showError` されない(エラーボックスが出ない)こと
     - 修正前(AbortController 導入前)のコードに当てると、S1〜S4 はいずれも「in-flight の fetch が abort されていない」で落ちることを確認済み
+  - **停止/再開**(`test/page.test.js` T1〜T6、Issue #32)。`runScript` harness に `opts.setTimeout` を追加してある。既定(未指定)なら従来どおり `setImmediate` で即座に発火するが、渡すと `context.setTimeout` の実装そのものを差し替えられる(`context.setTimeoutCalls` に呼ばれた delay を常に記録する点は共通)。T3 だけは `makeManualTimers()`(`setTimeout` を配列に積むだけで自動発火しない、`fireNext()` で1つずつ明示的に発火させる)を渡し、「周の切り替え待ち中でタイマーが張られているが発火していない」状態を tick のポーリングに頼らず決定的に作る
+    - T1: `run()` → 9マスを正解で確定させた後、10マス目の fetch が in-flight のときに `stop()`。fetch が増えない(pending の件数が変わらない)こと、`state.values` が9件、`state.running === false`、10マス目の fetch が abort(`settled`)されたこと、記録(`getRecords()`)が9件のまま増えないこと、`queue[0]` が10マス目の座標であること
+    - T2: T1 と同じ地点(9マス確定・10マス目 in-flight)で `stop()` した後、`run()` で再開。10マス目から順に聞かれ、応答に使われた fetch の合計が51件、`state.done === true`、`state.values` と記録がそれぞれ51件であること
+    - T3: `makeManualTimers()` で1周目(51マス、1マスだけ不正解になるスタブ)を手動発火のタイマーで最後まで進め、`finalizeRound()` が between-round のタイマーを張った直後(`state.round === 2`・`queue` が1周目の不正解マス・タイマーは1件積まれているが未発火)で `stop()`。`state.running === false` で `round` / `queue` はそのまま。次に `run()` で再開すると2周目の先頭(前の周の不正解マス)から聞き、正解を返すと `state.done === true` / `roundsToSolve === 2` になること。`stop()` 後も残っている古い between-round タイマーを実際に発火させても(`isCurrent()` に弾かれて)無害なことも確認する
+    - T4: `stop()` の後に `reset()` すると、`started === false`・`state.values` が空・`state.round === 1`・`queue` が空・`roundLog` が空になる(最初から)こと
+    - T5: in-flight 中に `stop()` した後、`setSpeed("fast")` してから `run()` で再開すると、再開後に発行される fetch が解決されたときの確定前の待ち時間(`setTimeout` の実引数、`context.setTimeoutCalls[0]`)が `FAST_BEFORE_COMMIT_MS`(0)になっていること(= 停止中の速度変更が再開後の待ち時間に反映される)
+    - T6: `driveToCompletion` で `state.done === true` まで進めた後に `stop()` を呼んでも、`state.done` / `state.running` / `state.values` / `roundLog` / `queue` / `state.round` / `runToken` のいずれも変化しないこと(何もしない)
   - **集計ビュー**(`test/page.test.js`、Issue #6)。`runScript` の harness に `localStorage` / `confirm` / `Blob` / `URL` / `document.createElement` / `document.body` のモックを足してある(`makeLocalStorage()` は `Map` ベース、`makeThrowingLocalStorage()` は必ず例外を投げる)
     - `binRecords`: 境界(`0.0`→帯0、`0.1`→帯1、`0.95`・`1.0`→帯9。`1.0` は最後の帯に入る)、帯ごとの `n`/`correct`/`rate`(`n===0` なら `rate=null`)の計算、数値でない/`NaN`/0〜1の範囲外(`1.5`・`-0.5`)の値の除外、`"pc"` と `"conf"` を独立に集計すること(pc が範囲外でも conf は数えること)
     - `appendRecord`: 上限(`RECORDS_MAX` は既定5,000だが、テストでは `ctx.RECORDS_MAX = 5` のように vm コンテキストのプロパティとして差し替えて境界だけ検証する。既定値5,000であることは別途1行で確認する)を超えたら最古から捨てて上限件数のまま保たれること
