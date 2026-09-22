@@ -141,6 +141,9 @@ function runScript(html, options) {
     setTimeout: function (fn) {
       return setImmediate(fn);
     },
+    // focusNext() がリクエストごとに new AbortController() する(Issue #19)。
+    // vm のコンテキストには Node のグローバルが自動では見えないので明示的に渡す。
+    AbortController: AbortController,
     fetch:
       opts.fetch ||
       function () {
