@@ -1119,3 +1119,208 @@ test("render(): 記録が蓄積済みでもrenderのたびにlocalStorageを読�
     "2回目以降のrenderでlocalStorage.getItemが呼ばれている(キャッシュされていない)"
   );
 });
+
+// -------------------------------------------------------------------
+// 周回ロジックの振る舞い: in-flight の abort(Issue #19)
+//
+// これまでの世代トークン(runToken)の検査は正規表現によるソース検査のみだった。
+// ここでは runScript の harness で実際に run() / reset() / newPuzzle() を動かし、
+// 「リセット後に古い /api/judge の結果が届いても盤面が壊れないこと」を挙動として
+// 検証する。fetch モックは応答を即座に返さず、呼び出しごとに resolve/reject を
+// 外側から制御できる「宙吊り」な Promise を返す(node:vm 越しでも AbortSignal の
+// addEventListener("abort", ...) は素の EventTarget なのでそのまま動く)。
+// -------------------------------------------------------------------
+
+/**
+ * fetch モック。呼び出しを pending に積み、resolve/reject を外側から制御できる
+ * ようにする。init.signal が付いていれば abort を購読し、abort() されたら
+ * AbortError で reject する(実装側の inflightController.abort() を再現する)。
+ * pending の各要素は最大1回しか解決できない(settled で二重解決を防ぐ。
+ * abort 済みのものを後から「解決」しようとしても無視されることを試験できるようにするため)。
+ */
+function makeAbortAwareFetch() {
+  var pending = [];
+  function fetchStub(url, init) {
+    return new Promise(function (resolve, reject) {
+      var entry = { url: url, init: init, settled: false };
+      entry.resolve = function (value) {
+        if (entry.settled) return;
+        entry.settled = true;
+        resolve(value);
+      };
+      entry.reject = function (err) {
+        if (entry.settled) return;
+        entry.settled = true;
+        reject(err);
+      };
+      var signal = init && init.signal;
+      if (signal) {
+        if (signal.aborted) {
+          entry.reject(makeAbortError());
+        } else {
+          signal.addEventListener("abort", function () {
+            entry.reject(makeAbortError());
+          });
+        }
+      }
+      pending.push(entry);
+    });
+  }
+  return { fetch: fetchStub, pending: pending };
+}
+
+function makeAbortError() {
+  var err = new Error("The operation was aborted");
+  err.name = "AbortError";
+  return err;
+}
+
+/** 正解をそのまま返す /api/judge のレスポンス(常に正解 ⇒ 1周で完了する)。 */
+function makeCorrectResponse(ctx, row, col) {
+  var digit = ctx.SOLUTION[row][col];
+  var probabilities = {};
+  for (var d = 1; d <= 9; d++) probabilities[String(d)] = String(d) === digit ? 0.9 : 0.0125;
+  return {
+    ok: true,
+    json: async function () {
+      return { probabilities: probabilities, choice: digit, confidence: 0.5 };
+    },
+  };
+}
+
+/**
+ * pending にたまった fetch を順に「正解」で解決し、state.done になるまで流し切る。
+ * すでに settled(= abort 済み)のものは resolve/reject を呼ばず、calls にも積まない
+ * (abort 済みの宙吊りを再送・再処理しないことの検証そのもの)。
+ */
+async function driveToCompletion(ctx, pending, calls, label) {
+  for (var i = 0; i < 1000; i++) {
+    if (ctx.state.done) return;
+    while (pending.length) {
+      var item = pending.shift();
+      if (item.settled) continue; // abort 済み。再送しない
+      var body = JSON.parse(item.init.body);
+      calls.push({ url: item.url, body: body });
+      item.resolve(makeCorrectResponse(ctx, body.target.row, body.target.col));
+    }
+    await tick();
+  }
+  throw new Error("待っても完了しなかった: " + label);
+}
+
+test("S1: run() 中の reset() → run() は in-flight を打ち切り、fetch を二重に送らない", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var calls = [];
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+
+  ctx.run();
+  assert.equal(af.pending.length, 1, "1件目の fetch が飛んでいない");
+  var firstEntry = af.pending[0];
+  assert.equal(firstEntry.settled, false, "1件目がまだ宙吊りでない");
+
+  ctx.reset();
+  assert.equal(firstEntry.settled, true, "reset() で in-flight の fetch が abort されていない");
+
+  ctx.run();
+  await driveToCompletion(ctx, af.pending, calls, "S1: 1周での完了");
+
+  assert.equal(ctx.state.done, true, "state.done が true になっていない");
+  assert.equal(ctx.state.roundsToSolve, 1, "常に正解を返しているので1周で終わるはず");
+  assert.ok(
+    calls.length <= 51,
+    "fetch 総数が 51 を超えている(abort により宙吊り分が再送された可能性): " + calls.length
+  );
+
+  var values = ctx.state.values;
+  var keys = Object.keys(values);
+  assert.equal(keys.length, 51, "commit 数が 51 でない: " + keys.length);
+  keys.forEach(function (key) {
+    assert.equal(values[key].status, "correct", key + " が不正解のまま残っている");
+  });
+
+  var remainingEmpty = 0;
+  for (var r = 0; r < 9; r++) {
+    for (var c = 0; c < 9; c++) {
+      var key2 = r + "-" + c;
+      var filled = ctx.GIVEN[r][c] !== "." || values[key2];
+      if (!filled) remainingEmpty++;
+    }
+  }
+  assert.equal(remainingEmpty, 0, "空マスが残っている");
+});
+
+test("S2: run() の in-flight 中に reset() だけした場合、古い結果は一切反映されない", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  var recordsBefore = ctx.getRecords().length;
+
+  ctx.run();
+  assert.equal(af.pending.length, 1, "1件目の fetch が飛んでいない");
+  var firstEntry = af.pending[0];
+  var body = JSON.parse(firstEntry.init.body);
+
+  ctx.reset();
+  assert.equal(firstEntry.settled, true, "reset() で in-flight の fetch が abort されていない");
+
+  // 「解決」しようとしても、abort 済みなので何も起きない
+  firstEntry.resolve(makeCorrectResponse(ctx, body.target.row, body.target.col));
+  await tick();
+  await tick();
+  await tick();
+
+  assert.equal(Object.keys(ctx.state.values).length, 0, "commit されてしまっている(state.values が空でない)");
+  assert.equal(ctx.state.running, false, "state.running が false になっていない");
+  assert.equal(ctx.state.done, false);
+  assert.equal(ctx.getRecords().length, recordsBefore, "記録(getRecords())が増えている");
+});
+
+test("S3: run() の in-flight 中に newPuzzle() した場合、古い結果は新しい盤面に commit されない", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+
+  ctx.run();
+  assert.equal(af.pending.length, 1, "1件目の fetch が飛んでいない");
+  var firstEntry = af.pending[0];
+  var oldBody = JSON.parse(firstEntry.init.body);
+  var oldGiven = hostRows(ctx.GIVEN);
+
+  ctx.newPuzzle(); // 内部で reset() を呼ぶので、ここで in-flight が abort されるはず
+  await waitFor(function () {
+    return ctx.generating === false;
+  }, "S3: 新しい問題の生成完了");
+
+  assert.equal(firstEntry.settled, true, "newPuzzle() で in-flight の fetch が abort されていない");
+  assert.notDeepEqual(hostRows(ctx.GIVEN), oldGiven, "GIVEN が新しい盤面に差し替わっていない");
+
+  // 古い盤面向けの結果を「解決」しようとしても、abort 済みなので新しい盤面には効かない
+  firstEntry.resolve(makeCorrectResponse(ctx, oldBody.target.row, oldBody.target.col));
+  await tick();
+  await tick();
+  await tick();
+
+  assert.equal(Object.keys(ctx.state.values).length, 0, "古い結果が新しい盤面に commit されている");
+  assert.equal(ctx.state.running, false);
+});
+
+test("S4: reset() で fetch が AbortError で reject されても showError にならない", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+
+  ctx.run();
+  assert.equal(af.pending.length, 1, "1件目の fetch が飛んでいない");
+  var firstEntry = af.pending[0];
+
+  ctx.reset();
+  assert.equal(firstEntry.settled, true, "reset() で in-flight の fetch が abort(reject)されていない");
+
+  // AbortError の reject が focusNext の then ハンドラまで伝播するのを待つ
+  await tick();
+  await tick();
+  await tick();
+
+  assert.equal(ctx.state.errorMessage, null, "abort が showError に流れてエラーメッセージが立っている");
+
+  ctx.render();
+  var html = ctx.appElement.innerHTML;
+  assert.ok(!html.includes('class="error"'), "abort でエラーボックスが表示されている");
+});
