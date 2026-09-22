@@ -844,10 +844,17 @@ var PAGE_HTML = `<!doctype html>
     return bins;
   }
 
-  // 実行世代のチェック。reset() / showError() で runToken が進むので、
+  // 実行世代のチェック。reset() / showError() / stop() で runToken が進むので、
   // 古い世代の fetch / setTimeout のコールバックはここで弾かれる(DESIGN 4.3)。
   function isCurrent(token) {
     return state.running && token === runToken;
+  }
+
+  // 停止中(started 後に stop() で running=false になり、done でも errorMessage
+  // でもない)かどうか。renderControls() の「再開」ラベルと renderCurrentPanel() の
+  // 「停止中」表示で使う(SPEC F1、Issue #32)。
+  function isPaused() {
+    return started && !state.running && !state.done && !state.errorMessage;
   }
 
   // 32bit FNV-1a。集計ビュー(SPEC F1 拡張2)の問題IDに使う簡易ハッシュ。
@@ -1436,6 +1443,48 @@ var PAGE_HTML = `<!doctype html>
     }, betweenRoundsMs);
   }
 
+  /**
+   * 実行中の停止(SPEC F1、Issue #32)。reset() と違って盤面・周回ログ・統計を
+   * 捨てない。state.values / state.round / state.roundLog / roundTally /
+   * roundSize / queue / started はそのまま保ち、「実行」(= 再開)で続きから
+   * 動かせるようにする(4.3、DESIGN.md 4.3 状態遷移)。
+   *
+   * runToken を進めて in-flight の fetch / 予約済みの setTimeout を無効化する点は
+   * reset() / showError() と同じ。判定中(フォーカス中)のマスがあれば、まだ
+   * commitFocused() されていない(結果待ち、または結果が確定待ちの)ものとして
+   * queue の先頭に戻す。その結果は破棄し、記録(appendRecord)にも残さない。
+   * 再開したら同じマスをもう一度聞く(SPEC F2)。
+   *
+   * 周をまたぐ待ち時間中(finalizeRound() の between-round の setTimeout 待ち)に
+   * 呼ばれた場合は、finalizeRound() がそのタイマーを張る前に次の周の
+   * round / queue / roundSize / roundTally を更新済みなので、focusedKey は
+   * 既に null(commitFocused() で消えている)。このケースでは何もすることがなく、
+   * 「実行」で押すと次の周の先頭から再開する(SPEC F3)。
+   *
+   * state.done / state.errorMessage のときは何もしない。両者は常に
+   * running=false とセットで立つ(finalizeRound() / showError())ので、
+   * running を見るだけで判定できる。
+   */
+  function stop() {
+    if (!state.running) return;
+    // 世代を進めて、進行中の fetch / setTimeout のコールバックを無効化する
+    runToken += 1;
+    // in-flight の /api/judge があれば打ち切る(reset() / showError() と同じ、Issue #19)
+    if (inflightController) {
+      inflightController.abort();
+      inflightController = null;
+    }
+    state.running = false;
+    if (state.focusedKey) {
+      var parts = state.focusedKey.split("-");
+      queue.unshift({ r: Number(parts[0]), c: Number(parts[1]) });
+    }
+    pendingCommit = null;
+    state.focusedKey = null;
+    state.currentProbs = null;
+    render();
+  }
+
   function showError(message) {
     // 世代を進めて、進行中の fetch / setTimeout のコールバックを無効化する
     runToken += 1;
@@ -1600,11 +1649,17 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function renderControls() {
-    var runDisabled = state.running || state.done || state.errorMessage || generating ? "disabled" : "";
-    // 生成中・実行中は問題を差し替えない(実行中の差し替えは盤面と周回ログの意味を壊す)
+    // 実行中は「実行」ボタンを「停止」に切り替える(id は run-btn のまま。Issue #32)。
+    // 停止中(isPaused())はラベルを「再開」にする。実行中は無効化しない(停止できる必要がある)。
+    var paused = isPaused();
+    var runLabel = state.running ? "停止" : paused ? "再開" : "実行";
+    var runOnclick = state.running ? "stop()" : "run()";
+    var runDisabled = state.running ? "" : state.done || state.errorMessage || generating ? "disabled" : "";
+    // 生成中・実行中は問題を差し替えない(実行中の差し替えは盤面と周回ログの意味を壊す)。
+    // 停止中(state.running===false)は「新しい問題」を押せる(Issue #32)。
     var newDisabled = state.running || generating ? "disabled" : "";
     // リセットは進行中の判定があっても安全に行える(SPEC F5、世代トークンが古い連鎖を無効化する)。
-    // 生成中だけは差し替え中の盤面と衝突するので無効化する。
+    // 停止中も押せる(Issue #32)。生成中だけは差し替え中の盤面と衝突するので無効化する。
     var resetDisabled = generating ? "disabled" : "";
     var newLabel = generating ? "生成中…" : "新しい問題";
     var slowActive = state.speedMode === "slow" ? " active" : "";
@@ -1613,7 +1668,7 @@ var PAGE_HTML = `<!doctype html>
     var normalActive = state.difficulty === "normal" ? " active" : "";
     var hardActive = state.difficulty === "hard" ? " active" : "";
     return "<div class=\\"controls\\">" +
-      "<button id=\\"run-btn\\" onclick=\\"run()\\" " + runDisabled + ">実行</button>" +
+      "<button id=\\"run-btn\\" onclick=\\"" + runOnclick + "\\" " + runDisabled + ">" + runLabel + "</button>" +
       "<button id=\\"reset-btn\\" onclick=\\"reset()\\" " + resetDisabled + ">リセット</button>" +
       "<button id=\\"new-puzzle-btn\\" onclick=\\"newPuzzle()\\" " + newDisabled + ">" + newLabel + "</button>" +
       "<div id=\\"speed-toggle\\">" +
@@ -1669,6 +1724,22 @@ var PAGE_HTML = `<!doctype html>
   function renderCurrentPanel() {
     var head = "<div id=\\"current-panel\\" class=\\"panel\\"><p class=\\"panel-title\\">現在の判定</p>";
     var tail = "</div>";
+
+    // 停止中(Issue #32): 残りマス数を示し、フォーカスの枠線は消える
+    // (state.focusedKey が null なので buildCellStyle 側で自然に消える)。
+    // 直前に確定した判定があれば、参考として下に残す。
+    if (isPaused()) {
+      var pausedBody = "<p class=\\"muted\\">停止中(残り " + queue.length + " マス)</p>";
+      var pausedLast = state.lastJudgment;
+      if (pausedLast && pausedLast.probs) {
+        var pausedStatusText = pausedLast.status === "correct" ? "正解" : "不正解";
+        var pausedConfidence = typeof pausedLast.confidence === "number" ? " / Jev confidence " + Math.round(pausedLast.confidence * 100) + "%" : "";
+        pausedBody += "<div class=\\"coords\\"><span class=\\"confidence\\">直前: " + coordLabel(pausedLast.r, pausedLast.c) +
+          " → " + escapeHtml(pausedLast.choice) + "(" + pausedStatusText + ")" + pausedConfidence + "</span></div>" +
+          "<div class=\\"bars\\">" + renderBars(pausedLast.probs) + "</div>";
+      }
+      return head + pausedBody + tail;
+    }
 
     // 結果が届いている最中のマス: 座標とバーをそのまま出す
     if (state.focusedKey && state.currentProbs) {
