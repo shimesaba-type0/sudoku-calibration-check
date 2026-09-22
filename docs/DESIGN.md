@@ -167,7 +167,7 @@ state: {
 }
 ````
 
-`questions` は空マス1つにつき1問で、キーは `"r0c2"` のようなマスのキー、中身は `{ type: "noul", instructions: <WHERE_INSTRUCTIONS_TEMPLATE に埋めた文> }`。`WHERE_INSTRUCTIONS_TEMPLATE` は `"Does the empty cell at row {row}, column {col} (zero-based) contain the digit {digit}?"` で、**フロント(Claude 経路)が同じ文言を使えるように定数として `PAGE_HTML` より前に置いてある**。
+`questions` は空マス1つにつき1問で、キーは `"r0c2"` のようなマスのキー、中身は `{ type: "noul", instructions: <WHERE_INSTRUCTIONS_TEMPLATE に埋めた文> }`。`WHERE_INSTRUCTIONS_TEMPLATE` は `"Is the digit {digit} the one that belongs in the empty cell at row {row}, column {col} (zero-based)?"` で、**フロント(Claude 経路)が同じ文言を使えるように定数として `PAGE_HTML` より前に置いてある**。
 
 `CELL_NOTE` / `CELL_INSTRUCTIONS` / `WHERE_NOTE` / `WHERE_INSTRUCTIONS_TEMPLATE` は `NOTE` / `INSTRUCTIONS` とは別の定数で、**`NOTE` の文面は変えない**(`ask` を省略したときの挙動を1文字も変えないため)。どちらの経路でも `state` に入るのは「今埋まっているマス」と固定の説明文だけで、`SOLUTION` 由来の情報は入らない(9 章 不変条件1。10 章のテストが `payload` の完全一致で機械的に確認する)。
 
@@ -233,7 +233,7 @@ await env.AI.run("typesafe/jev", {
 
 参考(将来の転用用):
 
-- `noul` のレスポンスは `{ "type": "noul", "noul": 0.98 }`(確率のみ。閾値判断はアプリ側)。**1回の呼び出しに複数の質問を入れられる**(2026-09-22 に `noul` の質問を51個まとめて1回で投げ、51件そのまま返ることを実環境で確認。215 ms、入力 1,948 / 出力 973 トークン)。`ask:"where"`(Issue #45)はこれを使っている
+- `noul` のレスポンスは `{ "type": "noul", "noul": 0.98 }`(確率のみ。閾値判断はアプリ側)。**1回の呼び出しに複数の質問を入れられる**(2026-09-22 に、探り用の使い捨て Worker から `noul` の質問を51個まとめて1回で投げ、51件そのまま返ることを実環境で確認。215 ms、入力 1,948 / 出力 973 トークン。同日、`choice` の質問51個(各 1〜9 の criteria)でも 51 件返った: 1,097 ms、入力 9,483 / 出力 4,083 トークン)。`ask:"where"`(Issue #45)はこれを使っている。**この PR の payload そのもの(キー `r0c2`・`WHERE_NOTE`・`state.digit`)での疎通はマージ後に本番で `curl` 1 回で確認する**
 - `score` は順序付きの段階から1つを選び、同様に確率を返す
 
 **この形式は変わり得る。** Jev は公開直後で頻繁に更新されており、ゲートウェイのラッパーも

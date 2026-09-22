@@ -92,7 +92,7 @@ var WHERE_NOTE =
 // フロント(PAGE_HTML)が Claude 経路で同じ文言を組み立てられるよう、**テンプレートそのもの**
 // を定数として持ち、Worker 側(whereInstructions)もこれ1つから組み立てる。
 var WHERE_INSTRUCTIONS_TEMPLATE =
-  "Does the empty cell at row {row}, column {col} (zero-based) contain the digit {digit}?";
+  "Is the digit {digit} the one that belongs in the empty cell at row {row}, column {col} (zero-based)?";
 
 /** WHERE_INSTRUCTIONS_TEMPLATE に座標と数字を埋めて1問分の instructions を作る。 */
 function whereInstructions(row, col, digit) {
@@ -115,7 +115,7 @@ var ANSWER_MESSAGES = {
   },
   // where は noul なので choice も confidence も無い(answers そのものを検証する)。
   where: {
-    keys: "AIの応答のanswersが候補マスのキーと一致していません",
+    keys: "AIの応答のanswersが質問したマスのキーと一致していません", // validateNoulAnswers 専用(choice は無い)
     values: "AIの応答のnoulに数値でない値が含まれています",
   },
 };

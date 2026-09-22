@@ -778,13 +778,13 @@ var EXPECTED_WHERE_NOTE =
 /** WHERE_INSTRUCTIONS_TEMPLATE を埋めた文言(テンプレートごとテスト側に複製している)。 */
 function expectedWhereInstructions(row, col, digit) {
   return (
-    "Does the empty cell at row " +
+    "Is the digit " +
+    digit +
+    " the one that belongs in the empty cell at row " +
     row +
     ", column " +
     col +
-    " (zero-based) contain the digit " +
-    digit +
-    "?"
+    " (zero-based)?"
   );
 }
 
@@ -927,7 +927,7 @@ test('400: ask:"where" に target が付いている', async () => {
 });
 
 test('400: ask:"where" の digit が 1〜9 の文字列でない', async () => {
-  var bad = [undefined, null, 4, "0", "10", "", "４", " 4", "a", ["4"], { digit: "4" }, true];
+  var bad = [undefined, null, 4, "0", "10", "", "４", " 4", "4 ", "a", ["4"], { digit: "4" }, true];
   for (var i = 0; i < bad.length; i++) {
     await expect400("digit=" + JSON.stringify(bad[i]), validWhereBody({ digit: bad[i] }));
   }
@@ -970,6 +970,15 @@ test('400: ask:"where" でも puzzle の形式は従来どおり見る(文言は
   var res = await worker.fetch(judgeRequest({ ask: "where", digit: "4" }), env);
   assert.equal(res.status, 400);
   assert.equal((await res.json()).error, "puzzle(9行の配列)が必要です");
+});
+
+test('200: ask:"where" はラッパー無し(素の { model, answers, usage })でも 200', async () => {
+  var keys = emptyCellKeys(GIVEN);
+  var out = await postWhere({ model: "jev-1.13.0", answers: jevWhereAnswers(keys), usage: { input_tokens: 1, output_tokens: 1 } });
+  assert.equal(out.res.status, 200, JSON.stringify(out.body));
+  assert.deepEqual(Object.keys(out.body.probabilities), keys);
+  assert.equal(out.body.digit, validWhereBody().digit);
+  assert.ok(out.body.request && out.body.request.questions);
 });
 
 test('502: ask:"where" で answers が取り出せない', async () => {
@@ -1018,7 +1027,7 @@ test('502: ask:"where" で answers のキーが空マスと一致しない', asy
   for (var label in cases) {
     var out = await postWhere(withWhereAnswers(cases[label]));
     assert.equal(out.res.status, 502, label + ": 502 を期待したが " + out.res.status);
-    assert.equal(out.body.error, "AIの応答のanswersが候補マスのキーと一致していません");
+    assert.equal(out.body.error, "AIの応答のanswersが質問したマスのキーと一致していません");
     assert.ok("raw" in out.body, label + ": raw が無い");
     assert.deepStrictEqual(out.body.request, out.env.aiCalls[0].payload);
   }

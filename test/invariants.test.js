@@ -289,19 +289,19 @@ test('不変条件1: ask:"where" の payload も期待どおりのオブジェ�
     questions: {
       r0c8: {
         type: "noul",
-        instructions: "Does the empty cell at row 0, column 8 (zero-based) contain the digit 7?",
+        instructions: "Is the digit 7 the one that belongs in the empty cell at row 0, column 8 (zero-based)?",
       },
       r4c7: {
         type: "noul",
-        instructions: "Does the empty cell at row 4, column 7 (zero-based) contain the digit 7?",
+        instructions: "Is the digit 7 the one that belongs in the empty cell at row 4, column 7 (zero-based)?",
       },
       r7c8: {
         type: "noul",
-        instructions: "Does the empty cell at row 7, column 8 (zero-based) contain the digit 7?",
+        instructions: "Is the digit 7 the one that belongs in the empty cell at row 7, column 8 (zero-based)?",
       },
       r8c8: {
         type: "noul",
-        instructions: "Does the empty cell at row 8, column 8 (zero-based) contain the digit 7?",
+        instructions: "Is the digit 7 the one that belongs in the empty cell at row 8, column 8 (zero-based)?",
       },
     },
   });
