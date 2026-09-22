@@ -203,7 +203,8 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
   "request": {
     "state": { "puzzle": ["53..7....", "..."], "target": { "row": 0, "col": 2 }, "note": "..." },
     "questions": { "digit": { "type": "choice", "instructions": "...", "criteria": { "1": "the digit 1", "...": "..." } } }
-  }
+  },
+  "usage": { "input_tokens": 665, "output_tokens": 80 }
 }
 ````
 
@@ -211,6 +212,8 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 - `choice`: Jev が選んだキー(文字列)
 - `confidence`: Jev が返す独自の確信度。`probabilities[choice]` とは一致しない(実測: 0.20 に対して 0.10 など)。較正の検証には `probabilities` を使う
 - `request`: `env.AI.run` に渡したペイロードそのもの。`state.puzzle` / `state.target` / `state.note` / `questions.digit.{type,instructions,criteria}`(フロントの「モデルに送ったプロンプト」パネルがそのまま表示する。Issue #34)。502 にも付く。400/415/429/503 には付かない(まだ payload を組み立てていないため)
+- `usage`: Jev が返すトークン使用量(`input_tokens` / `output_tokens`)。コスト表示用に **200 にそのまま載せる**。`ask` の種類(`digit` / `cell` / `where` / `all`)によらず同じ形で付く
+- ただし Jev の応答に `usage` が無い・オブジェクトでない・`input_tokens` / `output_tokens` が有限の数値でない場合は `usage` ごと **省略** する(参考情報なので 502 にはせず、判定結果の検証にも影響させない)。502 には付けない
 
 #### `ask: "cell"`(マス選び。Issue #38)
 
@@ -243,7 +246,8 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
   "request": {
     "state": { "puzzle": ["53..7....", "..."], "note": "..." },
     "questions": { "cell": { "type": "choice", "instructions": "...", "criteria": { "r0c2": "row 0, column 2 (zero-based)", "...": "..." } } }
-  }
+  },
+  "usage": { "input_tokens": 700, "output_tokens": 90 }
 }
 ````
 
@@ -284,7 +288,8 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
   "request": {
     "state": { "puzzle": ["53..7....", "..."], "digit": "4", "note": "..." },
     "questions": { "r0c2": { "type": "noul", "instructions": "Is the digit 4 the one that belongs in the empty cell at row 0, column 2 (zero-based)?" } }
-  }
+  },
+  "usage": { "input_tokens": 1948, "output_tokens": 973 }
 }
 ````
 
@@ -330,7 +335,8 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
     "questions": {
       "r0c2": { "type": "choice", "instructions": "...", "criteria": { "1": "the digit 1", "...": "..." } }
     }
-  }
+  },
+  "usage": { "input_tokens": 9483, "output_tokens": 4083 }
 }
 ````
 

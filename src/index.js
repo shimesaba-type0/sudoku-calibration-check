@@ -758,6 +758,41 @@ function extractAnswer(response, key) {
   return { answer: extracted.answers[key] };
 }
 
+/**
+ * Jev のレスポンスから `usage`(トークン使用量)を取り出す(コスト表示用。Issue「コスト
+ * (ドル)を周ごと・全体で表示する」の Worker 側)。
+ *
+ * 取り出し元は `extractAnswers` と同じ場所: ラッパー付きなら `result.usage`、
+ * 素の `{ model, answers, usage }` なら `usage`(docs/DESIGN.md 3.4)。
+ *
+ * 期待どおりの形でなければ `undefined` を返し、呼び出し側は 200 から `usage` ごと省略する。
+ * `usage` はあくまで参考情報なので、欠けていても・壊れていても **判定結果の検証には
+ * 影響させない**(502 にはしない)。片方のフィールドだけ数値、のような半端な形も
+ * 単純に丸ごと省略する。
+ * レート制限の使用率を返す usageOf() とは無関係(あちらは回数、こちらはトークン数)。
+ */
+function extractUsage(response) {
+  if (response === null || typeof response !== "object" || Array.isArray(response)) {
+    return undefined;
+  }
+
+  var inner = response.result;
+  var container =
+    inner !== null && typeof inner === "object" && !Array.isArray(inner) ? inner : response;
+
+  var usage = container.usage;
+  if (usage === null || typeof usage !== "object" || Array.isArray(usage)) return undefined;
+  // 負値も「壊れている」扱いで丸ごと省略する(参考値なので有限かつ 0 以上だけ通す)
+  if (typeof usage.input_tokens !== "number" || !Number.isFinite(usage.input_tokens) || usage.input_tokens < 0) {
+    return undefined;
+  }
+  if (typeof usage.output_tokens !== "number" || !Number.isFinite(usage.output_tokens) || usage.output_tokens < 0) {
+    return undefined;
+  }
+
+  return { input_tokens: usage.input_tokens, output_tokens: usage.output_tokens };
+}
+
 function truncate(text) {
   return text.length > RAW_MAX_LENGTH ? text.slice(0, RAW_MAX_LENGTH) + "…" : text;
 }
@@ -978,6 +1013,10 @@ async function handleJudge(request, env) {
     );
   }
 
+  // Jev のトークン使用量。ask の種類によらず 200 にそのまま添える(コスト表示用)。
+  // 取り出せなければ undefined で、その場合は 200 から usage ごと省略する。
+  var usage = extractUsage(result);
+
   if (ask === ASK_ALL) {
     // マスごとに digit と同じ形({ choice, probabilities, confidence })を返す。
     // `type` は落とす(digit / cell の 200 でも返していないため)。キーは行優先。
@@ -991,15 +1030,13 @@ async function handleJudge(request, env) {
         confidence: cellAnswer.confidence,
       };
     }
-    return jsonResponse(
-      {
-        cells: cellsOut,
-        // env.AI.run に渡したペイロードそのもの(Issue #34)。
-        request: payload,
-      },
-      200,
-      rate.headers
-    );
+    var allBody = {
+      cells: cellsOut,
+      // env.AI.run に渡したペイロードそのもの(Issue #34)。
+      request: payload,
+    };
+    if (usage !== undefined) allBody.usage = usage;
+    return jsonResponse(allBody, 200, rate.headers);
   }
 
   if (ask === ASK_WHERE) {
@@ -1008,16 +1045,14 @@ async function handleJudge(request, env) {
     for (var ki = 0; ki < expectedKeys.length; ki++) {
       whereProbabilities[expectedKeys[ki]] = answers[expectedKeys[ki]].noul;
     }
-    return jsonResponse(
-      {
-        probabilities: whereProbabilities,
-        digit: body.digit,
-        // env.AI.run に渡したペイロードそのもの(Issue #34)。
-        request: payload,
-      },
-      200,
-      rate.headers
-    );
+    var whereBody = {
+      probabilities: whereProbabilities,
+      digit: body.digit,
+      // env.AI.run に渡したペイロードそのもの(Issue #34)。
+      request: payload,
+    };
+    if (usage !== undefined) whereBody.usage = usage;
+    return jsonResponse(whereBody, 200, rate.headers);
   }
 
   var responseBody = {
@@ -1034,6 +1069,7 @@ async function handleJudge(request, env) {
     var chosen = cellsByKey[answer.choice];
     responseBody.cell = { row: chosen.row, col: chosen.col };
   }
+  if (usage !== undefined) responseBody.usage = usage;
   return jsonResponse(responseBody, 200, rate.headers);
 }
 
