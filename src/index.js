@@ -48,6 +48,43 @@ var NOTE =
 
 var INSTRUCTIONS = "Which digit from 1 to 9 belongs in the target cell of this Sudoku grid?";
 
+// 質問の種類(リクエストの ask フィールド。docs/SPEC.md 4章 / Issue #38)。
+// "digit" … 従来どおり target のマスの数字(1〜9)を聞く
+// "cell"  … target を取らず、空マスのうち「最も確定しやすいマス」を聞く
+var ASK_DIGIT = "digit";
+var ASK_CELL = "cell";
+
+// ask:"cell" 用の固定文。NOTE と同じくルールを伝えるための説明だが、target が無く、
+// 代わりに空マスの一覧が criteria として与えられることを伝える。NOTE の文面は変えない。
+var CELL_NOTE =
+  "puzzle is a 9x9 Sudoku grid given as 9 strings of 9 characters each, " +
+  "top row first. A digit character is a cell that is already filled in; " +
+  "'.' is an empty cell. There is no target cell this time. Instead, the criteria " +
+  "list every empty cell of the grid, keyed as 'r<row>c<col>' with zero-based row " +
+  "and col indices (row 0 is the first string, col 0 is its first character). " +
+  "Standard Sudoku rules apply: every row, every column and every 3x3 box must " +
+  "contain each of the digits 1 to 9 exactly once. Some of the digits already " +
+  "placed may be wrong. Answer which of those empty cells is the easiest to " +
+  "determine, that is, the cell whose digit you can state with the most confidence.";
+
+var CELL_INSTRUCTIONS =
+  "Which empty cell of this Sudoku grid can be filled in with the most certainty? " +
+  "Pick the cell whose digit you are most confident about.";
+
+// 質問の種類ごとの 502 の理由(validateAnswer に渡す)。digit 側の文言は従来のまま。
+var ANSWER_MESSAGES = {
+  digit: {
+    keys: "AIの応答のprobabilitiesが1〜9の9キーになっていません",
+    values: "AIの応答のprobabilitiesに数値でない値が含まれています",
+    choice: "AIの応答のchoiceが1〜9のいずれかではありません",
+  },
+  cell: {
+    keys: "AIの応答のprobabilitiesが候補マスのキーと一致していません",
+    values: "AIの応答のprobabilitiesに数値でない値が含まれています",
+    choice: "AIの応答のchoiceが候補マスのいずれかではありません",
+  },
+};
+
 function jsonResponse(body, status, extraHeaders) {
   var headers = { "content-type": "application/json; charset=utf-8" };
   if (extraHeaders) {
@@ -338,21 +375,60 @@ async function readRateLimitStatus(request, env) {
 var CELL_PATTERN = /^[1-9.]{9}$/;
 
 /**
+ * リクエストの ask(質問の種類)を読む。省略時は従来どおり "digit"。
+ * 未知の値は null を返し、呼び出し側が 400 にする(docs/SPEC.md 4章 / Issue #38)。
+ */
+function readAsk(body) {
+  if (body === null || typeof body !== "object") return null;
+  if (body.ask === undefined) return ASK_DIGIT;
+  if (body.ask === ASK_DIGIT || body.ask === ASK_CELL) return body.ask;
+  return null;
+}
+
+/**
+ * 盤面の空マスを行優先の順で列挙する。
+ * 戻り値は `{ key: "r0c2", row: 0, col: 2 }` の配列(ask:"cell" の criteria の元)。
+ */
+function emptyCells(puzzle) {
+  var cells = [];
+  for (var r = 0; r < 9; r++) {
+    for (var c = 0; c < 9; c++) {
+      if (puzzle[r][c] === ".") cells.push({ key: "r" + r + "c" + c, row: r, col: c });
+    }
+  }
+  return cells;
+}
+
+/**
  * 入力検証(docs/DESIGN.md 3.3 手順3)。
  * 問題なければ null、不備があれば日本語の理由を返す。
+ *
+ * ask:"digit"(既定)と ask:"cell" で見る項目が変わる。puzzle の形式・最小ヒント数は共通で、
+ * target は digit のとき必須・cell のとき禁止(付いていたら 400。どちらのつもりの
+ * リクエストか曖昧にしないため)。cell は空マスが1個も無ければ聞くものが無いので 400。
  */
-function validateInput(body) {
+function validateInput(body, ask) {
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
     return "puzzle(9行の配列)とtarget({row,col})が必要です";
+  }
+
+  // ask は呼び出し元(handleJudge)が readAsk で 1 回だけ解釈して渡す(レビュー指摘 S1。
+  // 2 か所で別々に解釈すると、検証順の変更で null が素通りする余地ができる)。
+  if (ask !== ASK_DIGIT && ask !== ASK_CELL) {
+    return "askはdigitかcellである必要があります";
   }
 
   var puzzle = body.puzzle;
   var target = body.target;
   if (!Array.isArray(puzzle) || puzzle.length !== 9) {
+    // cell では target を取らないので、文言でも target に触れない(S3)。digit の文言は従来どおり。
+    return ask === ASK_CELL ? "puzzle(9行の配列)が必要です" : "puzzle(9行の配列)とtarget({row,col})が必要です";
+  }
+  if (ask === ASK_DIGIT && (target === null || typeof target !== "object" || Array.isArray(target))) {
     return "puzzle(9行の配列)とtarget({row,col})が必要です";
   }
-  if (target === null || typeof target !== "object" || Array.isArray(target)) {
-    return "puzzle(9行の配列)とtarget({row,col})が必要です";
+  if (ask === ASK_CELL && target !== undefined) {
+    return "ask:cellではtargetを指定できません(盤面全体から選ぶため)";
   }
 
   for (var r = 0; r < 9; r++) {
@@ -361,16 +437,18 @@ function validateInput(body) {
     }
   }
 
-  var row = target.row;
-  var col = target.col;
-  if (!Number.isInteger(row) || !Number.isInteger(col) || row < 0 || row > 8 || col < 0 || col > 8) {
-    return "target.rowとtarget.colは0〜8の整数である必要があります";
-  }
+  if (ask === ASK_DIGIT) {
+    var row = target.row;
+    var col = target.col;
+    if (!Number.isInteger(row) || !Number.isInteger(col) || row < 0 || row > 8 || col < 0 || col > 8) {
+      return "target.rowとtarget.colは0〜8の整数である必要があります";
+    }
 
-  // 対象マスは必ず空。判定対象のマスに数字が入っていたら、そのマスは聞く必要がない。
-  // 再判定のときも対象マス自身は空にして送る。前回の推測を Jev に見せない(アンカリング回避)。
-  if (puzzle[row][col] !== ".") {
-    return "puzzleのtargetのマスは.(空)である必要があります";
+    // 対象マスは必ず空。判定対象のマスに数字が入っていたら、そのマスは聞く必要がない。
+    // 再判定のときも対象マス自身は空にして送る。前回の推測を Jev に見せない(アンカリング回避)。
+    if (puzzle[row][col] !== ".") {
+      return "puzzleのtargetのマスは.(空)である必要があります";
+    }
   }
 
   // 埋まっているマスが少なすぎる盤面は数独として成立しない。
@@ -386,6 +464,11 @@ function validateInput(body) {
     return "puzzleの埋まっているマスが少なすぎます(" + MIN_FILLED_CELLS + "個以上必要です)";
   }
 
+  // ask:"cell" は空マスの中から選ばせる質問なので、空マスが無ければ聞くものが無い。
+  if (ask === ASK_CELL && filled === 81) {
+    return "puzzleに空(.)のマスがありません";
+  }
+
   return null;
 }
 
@@ -393,8 +476,13 @@ function validateInput(body) {
  * Jev の回答が期待した形かを検証する(docs/DESIGN.md 3.3 手順6)。
  * 形が違うものをそのまま 200 で返すとフロントが黙って壊れるので、502 にして raw を見せる。
  * 問題なければ null、不備があれば日本語の理由を返す。
+ *
+ * `expectedKeys` は `probabilities` のキーと `choice` が取りうる値の集合
+ * (ask:"digit" なら DIGITS、ask:"cell" なら criteria のキー配列)。`probabilities` は
+ * この集合と **ちょうど一致**(個数と各キー)している必要がある。
+ * `messages` は質問の種類ごとに文言が変わる 502 の理由(ANSWER_MESSAGES)。
  */
-function validateAnswer(answer) {
+function validateAnswer(answer, expectedKeys, messages) {
   if (answer === null || typeof answer !== "object" || Array.isArray(answer)) {
     return "AIの応答が予期しない形式です";
   }
@@ -409,21 +497,21 @@ function validateAnswer(answer) {
   }
 
   var keys = Object.keys(probabilities);
-  if (keys.length !== DIGITS.length) {
-    return "AIの応答のprobabilitiesが1〜9の9キーになっていません";
+  if (keys.length !== expectedKeys.length) {
+    return messages.keys;
   }
-  for (var i = 0; i < DIGITS.length; i++) {
-    var digit = DIGITS[i];
-    if (!Object.prototype.hasOwnProperty.call(probabilities, digit)) {
-      return "AIの応答のprobabilitiesが1〜9の9キーになっていません";
+  for (var i = 0; i < expectedKeys.length; i++) {
+    var expected = expectedKeys[i];
+    if (!Object.prototype.hasOwnProperty.call(probabilities, expected)) {
+      return messages.keys;
     }
-    if (typeof probabilities[digit] !== "number" || !Number.isFinite(probabilities[digit])) {
-      return "AIの応答のprobabilitiesに数値でない値が含まれています";
+    if (typeof probabilities[expected] !== "number" || !Number.isFinite(probabilities[expected])) {
+      return messages.values;
     }
   }
 
-  if (typeof answer.choice !== "string" || DIGITS.indexOf(answer.choice) === -1) {
-    return "AIの応答のchoiceが1〜9のいずれかではありません";
+  if (typeof answer.choice !== "string" || expectedKeys.indexOf(answer.choice) === -1) {
+    return messages.choice;
   }
 
   if (typeof answer.confidence !== "number" || !Number.isFinite(answer.confidence)) {
@@ -434,7 +522,8 @@ function validateAnswer(answer) {
 }
 
 /**
- * Jev のレスポンスから `answers.digit` を取り出す(docs/DESIGN.md 3.4)。
+ * Jev のレスポンスから `answers[key]`(key は "digit" または "cell")を取り出す
+ * (docs/DESIGN.md 3.4)。
  *
  * 実環境の `typesafe/jev` は AI Gateway 経由で提供されており、`env.AI.run` は
  * `{ state, result: { model, answers, usage }, gatewayMetadata }` というラッパーを返す。
@@ -444,7 +533,7 @@ function validateAnswer(answer) {
  *
  * 取り出せたら `{ answer }`、駄目なら `{ error }`(日本語の理由)を返す。
  */
-function extractAnswer(response) {
+function extractAnswer(response, key) {
   if (response === null || typeof response !== "object" || Array.isArray(response)) {
     return { error: "AIの応答が予期しない形式です" };
   }
@@ -468,11 +557,11 @@ function extractAnswer(response) {
     return { error: "AIの応答が予期しない形式です" };
   }
 
-  if (answers.digit === undefined) {
+  if (answers[key] === undefined) {
     return { error: "AIの応答が予期しない形式です" };
   }
 
-  return { answer: answers.digit };
+  return { answer: answers[key] };
 }
 
 function truncate(text) {
@@ -523,32 +612,68 @@ async function handleJudge(request, env) {
     return errorResponse("リクエストボディをJSONとして解釈できません", 400, rate.headers);
   }
 
-  var invalid = validateInput(body);
+  // ask(質問の種類)はここで 1 回だけ解釈し、検証にも payload 構築にも同じ値を使う。
+  var ask = readAsk(body);
+  var invalid = validateInput(body, ask);
   if (invalid !== null) {
     return errorResponse(invalid, 400, rate.headers);
   }
 
-  var criteria = {};
-  for (var i = 0; i < DIGITS.length; i++) {
-    criteria[DIGITS[i]] = "the digit " + DIGITS[i];
-  }
-
-  // Jev に渡すのは「今埋まっているマス」と「対象座標」とルール説明だけ。
+  // 質問の種類ごとに payload と「期待するキー集合」を組み立てる(Issue #38)。
+  // どちらの経路でも Jev に渡すのは「今埋まっているマス」と質問文だけで、
   // 正解表に由来する情報は一切入れない(docs/DESIGN.md 9章 不変条件1)。
-  var payload = {
-    state: {
-      puzzle: body.puzzle,
-      target: { row: body.target.row, col: body.target.col },
-      note: NOTE,
-    },
-    questions: {
-      digit: {
-        type: "choice",
-        instructions: INSTRUCTIONS,
-        criteria: criteria,
+  var criteria = {};
+  var expectedKeys = [];
+  var payload;
+  var cellsByKey = null;
+
+  if (ask === ASK_CELL) {
+    // マス選び: 空マスの一覧を criteria にして「どのマスが最も確定しやすいか」を聞く。
+    // target は渡さない(盤面全体から選ばせる質問なので、対象マスが存在しない)。
+    var cells = emptyCells(body.puzzle);
+    cellsByKey = {};
+    for (var ci = 0; ci < cells.length; ci++) {
+      var cell = cells[ci];
+      criteria[cell.key] = "row " + cell.row + ", column " + cell.col + " (zero-based)";
+      expectedKeys.push(cell.key);
+      cellsByKey[cell.key] = cell;
+    }
+    payload = {
+      state: {
+        puzzle: body.puzzle,
+        note: CELL_NOTE,
       },
-    },
-  };
+      questions: {
+        cell: {
+          type: "choice",
+          instructions: CELL_INSTRUCTIONS,
+          criteria: criteria,
+        },
+      },
+    };
+  } else if (ask === ASK_DIGIT) {
+    for (var i = 0; i < DIGITS.length; i++) {
+      criteria[DIGITS[i]] = "the digit " + DIGITS[i];
+      expectedKeys.push(DIGITS[i]);
+    }
+    payload = {
+      state: {
+        puzzle: body.puzzle,
+        target: { row: body.target.row, col: body.target.col },
+        note: NOTE,
+      },
+      questions: {
+        digit: {
+          type: "choice",
+          instructions: INSTRUCTIONS,
+          criteria: criteria,
+        },
+      },
+    };
+  } else {
+    // validateInput が弾いているので通常ここには来ない。来ても 500 にせず 400 で返す(S2)。
+    return errorResponse("askはdigitかcellである必要があります", 400, rate.headers);
+  }
 
   var result;
   try {
@@ -568,9 +693,11 @@ async function handleJudge(request, env) {
     );
   }
 
-  var extracted = extractAnswer(result);
+  var extracted = extractAnswer(result, ask);
   var badAnswer =
-    extracted.error !== undefined ? extracted.error : validateAnswer(extracted.answer);
+    extracted.error !== undefined
+      ? extracted.error
+      : validateAnswer(extracted.answer, expectedKeys, ANSWER_MESSAGES[ask]);
   if (badAnswer !== null) {
     // AI.run が undefined を解決したとき、そのままだと raw のキーごと JSON から消える。
     // デバッグ用に「何が返ってきたか」を必ず残したいので null に寄せる。
@@ -587,19 +714,21 @@ async function handleJudge(request, env) {
   }
 
   var answer = extracted.answer;
-  return jsonResponse(
-    {
-      probabilities: answer.probabilities,
-      choice: answer.choice,
-      // Jev 独自の確信度。probabilities[choice] とは一致しない(docs/SPEC.md 4章)。
-      confidence: answer.confidence,
-      // env.AI.run に渡したペイロードそのもの(Issue #34)。フロントの「Jev に送った
-      // プロンプト」パネルがそのまま表示する。別のオブジェクトを組み立て直さない。
-      request: payload,
-    },
-    200,
-    rate.headers
-  );
+  var responseBody = {
+    probabilities: answer.probabilities,
+    choice: answer.choice,
+    // Jev 独自の確信度。probabilities[choice] とは一致しない(docs/SPEC.md 4章)。
+    confidence: answer.confidence,
+    // env.AI.run に渡したペイロードそのもの(Issue #34)。フロントの「Jev に送った
+    // プロンプト」パネルがそのまま表示する。別のオブジェクトを組み立て直さない。
+    request: payload,
+  };
+  if (ask === ASK_CELL) {
+    // choice("r0c2")を座標に分解して添える(フロントが毎回パースしなくて済むように)。
+    var chosen = cellsByKey[answer.choice];
+    responseBody.cell = { row: chosen.row, col: chosen.col };
+  }
+  return jsonResponse(responseBody, 200, rate.headers);
 }
 
 // GET / に付けるセキュリティヘッダー(docs/DESIGN.md 7章)。CORS ヘッダーは付けない。

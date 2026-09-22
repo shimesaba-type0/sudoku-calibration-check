@@ -5,13 +5,18 @@ import assert from "node:assert/strict";
 import worker from "../src/index.js";
 import {
   GIVEN,
+  ANSWER_KEY,
   makeEnv,
   makeRateLimiter,
   judgeRequest,
   validBody,
+  validCellBody,
   jevResponse,
   bareJevResponse,
   jevAnswer,
+  jevCellAnswer,
+  jevCellResponse,
+  emptyCellKeys,
 } from "./helpers.js";
 
 async function judge(body, envOptions) {
@@ -436,4 +441,318 @@ test("余計なキーが付いた answers.digit は 200(絞って返す)", async
   assert.equal(res.status, 200);
   var body = await res.json();
   assert.deepEqual(Object.keys(body).sort(), ["choice", "confidence", "probabilities", "request"]);
+});
+
+// --- ask:"cell"(マス選び。Issue #38) ---------------------------------------
+
+// 期待値は src/index.js の CELL_NOTE / CELL_INSTRUCTIONS を **意図的に複製** している
+// (不変条件1のテストと同じ流儀。文面をこっそり変えたら落ちるように実装から import しない)。
+var EXPECTED_CELL_NOTE =
+  "puzzle is a 9x9 Sudoku grid given as 9 strings of 9 characters each, " +
+  "top row first. A digit character is a cell that is already filled in; " +
+  "'.' is an empty cell. There is no target cell this time. Instead, the criteria " +
+  "list every empty cell of the grid, keyed as 'r<row>c<col>' with zero-based row " +
+  "and col indices (row 0 is the first string, col 0 is its first character). " +
+  "Standard Sudoku rules apply: every row, every column and every 3x3 box must " +
+  "contain each of the digits 1 to 9 exactly once. Some of the digits already " +
+  "placed may be wrong. Answer which of those empty cells is the easiest to " +
+  "determine, that is, the cell whose digit you can state with the most confidence.";
+
+var EXPECTED_CELL_INSTRUCTIONS =
+  "Which empty cell of this Sudoku grid can be filled in with the most certainty? " +
+  "Pick the cell whose digit you are most confident about.";
+
+// GIVEN の空マスのキー(行優先)。実装から import せずテスト側で作る。
+var GIVEN_CELL_KEYS = emptyCellKeys(GIVEN);
+
+/** ask:"cell" を投げ、モック AI には criteria と一致する probabilities を返させる。 */
+async function judgeCell(body, choice) {
+  var target = body || validCellBody();
+  var keys = emptyCellKeys(target.puzzle || GIVEN);
+  var env = makeEnv({ aiResult: jevCellResponse(keys, choice) });
+  var res = await worker.fetch(judgeRequest(target), env);
+  var payload = await res.json();
+  return { res: res, body: payload, env: env, keys: keys };
+}
+
+test('ask:"cell": payload は target 無し・CELL_NOTE・空マスの criteria', async () => {
+  var out = await judgeCell();
+  assert.equal(out.res.status, 200);
+  assert.equal(out.env.aiCalls.length, 1);
+  assert.equal(out.env.aiCalls[0].model, "typesafe/jev");
+
+  var payload = out.env.aiCalls[0].payload;
+  assert.deepEqual(Object.keys(payload).sort(), ["questions", "state"]);
+  // state に target は無い(盤面全体から選ばせる質問なので対象マスが存在しない)
+  assert.deepEqual(Object.keys(payload.state).sort(), ["note", "puzzle"]);
+  assert.equal("target" in payload.state, false);
+  assert.deepEqual(payload.state.puzzle, GIVEN);
+  assert.equal(payload.state.note, EXPECTED_CELL_NOTE);
+
+  // questions は cell ひとつだけ(digit は出てこない)
+  assert.deepEqual(Object.keys(payload.questions), ["cell"]);
+  assert.deepEqual(Object.keys(payload.questions.cell).sort(), [
+    "criteria",
+    "instructions",
+    "type",
+  ]);
+  assert.equal(payload.questions.cell.type, "choice");
+  assert.equal(payload.questions.cell.instructions, EXPECTED_CELL_INSTRUCTIONS);
+
+  // criteria のキーは空マスの一覧で、行優先の順
+  assert.deepEqual(Object.keys(payload.questions.cell.criteria), GIVEN_CELL_KEYS);
+  assert.equal(GIVEN_CELL_KEYS.length, 51, "固定問題の空マスは51個");
+  assert.equal(payload.questions.cell.criteria.r0c2, "row 0, column 2 (zero-based)");
+  assert.equal(payload.questions.cell.criteria.r8c6, "row 8, column 6 (zero-based)");
+  assert.equal(payload.questions.cell.criteria.r0c0, undefined, "埋まっているマスは候補に入れない");
+});
+
+test('ask:"cell": 埋まっているマスは criteria に入らない(推測入りの盤面)', async () => {
+  var guessed = GIVEN.slice();
+  guessed[0] = "531175111"; // 1行目は全部埋まった状態
+  var out = await judgeCell(validCellBody({ puzzle: guessed }));
+  assert.equal(out.res.status, 200);
+  var keys = Object.keys(out.env.aiCalls[0].payload.questions.cell.criteria);
+  assert.deepEqual(keys, emptyCellKeys(guessed));
+  for (var i = 0; i < keys.length; i++) {
+    assert.ok(!keys[i].startsWith("r0c"), "埋まっている1行目のマスが候補に入っている: " + keys[i]);
+  }
+});
+
+test('ask:"cell": 200 の形(probabilities / choice / confidence / request / cell)', async () => {
+  var out = await judgeCell(undefined, "r3c5");
+  assert.equal(out.res.status, 200);
+  assert.equal(out.res.headers.get("content-type"), "application/json; charset=utf-8");
+  assert.deepEqual(Object.keys(out.body).sort(), [
+    "cell",
+    "choice",
+    "confidence",
+    "probabilities",
+    "request",
+  ]);
+  assert.equal(out.body.choice, "r3c5");
+  // choice を座標に分解したものが cell(フロントが毎回パースしなくて済むように)
+  assert.deepStrictEqual(out.body.cell, { row: 3, col: 5 });
+  assert.equal(out.body.confidence, 0.42);
+  assert.deepEqual(Object.keys(out.body.probabilities), GIVEN_CELL_KEYS);
+  // request は env.AI.run に渡したペイロードそのもの(Issue #34)
+  assert.deepStrictEqual(out.body.request, out.env.aiCalls[0].payload);
+});
+
+test('ask:"cell": choice がどの候補でも cell がその座標になる', async () => {
+  var cases = ["r0c2", "r8c6", "r0c8", "r8c0"];
+  for (var i = 0; i < cases.length; i++) {
+    var out = await judgeCell(undefined, cases[i]);
+    assert.equal(out.res.status, 200, cases[i]);
+    assert.equal(out.body.choice, cases[i]);
+    assert.deepStrictEqual(out.body.cell, {
+      row: Number(cases[i][1]),
+      col: Number(cases[i][3]),
+    });
+  }
+});
+
+test('ask:"cell": payload に正解表の行が一切含まれない(不変条件1)', async () => {
+  var out = await judgeCell();
+  var serialized = JSON.stringify(out.env.aiCalls[0].payload);
+  for (var i = 0; i < ANSWER_KEY.length; i++) {
+    assert.ok(
+      !serialized.includes(ANSWER_KEY[i]),
+      "payload に正解表の " + (i + 1) + " 行目が含まれている: " + ANSWER_KEY[i]
+    );
+  }
+});
+
+test('ask:"digit" を明示しても省略時とまったく同じ(従来どおり)', async () => {
+  var omitted = await judge(validBody());
+  var explicit = await judge(validBody({ ask: "digit" }));
+  assert.equal(explicit.res.status, 200);
+  assert.deepStrictEqual(explicit.env.aiCalls[0].payload, omitted.env.aiCalls[0].payload);
+  assert.deepEqual(Object.keys(explicit.body).sort(), [
+    "choice",
+    "confidence",
+    "probabilities",
+    "request",
+  ]);
+  assert.equal("cell" in explicit.body, false, "digit の応答に cell は付けない");
+});
+
+test("400: ask が digit / cell / 省略 のいずれでもない", async () => {
+  var bad = ["cells", "digits", "", "DIGIT", "Cell", null, 1, true, {}, ["cell"]];
+  for (var i = 0; i < bad.length; i++) {
+    await expect400("ask=" + JSON.stringify(bad[i]), validBody({ ask: bad[i] }));
+  }
+});
+
+test('400: ask:"cell" に target が付いている', async () => {
+  await expect400("target 付き", { puzzle: GIVEN.slice(), ask: "cell", target: { row: 0, col: 2 } });
+  await expect400("target が null", { puzzle: GIVEN.slice(), ask: "cell", target: null });
+  await expect400("target が空オブジェクト", { puzzle: GIVEN.slice(), ask: "cell", target: {} });
+});
+
+test('400: ask:"cell" で空マスが1つも無い(全部埋まった盤面)', async () => {
+  // ANSWER_KEY は81マスすべて埋まった盤面。聞くものが無いので 400。
+  await expect400("全部埋まっている", { puzzle: ANSWER_KEY.slice(), ask: "cell" });
+});
+
+test('400: ask:"cell" でも埋まっているマスが17個未満なら弾く', async () => {
+  await expect400("16個", { puzzle: filledPuzzle(16), ask: "cell" });
+  await expect400("0個(全部空)", { puzzle: filledPuzzle(0), ask: "cell" });
+});
+
+test('400: ask:"cell" でも puzzle の形式は従来どおり見る', async () => {
+  await expect400("puzzle 欠落", { ask: "cell" });
+  await expect400("8行", { puzzle: GIVEN.slice(0, 8), ask: "cell" });
+  var letter = GIVEN.slice();
+  letter[2] = ".98..x.6.";
+  await expect400("英字を含む行", { puzzle: letter, ask: "cell" });
+});
+
+test('200: ask:"cell" で埋まっているマスが17個ちょうど', async () => {
+  var out = await judgeCell(validCellBody({ puzzle: filledPuzzle(17) }));
+  assert.equal(out.res.status, 200);
+  assert.equal(out.env.aiCalls.length, 1);
+  assert.equal(Object.keys(out.env.aiCalls[0].payload.questions.cell.criteria).length, 81 - 17);
+});
+
+test('200: ask:"cell" で空マスが1個(criteria 1件)でも動く', async () => {
+  // 正解表の 1 マスだけを空にした盤面(残り 80 マス埋まり)。criteria / probabilities は 1 キー。
+  var puzzle = ANSWER_KEY.slice();
+  puzzle[4] = puzzle[4].slice(0, 4) + "." + puzzle[4].slice(5);
+  var out = await judgeCell(validCellBody({ puzzle: puzzle }));
+  assert.equal(out.res.status, 200);
+  assert.deepEqual(out.keys, ["r4c4"]);
+  assert.deepEqual(Object.keys(out.env.aiCalls[0].payload.questions.cell.criteria), ["r4c4"]);
+  assert.deepEqual(Object.keys(out.body.probabilities), ["r4c4"]);
+  assert.equal(out.body.choice, "r4c4");
+  assert.deepEqual(out.body.cell, { row: 4, col: 4 });
+});
+
+test('400: ask:"cell" の puzzle 不正の文言は target に触れない(digit の文言は従来どおり)', async () => {
+  var env = makeEnv();
+  var res = await worker.fetch(judgeRequest({ ask: "cell" }), env);
+  assert.equal(res.status, 400);
+  assert.equal((await res.json()).error, "puzzle(9行の配列)が必要です");
+  var res2 = await worker.fetch(judgeRequest({ ask: "digit" }), env);
+  assert.equal(res2.status, 400);
+  assert.equal((await res2.json()).error, "puzzle(9行の配列)とtarget({row,col})が必要です");
+  assert.equal(env.aiCalls.length, 0);
+});
+
+test('502: ask:"cell" なのに answers.cell が無い', async () => {
+  var shapes = [
+    jevResponse(), // answers.digit しか無い(digit 用の応答が返ってきた)
+    { state: "Completed", result: { model: "jev-1.13.0", answers: {} } },
+    { state: "Completed", result: { model: "jev-1.13.0", answers: { other: { choice: "r0c2" } } } },
+    { model: "jev-1.13.0", answers: {} },
+  ];
+  for (var i = 0; i < shapes.length; i++) {
+    var env = makeEnv({ aiResult: shapes[i] });
+    var res = await worker.fetch(judgeRequest(validCellBody()), env);
+    assert.equal(res.status, 502, "shape #" + i + ": 502 を期待したが " + res.status);
+    var body = await res.json();
+    assert.equal(body.error, "AIの応答が予期しない形式です");
+    assert.ok("raw" in body, "shape #" + i + ": raw が無い");
+    assert.deepStrictEqual(body.request, env.aiCalls[0].payload);
+  }
+});
+
+/** GIVEN の空マスに対する正常な answers.cell を作り、差し替えて返す。 */
+function withCell(cell) {
+  var response = jevCellResponse(GIVEN_CELL_KEYS);
+  response.result.answers.cell = cell;
+  return response;
+}
+
+test('502: ask:"cell" で probabilities のキーが criteria と一致しない', async () => {
+  var good = jevCellAnswer(GIVEN_CELL_KEYS);
+
+  var extra = jevCellAnswer(GIVEN_CELL_KEYS);
+  extra.probabilities.r0c0 = 0.1; // 埋まっているマス(候補外)が増えている
+
+  var missing = jevCellAnswer(GIVEN_CELL_KEYS);
+  delete missing.probabilities[GIVEN_CELL_KEYS[GIVEN_CELL_KEYS.length - 1]];
+
+  var renamed = jevCellAnswer(GIVEN_CELL_KEYS);
+  renamed.probabilities["0-2"] = renamed.probabilities.r0c2; // 個数は同じだがキーが違う
+  delete renamed.probabilities.r0c2;
+
+  var digits = jevCellAnswer(GIVEN_CELL_KEYS);
+  digits.probabilities = { 1: 0.1, 2: 0.1, 3: 0.1, 4: 0.1, 5: 0.1, 6: 0.1, 7: 0.1, 8: 0.1, 9: 0.2 };
+
+  var cases = {
+    "候補外のキーが増えている": extra,
+    "キーが1つ欠けている": missing,
+    "キー名が違う(個数は同じ)": renamed,
+    "1〜9 のキーになっている": digits,
+  };
+  for (var label in cases) {
+    var env = makeEnv({ aiResult: withCell(cases[label]) });
+    var res = await worker.fetch(judgeRequest(validCellBody()), env);
+    assert.equal(res.status, 502, label + ": 502 を期待したが " + res.status);
+    var body = await res.json();
+    assert.equal(body.error, "AIの応答のprobabilitiesが候補マスのキーと一致していません");
+    assert.ok("raw" in body, label + ": raw が無い");
+    assert.deepStrictEqual(body.request, env.aiCalls[0].payload);
+  }
+
+  // 参考: 手を加えていない good はちゃんと 200 になる(上の 502 がキー以外の理由でないこと)
+  var okEnv = makeEnv({ aiResult: withCell(good) });
+  var okRes = await worker.fetch(judgeRequest(validCellBody()), okEnv);
+  assert.equal(okRes.status, 200);
+});
+
+test('502: ask:"cell" で choice が criteria に無い', async () => {
+  var cases = {
+    "埋まっているマスを選んだ": "r0c0",
+    "範囲外のキー": "r9c9",
+    "形式が違う": "0-2",
+    "数字を返した": "4",
+    "文字列でない": 4,
+  };
+  for (var label in cases) {
+    var answer = jevCellAnswer(GIVEN_CELL_KEYS);
+    answer.choice = cases[label];
+    var env = makeEnv({ aiResult: withCell(answer) });
+    var res = await worker.fetch(judgeRequest(validCellBody()), env);
+    assert.equal(res.status, 502, label + ": 502 を期待したが " + res.status);
+    var body = await res.json();
+    assert.equal(body.error, "AIの応答のchoiceが候補マスのいずれかではありません");
+    assert.ok("raw" in body, label + ": raw が無い");
+  }
+});
+
+test('502: ask:"cell" の probabilities の値 / confidence が数値でない', async () => {
+  var badValue = jevCellAnswer(GIVEN_CELL_KEYS);
+  badValue.probabilities.r0c2 = "0.1";
+  var env = makeEnv({ aiResult: withCell(badValue) });
+  var res = await worker.fetch(judgeRequest(validCellBody()), env);
+  assert.equal(res.status, 502);
+  assert.equal((await res.json()).error, "AIの応答のprobabilitiesに数値でない値が含まれています");
+
+  var nan = jevCellAnswer(GIVEN_CELL_KEYS);
+  nan.probabilities.r0c2 = NaN;
+  var env2 = makeEnv({ aiResult: withCell(nan) });
+  assert.equal((await worker.fetch(judgeRequest(validCellBody()), env2)).status, 502);
+
+  var noConf = jevCellAnswer(GIVEN_CELL_KEYS);
+  delete noConf.confidence;
+  var env3 = makeEnv({ aiResult: withCell(noConf) });
+  var res3 = await worker.fetch(judgeRequest(validCellBody()), env3);
+  assert.equal(res3.status, 502);
+  assert.equal((await res3.json()).error, "AIの応答のconfidenceが数値ではありません");
+});
+
+test('ask:"cell" でもレート制限は1呼び出し=1カウント(digit と同じ)', async () => {
+  var limiter = makeRateLimiter();
+  var env = makeEnv({ limiter: limiter, aiResult: jevCellResponse(GIVEN_CELL_KEYS) });
+  var res = await worker.fetch(judgeRequest(validCellBody()), env);
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("X-RateLimit-Remaining-IP"), "29");
+  assert.equal(res.headers.get("X-RateLimit-Remaining-Global"), "499");
+  // increment はグローバルと IP で1回ずつ(digit と同じ回数)
+  var increments = limiter.calls.filter(function (call) {
+    return call.op === "increment";
+  });
+  assert.equal(increments.length, 2);
 });

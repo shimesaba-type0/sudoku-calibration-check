@@ -62,6 +62,51 @@ export function jevResponse() {
   };
 }
 
+/**
+ * 盤面の空マス(".")のキー("r{row}c{col}")を行優先で列挙する。
+ * src/index.js の `emptyCells` を **意図的に複製** したもの(実装から import しない)。
+ */
+export function emptyCellKeys(puzzle) {
+  var keys = [];
+  for (var r = 0; r < 9; r++) {
+    for (var c = 0; c < 9; c++) {
+      if (puzzle[r][c] === ".") keys.push("r" + r + "c" + c);
+    }
+  }
+  return keys;
+}
+
+/**
+ * ask:"cell" 用の `answers.cell`(Issue #38)。`probabilities` のキーは criteria の
+ * キー集合とちょうど一致させる。`confidence` は digit と同じく probabilities[choice] とは
+ * 別の値にしてある。
+ */
+export function jevCellAnswer(keys, choice) {
+  var probabilities = {};
+  for (var i = 0; i < keys.length; i++) {
+    probabilities[keys[i]] = Number((1 / keys.length).toFixed(6));
+  }
+  return {
+    type: "choice",
+    choice: choice === undefined ? keys[0] : choice,
+    probabilities: probabilities,
+    confidence: 0.42,
+  };
+}
+
+/** ask:"cell" のラッパー付きレスポンス(docs/DESIGN.md 3.4 と同じ形)。 */
+export function jevCellResponse(keys, choice) {
+  return {
+    state: "Completed",
+    result: {
+      model: "jev-1.13.0",
+      answers: { cell: jevCellAnswer(keys, choice) },
+      usage: { input_tokens: 700, output_tokens: 90 },
+    },
+    gatewayMetadata: { keySource: "Unified" },
+  };
+}
+
 // ラッパーの無い素の形式。Cloudflare が将来ゲートウェイを外しても動くことの確認に使う。
 export function bareJevResponse() {
   return {
@@ -210,6 +255,15 @@ export function makeEnv(options) {
 /** 既定の有効な盤面(GIVEN そのまま)と対象マス。 */
 export function validBody(overrides) {
   var body = { puzzle: GIVEN.slice(), target: { row: 0, col: 2 } };
+  if (overrides) {
+    for (var key in overrides) body[key] = overrides[key];
+  }
+  return body;
+}
+
+/** ask:"cell"(マス選び)の既定の有効なボディ。target は付けない。 */
+export function validCellBody(overrides) {
+  var body = { puzzle: GIVEN.slice(), ask: "cell" };
   if (overrides) {
     for (var key in overrides) body[key] = overrides[key];
   }
