@@ -788,12 +788,12 @@ test("「新しい問題」の後に run() すると、新しい GIVEN の空マ
 var RECORDS_STORAGE_KEY = "scc.records.v1";
 
 /**
- * loadRecords() は vm コンテキストの Array(別レルム)を返すので、
- * deepStrictEqual(=deepEqual) はプロトタイプ違いで空配列同士でも落ちる。
+ * loadRecords() は { ok, records } を返す(PR #25 レビュー指摘 should-fix 1)。
+ * records は vm コンテキストの Array(別レルム)なので deepStrictEqual は使わず、
  * 長さだけを見る。
  */
 function assertEmptyRecords(ctx, message) {
-  assert.equal(ctx.loadRecords().length, 0, message);
+  assert.equal(ctx.loadRecords().records.length, 0, message);
 }
 
 test("loadRecords/saveRecords/appendRecord: 素朴な往復", async () => {
@@ -801,25 +801,37 @@ test("loadRecords/saveRecords/appendRecord: 素朴な往復", async () => {
   assertEmptyRecords(ctx);
 
   ctx.appendRecord({ t: 1, p: "abc", r: 0, c: 0, round: 1, choice: "4", pc: 0.6, conf: 0.3, ok: true });
-  var records = ctx.loadRecords();
+  var loaded = ctx.loadRecords();
+  assert.equal(loaded.ok, true);
+  var records = loaded.records;
   assert.equal(records.length, 1);
   assert.equal(records[0].choice, "4");
   assert.equal(records[0].ok, true);
 });
 
-test("appendRecord: 5001件目で最古が捨てられ5000件のまま", { timeout: 30000 }, async () => {
+test("RECORDS_MAX は既定で5000", async () => {
   var ctx = runScript(await getPageHtml());
-  for (var i = 0; i < 5001; i++) {
-    ctx.appendRecord({ t: i, p: "p", r: 0, c: 0, round: 1, choice: "1", pc: 0.5, conf: 0.5, ok: true });
-  }
-  var records = ctx.loadRecords();
-  assert.equal(records.length, 5000, "上限5000件を超えている");
-  assert.equal(records[0].t, 1, "最古(t=0)が捨てられていない");
-  assert.equal(records[records.length - 1].t, 5000);
+  assert.equal(ctx.RECORDS_MAX, 5000);
 });
 
-test("loadRecords: localStorage が無い環境でも空配列を返す", async () => {
+test("appendRecord: 上限を超えたら最古が捨てられ、上限件数のまま保たれる", async () => {
+  // RECORDS_MAX(既定5000)そのものは上のテストで担保済み。ここは ctx.RECORDS_MAX を
+  // 5 に差し替えて境界だけを検証する(5,001件のループを回すと12秒近くかかっていた。
+  // PR #25 レビュー指摘 should-fix 3)。
+  var ctx = runScript(await getPageHtml());
+  ctx.RECORDS_MAX = 5;
+  for (var i = 1; i <= 6; i++) {
+    ctx.appendRecord({ t: i, p: "p", r: 0, c: 0, round: 1, choice: "1", pc: 0.5, conf: 0.5, ok: true });
+  }
+  var records = ctx.loadRecords().records;
+  assert.equal(records.length, 5, "上限5件を超えている");
+  assert.equal(records[0].t, 2, "最古(t=1)が捨てられていない");
+  assert.equal(records[records.length - 1].t, 6);
+});
+
+test("loadRecords: localStorage が無い環境では ok:false・空配列を返す(appendRecordは保存せず捨てる)", async () => {
   var ctx = runScript(await getPageHtml(), { localStorage: undefined });
+  assert.equal(ctx.loadRecords().ok, false);
   assertEmptyRecords(ctx);
   // appendRecord / saveRecords も例外を出さない
   assert.doesNotThrow(function () {
@@ -828,19 +840,72 @@ test("loadRecords: localStorage が無い環境でも空配列を返す", async 
   assertEmptyRecords(ctx);
 });
 
-test("loadRecords: localStorage が例外を投げても空配列を返す", async () => {
+test("loadRecords: localStorage が例外を投げたら ok:false・空配列を返す(appendRecordは保存せず捨てる)", async () => {
   var ctx = runScript(await getPageHtml(), { localStorage: makeThrowingLocalStorage() });
+  assert.equal(ctx.loadRecords().ok, false);
   assertEmptyRecords(ctx);
   assert.doesNotThrow(function () {
     ctx.appendRecord({ t: 1, p: "x", r: 0, c: 0, round: 1, choice: "1", pc: 0.1, conf: 0.1, ok: false });
   });
 });
 
-test("loadRecords: 壊れたJSONが入っていても空配列を返す", async () => {
+test("loadRecords: 壊れたJSONが入っていても ok:true・空配列で作り直し、元の文字列を退避キーに残す", async () => {
   var storage = makeLocalStorage();
-  storage.setItem(RECORDS_STORAGE_KEY, "{not valid json");
+  var broken = "{not valid json";
+  storage.setItem(RECORDS_STORAGE_KEY, broken);
   var ctx = runScript(await getPageHtml(), { localStorage: storage });
-  assertEmptyRecords(ctx);
+  var loaded = ctx.loadRecords();
+  assert.equal(loaded.ok, true, "壊れたJSONは読み取り失敗ではなく、空で作り直してよい");
+  assert.equal(loaded.records.length, 0);
+  assert.equal(storage.getItem(RECORDS_STORAGE_KEY + ".broken"), broken, "壊れた元の文字列が退避キーに入っていない");
+});
+
+test("loadRecords: 配列でないJSON({\"a\":1})が入っていても空配列で作り直す", async () => {
+  var storage = makeLocalStorage();
+  storage.setItem(RECORDS_STORAGE_KEY, JSON.stringify({ a: 1 }));
+  var ctx = runScript(await getPageHtml(), { localStorage: storage });
+  var loaded = ctx.loadRecords();
+  assert.equal(loaded.ok, true);
+  assert.equal(loaded.records.length, 0);
+});
+
+test("appendRecord: 読み取りが失敗しているあいだは保存せず、既存の記録を全消ししない", async () => {
+  // 20件蓄積後に getItem が一時的に throw する状況を模す。バグ版は loadRecords() が
+  // 「読めなかった」を「空」と取り違え、[] + 1件で上書きして過去の記録を消していた
+  // (PR #25 レビュー指摘 should-fix 1。実測: 20件蓄積 → getItem が1回throw → 1件に減っていた)。
+  //
+  // runScript() は末尾で render() を自動実行するので、キャッシュが未確立の最初の
+  // getItem 呼び出しは render() 経由のもの(1回目)、続いて明示的に呼ぶ
+  // appendRecord() 内の loadRecords()(2回目)。この2回とも読み取り失敗を模したあと、
+  // 3回目以降は正常に読める状態にする。
+  var storage = makeLocalStorage();
+  var existing = [];
+  for (var i = 1; i <= 20; i++) {
+    existing.push({ t: i, p: "x", r: 0, c: 0, round: 1, choice: "1", pc: 0.5, conf: 0.5, ok: true });
+  }
+  storage.setItem(RECORDS_STORAGE_KEY, JSON.stringify(existing));
+
+  var originalGetItem = storage.getItem;
+  var callCount = 0;
+  var throwUntilCall = 2;
+  storage.getItem = function (key) {
+    callCount++;
+    if (callCount <= throwUntilCall) {
+      throw new Error("一時的な読み取り失敗を模す");
+    }
+    return originalGetItem.call(storage, key);
+  };
+
+  var ctx = runScript(await getPageHtml(), { localStorage: storage });
+  assert.ok(callCount >= 1, "初期描画で読み取りが試みられていない(前提が崩れている)");
+  // 読み取りが失敗している状態での appendRecord。保存せず黙って捨てるはず。
+  ctx.appendRecord({ t: 999, p: "y", r: 1, c: 1, round: 1, choice: "2", pc: 0.4, conf: 0.4, ok: false });
+
+  // 読み取りが復旧したあとは、20件がそのまま残っている(21件でも1件でもない)
+  var records = ctx.loadRecords().records;
+  assert.equal(records.length, 20, "読み取り失敗時に保存してしまい、過去の記録が消えた(または新しい1件だけになった)");
+  assert.equal(records[0].t, 1);
+  assert.equal(records[19].t, 20);
 });
 
 test(
@@ -867,7 +932,7 @@ test(
       return ctx.state.done === true;
     }, "1周での完了(全問正解)");
 
-    var records = ctx.loadRecords();
+    var records = ctx.loadRecords().records;
     assert.equal(records.length, 51, "判定した51マス分の記録がない");
 
     var expectedId = ctx.puzzleId();
@@ -917,31 +982,35 @@ test("純粋関数 binRecords: 境界(0.0→帯0 / 0.1→帯1 / 0.95・1.0→帯
   assert.equal(bins[2].rate, null);
 });
 
-test("純粋関数 binRecords: 数値でない/NaNの値を除外し、pc と conf を独立に集計する", async () => {
+test("純粋関数 binRecords: 数値でない/NaN/範囲外(0〜1超え)の値を除外し、pc と conf を独立に集計する", async () => {
   var ctx = runScript(await getPageHtml());
   var records = [
     { pc: 0.25, conf: 0.85, ok: true },
     { pc: "0.5", conf: 0.15, ok: true }, // pc が文字列 → pc集計から除外
     { pc: NaN, conf: 0.15, ok: false }, // pc が NaN → pc集計から除外
     { pc: 0.25, ok: true }, // conf が無い(undefined)→ conf集計から除外
+    { pc: 1.5, conf: 0.5, ok: true }, // pc が範囲外(>1)→ pc集計から除外。confは独立に集計される(nit)
+    { pc: -0.5, conf: 0.5, ok: true }, // pc が範囲外(<0)→ pc集計から除外。confは独立に集計される(nit)
   ];
 
   var pcBins = ctx.binRecords(records, "pc");
   var pcTotal = pcBins.reduce(function (sum, b) {
     return sum + b.n;
   }, 0);
-  assert.equal(pcTotal, 2, "数値でない/NaNのpcが除外されていない");
+  assert.equal(pcTotal, 2, "数値でない/NaN/範囲外のpcが除外されていない");
   assert.equal(pcBins[2].n, 2, "pc=0.25(帯2)の集計が合わない");
   assert.equal(pcBins[2].rate, 1);
+  assert.equal(pcBins[9].n, 0, "pc=1.5(範囲外)が帯9に紛れ込んでいる");
 
   var confBins = ctx.binRecords(records, "conf");
   var confTotal = confBins.reduce(function (sum, b) {
     return sum + b.n;
   }, 0);
-  assert.equal(confTotal, 3, "confが無い記録が除外されていない");
+  assert.equal(confTotal, 5, "confが無い記録の除外、またはpc範囲外でもconfが独立集計されることが崩れている");
   assert.equal(confBins[8].n, 1, "conf=0.85(帯8)の集計が合わない");
   assert.equal(confBins[1].n, 2, "conf=0.15(帯1)が2件、集計が合わない");
   assert.equal(confBins[1].rate, 0.5);
+  assert.equal(confBins[5].n, 2, "conf=0.5(帯5)が2件、集計が合わない(pcが範囲外でもconfは数えるはず)");
 });
 
 test("renderCalibration: 記録が無ければ0件/0%/0問、あれば件数・正解率・SVGが出る", async () => {
@@ -998,10 +1067,52 @@ test("clearRecords: confirmがtrueなら記録が0件になり、falseなら消�
   });
   ctxKeep.saveRecords([sampleRecord]);
   ctxKeep.clearRecords();
-  assert.equal(ctxKeep.loadRecords().length, 1, "confirmがfalseなのに削除された");
+  assert.equal(ctxKeep.loadRecords().records.length, 1, "confirmがfalseなのに削除された");
 
   var ctxClear = runScript(await getPageHtml()); // 既定の confirm は true を返す
   ctxClear.saveRecords([sampleRecord]);
   ctxClear.clearRecords();
-  assert.equal(ctxClear.loadRecords().length, 0, "confirmがtrueなのに削除されていない");
+  assert.equal(ctxClear.loadRecords().records.length, 0, "confirmがtrueなのに削除されていない");
+});
+
+test("renderCalibrationChart: 正解率0%でも件数>0の帯は1pxの台座を描く(n=0の帯と区別できる)", async () => {
+  var ctx = runScript(await getPageHtml());
+  var bins = ctx.binRecords([{ pc: 0.1, conf: 0.1, ok: false }], "pc");
+  assert.equal(bins[1].n, 1);
+  assert.equal(bins[1].rate, 0);
+
+  var html = ctx.renderCalibrationChart(bins, "test");
+  // rate=0 の帯が height="0" の矩形になると n=0(未記録)の帯と見分けがつかない(nit)。
+  assert.ok(!/height="0"/.test(html), "正解率0%の帯にheight=0の矩形が描かれている(1pxの台座になっていない)");
+  assert.ok(/height="1"/.test(html), "1pxの台座になっていない");
+});
+
+test("render(): 記録が蓄積済みでもrenderのたびにlocalStorageを読み直さない(キャッシュ、should-fix 2)", async () => {
+  var storage = makeLocalStorage();
+  var many = [];
+  for (var i = 0; i < 5000; i++) {
+    many.push({ t: i, p: "x", r: 0, c: 0, round: 1, choice: "1", pc: 0.5, conf: 0.5, ok: true });
+  }
+  storage.setItem(RECORDS_STORAGE_KEY, JSON.stringify(many));
+
+  var getItemCalls = 0;
+  var originalGetItem = storage.getItem;
+  storage.getItem = function (key) {
+    getItemCalls++;
+    return originalGetItem.call(storage, key);
+  };
+
+  var ctx = runScript(await getPageHtml(), { localStorage: storage });
+  ctx.render(); // 初回はキャッシュが無いので localStorage を読む
+  var callsAfterFirstRender = getItemCalls;
+  assert.ok(callsAfterFirstRender >= 1, "初回のrenderでlocalStorageを読んでいない");
+
+  ctx.render();
+  ctx.render();
+  ctx.render();
+  assert.equal(
+    getItemCalls,
+    callsAfterFirstRender,
+    "2回目以降のrenderでlocalStorage.getItemが呼ばれている(キャッシュされていない)"
+  );
 });

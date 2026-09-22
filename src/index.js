@@ -750,7 +750,7 @@ var PAGE_HTML = `<!doctype html>
 
   .calib-summary { font-size: 12px; color: var(--muted); margin: 0 0 12px; }
   .calib-charts { display: flex; flex-wrap: wrap; gap: 16px; }
-  .calib-chart { flex: 1 1 220px; min-width: 200px; }
+  .calib-chart { flex: 1 1 220px; min-width: 260px; }
   .calib-chart-title { font-size: 11px; color: var(--muted); margin: 0 0 6px; text-align: center; }
   .calib-chart svg { width: 100%; height: auto; display: block; }
   .calib-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
@@ -833,8 +833,8 @@ var PAGE_HTML = `<!doctype html>
       var rec = list[j];
       var v = rec ? rec[key] : undefined;
       if (typeof v !== "number" || !isFinite(v)) continue;
+      if (v < 0 || v > 1) continue; // 確率の範囲外(0〜1)は帯に押し込めず除外する
       var idx = Math.min(9, Math.floor(v * 10));
-      if (idx < 0) continue;
       bins[idx].n += 1;
       if (rec.ok) bins[idx].correct += 1;
     }
@@ -1110,9 +1110,13 @@ var PAGE_HTML = `<!doctype html>
   var MAX_ROUNDS = 15;
 
   // 集計ビュー(SPEC F1 拡張2、docs/DESIGN.md 4.2)。判定ごとの記録は state ではなく
-  // localStorage 由来。state に持たせず、render() のたびに loadRecords() で読み直す。
+  // localStorage(キー RECORDS_STORAGE_KEY)が正本。読み直しのコストを避けるため
+  // モジュールスコープに recordsCache を持ち、getRecords() が初回だけ localStorage を
+  // 読んで以後はそれを使い回す(PR #25 レビュー指摘 should-fix 2)。
   var RECORDS_STORAGE_KEY = "scc.records.v1";
+  var RECORDS_BROKEN_STORAGE_KEY = RECORDS_STORAGE_KEY + ".broken";
   var RECORDS_MAX = 5000;
+  var recordsCache = null; // null = まだ一度も読み込んでいない。読み込み後は配列(localStorageの鏡)
 
   var state = {
     round: 1,
@@ -1167,19 +1171,49 @@ var PAGE_HTML = `<!doctype html>
   // localStorage が無い・例外を投げる・壊れた JSON が入っている、いずれの場合も
   // 例外を外に出さない(呼び出し側の commitFocused / run() を止めないため)。
   // -------------------------------------------------------------------
-  function loadRecords() {
+
+  // 壊れた(パースできない・配列でない)値を退避キーに逃がしてから空で作り直す。
+  // 退避そのものに失敗しても(容量超過等)、元々壊れていたデータなので諦める。
+  function stashBrokenRecords(raw) {
     try {
-      if (typeof localStorage === "undefined" || !localStorage) return [];
-      var raw = localStorage.getItem(RECORDS_STORAGE_KEY);
-      if (!raw) return [];
-      var parsed = JSON.parse(raw);
-      return Array.isArray(parsed) ? parsed : [];
+      if (typeof localStorage === "undefined" || !localStorage) return;
+      localStorage.setItem(RECORDS_BROKEN_STORAGE_KEY, raw);
     } catch (e) {
-      return [];
+      // 退避も失敗したら諦める
     }
   }
 
+  // localStorage から読む。戻り値は { ok, records }。
+  // - ok:true, records:[]  … 何も保存されていない、または壊れていたので空で作り直した(正常系)
+  // - ok:false, records:[] … localStorage が無い、または getItem が例外を投げた
+  //   (= 「読めなかった」。中身が本当に空なのか分からないので、呼び出し側はこれを
+  //   「空だった」と混同して上書き保存してはいけない。PR #25 レビュー指摘 should-fix 1)
+  function loadRecords() {
+    try {
+      if (typeof localStorage === "undefined" || !localStorage) return { ok: false, records: [] };
+      var raw = localStorage.getItem(RECORDS_STORAGE_KEY);
+      if (!raw) return { ok: true, records: [] };
+      var parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (parseErr) {
+        stashBrokenRecords(raw);
+        return { ok: true, records: [] };
+      }
+      if (!Array.isArray(parsed)) {
+        stashBrokenRecords(raw);
+        return { ok: true, records: [] };
+      }
+      return { ok: true, records: parsed };
+    } catch (e) {
+      // getItem 自体が例外を投げた場合。中身が読めていないので「読めなかった」として扱う。
+      return { ok: false, records: [] };
+    }
+  }
+
+  // records を正本(localStorage)に書き込み、キャッシュも同期する。
   function saveRecords(records) {
+    recordsCache = records;
     try {
       if (typeof localStorage === "undefined" || !localStorage) return;
       localStorage.setItem(RECORDS_STORAGE_KEY, JSON.stringify(records));
@@ -1189,14 +1223,31 @@ var PAGE_HTML = `<!doctype html>
     }
   }
 
+  // render() / exportRecords() が読む窓口。初回だけ localStorage を読み、以後は
+  // recordsCache を使い回す(PR #25 レビュー指摘 should-fix 2)。読み込みに失敗した
+  // (ok:false)ときはキャッシュを作らず、その場限りの空配列を返す(次回また読み直しを試みる)。
+  function getRecords() {
+    if (recordsCache !== null) return recordsCache;
+    var loaded = loadRecords();
+    if (loaded.ok) recordsCache = loaded.records;
+    return loaded.records;
+  }
+
   // 1件追記する。上限 RECORDS_MAX を超えたら古いものから捨てる。
+  // キャッシュが無ければ初回だけ localStorage を読むが、読めなかった(ok:false)
+  // ときは中身が分からないまま upsert すると全消しになりかねないので、
+  // 何もせず黙って捨てる(このレコード1件だけを諦める。PR #25 レビュー指摘 should-fix 1)。
   function appendRecord(rec) {
-    var records = loadRecords();
-    records.push(rec);
-    if (records.length > RECORDS_MAX) {
-      records = records.slice(records.length - RECORDS_MAX);
+    if (recordsCache === null) {
+      var loaded = loadRecords();
+      if (!loaded.ok) return;
+      recordsCache = loaded.records;
     }
-    saveRecords(records);
+    recordsCache.push(rec);
+    if (recordsCache.length > RECORDS_MAX) {
+      recordsCache = recordsCache.slice(recordsCache.length - RECORDS_MAX);
+    }
+    saveRecords(recordsCache);
   }
 
   // -------------------------------------------------------------------
@@ -1630,7 +1681,9 @@ var PAGE_HTML = `<!doctype html>
     for (var i = 0; i < bins.length; i++) {
       var bin = bins[i];
       if (bin.n === 0) continue;
-      var barH = bin.rate * plotH;
+      // 正解率0%でも、件数>0の帯は高さ0だと n=0(未記録)の帯と見分けがつかないため、
+      // 最低1pxの台座を描く(PR #25 レビュー指摘 nit)。
+      var barH = Math.max(bin.rate * plotH, 1);
       var bx = xAt(i) + barGap / 2;
       var by = padTop + plotH - barH;
       svg += "<rect x=\\"" + bx + "\\" y=\\"" + by + "\\" width=\\"" + barWidth + "\\" height=\\"" + barH +
@@ -1647,10 +1700,29 @@ var PAGE_HTML = `<!doctype html>
     return "<div class=\\"calib-chart\\"><p class=\\"calib-chart-title\\">" + escapeHtml(titleText) + "</p>" + svg + "</div>";
   }
 
+  // binRecords(pc/conf それぞれ)の結果を、件数と最終追記時刻が前回と同じなら
+  // 使い回す軽いキャッシュ(PR #25 レビュー指摘 should-fix 2)。records は毎回
+  // getRecords() から渡ってくるので、記録が増減・追記されていなければ計算し直さない。
+  var calibBinCache = null; // { n, lastT, pcBins, confBins }
+  function computeCalibBins(records) {
+    var n = records.length;
+    var lastT = n > 0 ? records[n - 1].t : null;
+    if (calibBinCache && calibBinCache.n === n && calibBinCache.lastT === lastT) {
+      return calibBinCache;
+    }
+    calibBinCache = {
+      n: n,
+      lastT: lastT,
+      pcBins: binRecords(records, "pc"),
+      confBins: binRecords(records, "conf")
+    };
+    return calibBinCache;
+  }
+
   // 集計パネル(SPEC F1 拡張2)。records は state ではなく localStorage 由来なので、
-  // render() のたびに loadRecords() で読み直す(上限5,000件なので毎回集計してよい)。
+  // getRecords()(初回だけ localStorage を読み、以後はキャッシュを使う)経由で読む。
   function renderCalibration() {
-    var records = loadRecords();
+    var records = getRecords();
     var total = records.length;
     var correctCount = 0;
     var puzzles = {};
@@ -1663,8 +1735,9 @@ var PAGE_HTML = `<!doctype html>
     var puzzleCount = Object.keys(puzzles).length;
     var pct = total === 0 ? 0 : Math.round((correctCount / total) * 100);
 
-    var pcBins = binRecords(records, "pc");
-    var confBins = binRecords(records, "conf");
+    var calibBins = computeCalibBins(records);
+    var pcBins = calibBins.pcBins;
+    var confBins = calibBins.confBins;
 
     return "<div id=\\"calibration-panel\\" class=\\"panel\\">" +
       "<p class=\\"panel-title\\">較正図</p>" +
@@ -1692,7 +1765,7 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function exportRecords() {
-    var payload = { version: 1, exported_at: new Date().toISOString(), records: loadRecords() };
+    var payload = { version: 1, exported_at: new Date().toISOString(), records: getRecords() };
     var blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     var url = URL.createObjectURL(blob);
     var a = document.createElement("a");

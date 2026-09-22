@@ -237,9 +237,18 @@ var runToken = 0;               // 実行の世代。reset() / showError() で +
 **集計ビューの記録は `state` に持たない。** 判定結果の記録(SPEC F1 拡張2、Issue #6)は
 `state.values` のような「今の実行」の状態ではなく、複数の問題・複数回の実行をまたいで
 残る `localStorage`(キー `scc.records.v1`)が正本。`reset()` / `newPuzzle()` でも消えない
-(記録を消すのは「記録を消す」ボタン、すなわち `clearRecords()` のときだけ)。
-`render()` のたびに `loadRecords()` で読み直して集計するので(上限5,000件なので
-毎回集計してよい)、記録用に別の state フィールドは増やしていない。
+(記録を消すのは「記録を消す」ボタン、すなわち `clearRecords()` のときだけ)。**正本は
+引き続き `localStorage` だが、モジュールスコープの `recordsCache` にも読み込み結果を
+キャッシュとして持つ**(PR #25 レビュー指摘。以前は `render()` のたびに `loadRecords()`
+で全件 `JSON.parse` していたため、記録が数千件になると描画のたびに数msかかっていた)。
+`getRecords()` が初回だけ `localStorage` を読んでキャッシュを作り、以後の `render()` /
+`exportRecords()` はキャッシュを読む。`appendRecord()` もキャッシュへの追記で済ませ、
+`saveRecords()` の呼び出しでキャッシュと `localStorage` を同期する。詳細は 4.2 の
+`loadRecords` / `getRecords` / `appendRecord` を参照。
+
+同じマスの判定は、周ごとにスナップショット(埋まっているマスの文脈)が異なる独立した
+サンプルとして、正誤にかかわらずすべて記録・集計する(同一マスの重複除去や再判定分の
+除外はしない)。
 
 ### 4.2 関数と責務
 
@@ -268,10 +277,13 @@ var runToken = 0;               // 実行の世代。reset() / showError() で +
 | `buildCellStyle()` | マスの状態(given/pending/correct/incorrect + focused)からインラインstyle文字列を返す |
 | `escapeHtml(text)` | `innerHTML` に入れる前に `& < > " '` を実体参照にする |
 | `fnv1a32(text)` / `puzzleId()` | 集計ビュー(SPEC F1 拡張2)の問題ID用の簡易ハッシュ。32bit FNV-1a を8桁16進で返す。`puzzleId()` は `GIVEN` の9行を結合した文字列をハッシュ化する |
-| `loadRecords()` / `saveRecords(records)` / `appendRecord(rec)` | 判定記録の読み書き。`localStorage`(キー `scc.records.v1`)が無い・例外を投げる・壊れた JSON が入っている、いずれの場合も例外を外に出さず空配列扱いにする(判定ループを止めないため)。`appendRecord` は上限 `RECORDS_MAX`(5,000)を超えたら古いものから捨てる |
-| `binRecords(records, key)` | `records` を `key`(`"pc"` または `"conf"`)の値で10%刻み10帯に分ける純粋関数。帯は `Math.min(9, Math.floor(v * 10))`(`v=1.0` は最後の帯)。数値でない/有限でない値は除外。戻り値は長さ10の配列 `{ lo, hi, n, correct, rate }`(`rate` は `n===0` なら `null`) |
-| `renderCalibration()` / `renderCalibrationChart(bins, title)` | 集計パネル(見出し「較正図」)。`loadRecords()` を読み、合計件数・全体正解率・記録している問題数(`p` のユニーク数)を出したあと、`binRecords` で作った `pc` / `conf` 各10帯をインラインSVGの棒グラフ(対角線は理想の較正線)として横並びで描く。件数0の帯は棒を描かない。色は CSS 変数(`--accent` / `--muted` / `--border`)をそのまま使う |
-| `exportRecords()` | `loadRecords()` の内容を `{ version:1, exported_at, records }` として `Blob` + `<a download>` でダウンロードさせる。ファイル名 `sudoku-calibration-YYYYMMDD-HHMMSS.json`(ローカル時刻) |
+| `loadRecords()` | `localStorage`(キー `scc.records.v1`)から読む。戻り値は `{ ok, records }`。`ok:false` は「読めなかった」(`localStorage` が無い、または `getItem` が例外)ときだけで、`records` は空のまま呼び出し側に「保存してよい空」だと誤解させない。保存が無い・JSON が壊れている・配列でない、はいずれも `ok:true, records:[]`(壊れていた場合は元の文字列を退避キー `scc.records.v1.broken` に逃がしてから空で作り直す)。**`ok` を見ずに `records` だけ使わないこと**(PR #25 レビュー指摘 should-fix 1) |
+| `saveRecords(records)` | `records` を `localStorage` に書き込み、`recordsCache`(後述)も同時に同期する |
+| `getRecords()` | `render()` / `exportRecords()` が読む窓口。モジュールスコープの `recordsCache`(初期値 `null`)が無ければ `loadRecords()` で読んで(`ok:true` のときだけ)キャッシュを作り、以後はキャッシュをそのまま返す。読み直しのコストを避けるための追加(PR #25 レビュー指摘 should-fix 2。以前は `render()` のたびに全件 `JSON.parse` していた) |
+| `appendRecord(rec)` | 1件追記する。キャッシュが無ければ初回だけ `loadRecords()` を読むが、`ok:false`(読めなかった)なら **このレコードを黙って捨てて保存しない**(読めなかった状態を「空」と取り違えて上書きし、既存の記録を全消しにしないため。should-fix 1)。上限 `RECORDS_MAX`(既定 5,000。テストでは `ctx.RECORDS_MAX` を差し替えて境界だけ検証する)を超えたら古いものから捨てる |
+| `binRecords(records, key)` | `records` を `key`(`"pc"` または `"conf"`)の値で10%刻み10帯に分ける純粋関数。帯は `Math.min(9, Math.floor(v * 10))`(`v=1.0` は最後の帯)。数値でない/有限でない値、および 0〜1 の範囲外の値は除外。戻り値は長さ10の配列 `{ lo, hi, n, correct, rate }`(`rate` は `n===0` なら `null`) |
+| `renderCalibration()` / `renderCalibrationChart(bins, title)` | 集計パネル(見出し「較正図」)。`getRecords()` を読み、合計件数・全体正解率・記録している問題数(`p` のユニーク数)を出したあと、`binRecords` の結果(記録数と最終追記時刻が前回と同じなら再計算しない軽いキャッシュ付き)を `pc` / `conf` 各10帯のインラインSVGの棒グラフ(対角線は理想の較正線)として横並びで描く。件数0の帯は棒を描かない。件数>0だが正解率0%の帯は高さ1pxの台座を描き、件数0の帯と見分けられるようにする(should-fix 2 / nit)。色は CSS 変数(`--accent` / `--muted` / `--border`)をそのまま使う |
+| `exportRecords()` | `getRecords()` の内容を `{ version:1, exported_at, records }` として `Blob` + `<a download>` でダウンロードさせる。ファイル名 `sudoku-calibration-YYYYMMDD-HHMMSS.json`(ローカル時刻) |
 | `clearRecords()` | `confirm()` で確認したうえで `saveRecords([])` し、再描画する |
 
 ### 4.3 状態遷移(1マス)
@@ -427,11 +439,14 @@ new_sqlite_classes = ["RateLimitCounter"]
     - 「新しい問題」の後に `run()` すると、**新しい `GIVEN` の空マスだけを行優先の順で** `/api/judge` に問い合わせること(回数と座標の両方を見る。空マスの「数」は固定問題と同じ51になりうるため)
     - vm のコンテキストで作った配列は host とは別レルムなので、`deepStrictEqual` の前に host 側の配列へ移し替える(`hostRows`)
   - **集計ビュー**(`test/page.test.js`、Issue #6)。`runScript` の harness に `localStorage` / `confirm` / `Blob` / `URL` / `document.createElement` / `document.body` のモックを足してある(`makeLocalStorage()` は `Map` ベース、`makeThrowingLocalStorage()` は必ず例外を投げる)
-    - `binRecords`: 境界(`0.0`→帯0、`0.1`→帯1、`0.95`・`1.0`→帯9。`1.0` は最後の帯に入る)、帯ごとの `n`/`correct`/`rate`(`n===0` なら `rate=null`)の計算、数値でない/`NaN`の値の除外、`"pc"` と `"conf"` を独立に集計すること
-    - `appendRecord`: 5,001件追記すると最古(1件目)が捨てられ、5,000件のまま保たれること
-    - `loadRecords`: `localStorage` が無い・例外を投げる・壊れた JSON が入っている、いずれでも空配列を返し、その後の `appendRecord` / `run()` が例外を出さずに続くこと
+    - `binRecords`: 境界(`0.0`→帯0、`0.1`→帯1、`0.95`・`1.0`→帯9。`1.0` は最後の帯に入る)、帯ごとの `n`/`correct`/`rate`(`n===0` なら `rate=null`)の計算、数値でない/`NaN`/0〜1の範囲外(`1.5`・`-0.5`)の値の除外、`"pc"` と `"conf"` を独立に集計すること(pc が範囲外でも conf は数えること)
+    - `appendRecord`: 上限(`RECORDS_MAX` は既定5,000だが、テストでは `ctx.RECORDS_MAX = 5` のように vm コンテキストのプロパティとして差し替えて境界だけ検証する。既定値5,000であることは別途1行で確認する)を超えたら最古から捨てて上限件数のまま保たれること
+    - `loadRecords`: 戻り値が `{ ok, records }` であること。`localStorage` が無い・例外を投げる、いずれも `ok:false` で `records` は空配列。壊れた JSON・配列でない JSON(`{"a":1}`)は `ok:true` で空配列に作り直し、壊れたJSONは元の文字列を退避キー(`scc.records.v1.broken`)に残すこと。いずれの場合も `appendRecord` / `run()` が例外を出さずに続くこと
+    - `appendRecord`: 読み取りが失敗している(`loadRecords().ok === false`)あいだは **保存せず黙って捨てる**こと。読み取りが復旧したあとに既存の記録がそのまま残っていること(蓄積済みの記録を `[] + 1件` で上書きして全消しにしない。PR #25 レビュー指摘 should-fix 1。実測: 20件蓄積 → `getItem` が1回throw → 1件に減っていた)
     - `run()`(常に正解を返す `fetch` スタブ)で固定問題(51マス)を解かせ、記録が51件になること。各件が `p`(`puzzleId()` と一致)/ `pc`(`probabilities[choice]`)/ `conf`(Jevの`confidence`)/ `ok`(採点と一致)を持つこと
     - `renderCalibration`: 記録が無ければ0件/0%/0問と表示され、記録があれば合計件数・SVG(`<svg`)・エクスポート/消去ボタンが描画されること
-    - `exportRecords`: `Blob` に渡した JSON(`version`/`exported_at`/`records`)が `loadRecords()` の内容と一致し、`exported_at` が ISO 文字列であること。`<a>` が `appendChild` → `removeChild` で対になっていること(モックの `Blob` / `URL.createObjectURL` / `document.createElement`)
+    - `renderCalibrationChart`: 件数>0で正解率0%の帯は高さ1pxの台座を描き、`height="0"` の矩形にならない(n=0の帯と見分けられる)こと
+    - `render()`: 記録が蓄積済み(5,000件)でも、初回の `render()` 以降は `localStorage.getItem` を呼ばない(`recordsCache` で使い回すこと。should-fix 2)
+    - `exportRecords`: `Blob` に渡した JSON(`version`/`exported_at`/`records`)が `loadRecords().records` の内容と一致し、`exported_at` が ISO 文字列であること。`<a>` が `appendChild` → `removeChild` で対になっていること(モックの `Blob` / `URL.createObjectURL` / `document.createElement`)
     - `clearRecords`: `confirm()` が `true` を返すモックなら記録が0件になり、`false` を返すモックなら消えないこと
 - CI(`.github/workflows/ci.yml`)は push と PR で `npm ci` → `npm test` → `npm run check` を実行する。`check` は `wrangler deploy --dry-run` で、認証なしで動く
