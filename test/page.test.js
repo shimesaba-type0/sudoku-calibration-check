@@ -104,13 +104,28 @@ function makeThrowingLocalStorage() {
  *
  * ブラウザの代わりに与えるのは最低限:
  * - document: render() が触る #app、周回ログの querySelector(常に null)、
- *   エクスポート(`<a download>`)用の createElement / body.appendChild / removeChild
+ *   エクスポート(`<a download>`)用の createElement / body.appendChild / removeChild。
+ *   opts.document で丸ごと差し替えられる(比較シェルの iframe / querySelectorAll を
+ *   検査するテスト用。Issue #46 X4)
  * - setTimeout: 待ち時間を無視して即座に実行する(テストを速く・決定的にする)
  * - fetch: 呼び出しを記録するスタブ(既定では呼ばれたら失敗させる)
  * - localStorage: 既定では makeLocalStorage()(Map ベース)。opts.localStorage で
  *   差し替えられる(未指定 = undefined を渡すテストは「localStorage が無い環境」)
  * - confirm / Blob / URL: 「記録を消す」「JSONエクスポート」用の最小スタブ
+ * - location: 既定 { pathname: "/", search: "", origin: "https://example.com" }。
+ *   opts.location で差し替えられる(URL パラメータ・/compare のテスト用。Issue #46)
+ * - window: 既定は自分自身が parent の自己参照オブジェクト(トップレベルページを模す。
+ *   postStatus() が window.parent === window のとき何もしないため)。opts.window で
+ *   差し替えられる(embed の message 受信・比較シェルの status 受信のテスト用)
  */
+function defaultWindow() {
+  var win = {
+    addEventListener: function () {},
+    postMessage: function () {},
+  };
+  win.parent = win;
+  return win;
+}
 function runScript(html, options) {
   var opts = options || {};
   var app = { innerHTML: "" };
@@ -120,28 +135,34 @@ function runScript(html, options) {
   // 振る舞いテスト(#32 T3)がタイマーの発火タイミングそのものを制御したいときに使う)。
   // opts.setTimeout が無ければ従来どおり setImmediate で即座に(delay を無視して)実行する。
   var setTimeoutCalls = [];
-  var context = {
-    console: console,
-    document: {
-      getElementById: function (id) {
-        return id === "app" ? app : null;
+  var defaultDocument = {
+    getElementById: function (id) {
+      return id === "app" ? app : null;
+    },
+    querySelector: function () {
+      return null;
+    },
+    querySelectorAll: function () {
+      return [];
+    },
+    createElement: function (tag) {
+      return { tagName: tag, href: "", download: "", click: function () {} };
+    },
+    body: {
+      appendChild: function (el) {
+        bodyChildren.push(el);
       },
-      querySelector: function () {
-        return null;
-      },
-      createElement: function (tag) {
-        return { tagName: tag, href: "", download: "", click: function () {} };
-      },
-      body: {
-        appendChild: function (el) {
-          bodyChildren.push(el);
-        },
-        removeChild: function (el) {
-          var idx = bodyChildren.indexOf(el);
-          if (idx >= 0) bodyChildren.splice(idx, 1);
-        },
+      removeChild: function (el) {
+        var idx = bodyChildren.indexOf(el);
+        if (idx >= 0) bodyChildren.splice(idx, 1);
       },
     },
+  };
+  var context = {
+    console: console,
+    document: opts.document || defaultDocument,
+    location: opts.location || { pathname: "/", search: "", origin: "https://example.com" },
+    window: opts.window || defaultWindow(),
     setTimeout: function (fn, delay) {
       setTimeoutCalls.push(delay);
       if (opts.setTimeout) return opts.setTimeout(fn, delay);
@@ -173,7 +194,9 @@ function runScript(html, options) {
   };
   vm.createContext(context);
   vm.runInContext(extractScript(html), context);
-  context.appElement = app;
+  // opts.document があるとき(比較シェルのテストなど)は、その document 自身の
+  // getElementById("app") から appElement を取る(ローカル変数 app とは別物のため)。
+  context.appElement = context.document.getElementById("app") || app;
   context.bodyChildren = bodyChildren;
   context.createdBlobs = createdBlobs;
   context.setTimeoutCalls = setTimeoutCalls;
@@ -2893,4 +2916,269 @@ test("W10: 順番トグルは停止中もロックされ、reset() / newPuzzle()
   assert.equal(ctx.state.orderMode, "confidence", "newPuzzle() で順番が消えた");
   ctx.setOrderMode("scan");
   assert.equal(ctx.state.orderMode, "scan");
+});
+
+// -------------------------------------------------------------------
+// 比較モード(SPEC F1、docs/DESIGN.md 4章、Issue #46)。
+// X1/X2: 通常ページ(GET /)の URL パラメータ。X3: 埋め込みモード(embed=1)。
+// X4: 比較シェル(GET /compare)。
+// -------------------------------------------------------------------
+
+test("X1: URL パラメータ puzzle= で盤面と SOLUTION が差し替わる。非一意・不正な puzzle は無視される", async () => {
+  var html = await getPageHtml();
+
+  // ANSWER_KEY(既知の正解)の1マスだけ空けた、一意解を持つ盤面
+  var custom = ANSWER_KEY.slice();
+  custom[0] = "." + custom[0].slice(1);
+  var puzzleParam = custom.join("");
+  assert.equal(puzzleParam.length, 81);
+
+  var ctx = runScript(html, {
+    location: { pathname: "/", search: "?puzzle=" + puzzleParam, origin: "https://example.com" },
+  });
+  assert.deepEqual(hostRows(ctx.GIVEN), custom, "puzzle= の盤面が反映されていない");
+  assert.deepEqual(hostRows(ctx.SOLUTION), ANSWER_KEY, "SOLUTION がソルバーで求め直されていない");
+  assert.equal(ctx.TOTAL_EMPTY, 1, "TOTAL_EMPTY が空マス数(1)になっていない");
+
+  // 非一意(というよりここでは矛盾していて解無し = 0)な puzzle は無視され、固定問題のまま
+  var conflicting = "1".repeat(81);
+  var ctxConflict = runScript(html, {
+    location: { pathname: "/", search: "?puzzle=" + conflicting, origin: "https://example.com" },
+  });
+  assert.deepEqual(hostRows(ctxConflict.GIVEN), GIVEN, "矛盾した puzzle が採用されてしまった");
+  assert.equal(ctxConflict.TOTAL_EMPTY, GIVEN.join("").split("").filter(function (ch) { return ch === "."; }).length);
+
+  // 形式不正(長さが81でない)も無視される
+  var ctxShort = runScript(html, {
+    location: { pathname: "/", search: "?puzzle=123", origin: "https://example.com" },
+  });
+  assert.deepEqual(hostRows(ctxShort.GIVEN), GIVEN, "不正な形式の puzzle が採用されてしまった");
+});
+
+test("X2: URL パラメータ model/order/speed で初期 state が変わり、localStorage には書き戻されない", async () => {
+  var html = await getPageHtml();
+  var storage = makeLocalStorage();
+  var ctx = runScript(html, {
+    location: { pathname: "/", search: "?model=claude&order=confidence&speed=fast", origin: "https://example.com" },
+    localStorage: storage,
+  });
+  assert.equal(ctx.state.modelMode, "claude");
+  assert.equal(ctx.state.orderMode, "confidence");
+  assert.equal(ctx.state.speedMode, "fast");
+  // 通常ページの設定(scc.claude_settings.v1)は汚さない
+  assert.equal(storage.getItem("scc.claude_settings.v1"), null, "URL パラメータが localStorage に書き戻ってしまった");
+
+  // location.pathname === "/" 、search === "" の既定では今までどおり(jev/scan/slow)
+  var ctxDefault = runScript(html);
+  assert.equal(ctxDefault.state.modelMode, "jev");
+  assert.equal(ctxDefault.state.orderMode, "scan");
+  assert.equal(ctxDefault.state.speedMode, "slow");
+});
+
+test(
+  "X3: embed=1 はコントロール等を隠しグリッド/統計だけを描く。message の run/stop/reset/newPuzzle が効き、他オリジンは無視。status が window.parent.postMessage に飛ぶ",
+  { timeout: 10000 },
+  async () => {
+    var html = await getPageHtml();
+    var messageHandlers = [];
+    var parentCalls = [];
+    var fakeParent = {
+      postMessage: function (data, origin) {
+        parentCalls.push({ data: data, origin: origin });
+      },
+    };
+    var fakeWindow = {
+      parent: fakeParent,
+      addEventListener: function (type, handler) {
+        if (type === "message") messageHandlers.push(handler);
+      },
+      postMessage: function () {},
+    };
+    var fetchStub = async function (url, init) {
+      var body = JSON.parse(init.body);
+      var digit = ANSWER_KEY[body.target.row][body.target.col];
+      var probabilities = {};
+      for (var d = 1; d <= 9; d++) probabilities[String(d)] = String(d) === digit ? 0.61 : 0.0125;
+      return { ok: true, json: async function () { return { probabilities: probabilities, choice: digit, confidence: 0.31 }; } };
+    };
+    var ctx = runScript(html, {
+      location: { pathname: "/", search: "?embed=1", origin: "https://example.com" },
+      window: fakeWindow,
+      fetch: fetchStub,
+    });
+
+    var out = ctx.appElement.innerHTML;
+    assert.equal(out.indexOf('id="run-btn"'), -1, "実行ボタン(コントロール)が embed で描かれている");
+    assert.equal(out.indexOf('id="speed-toggle"'), -1, "速度トグルが embed で描かれている");
+    assert.equal(out.indexOf("較正図"), -1, "較正図が embed で描かれている");
+    assert.equal(out.indexOf("モデルに送ったプロンプト"), -1, "プロンプト枠が embed で描かれている");
+    assert.equal(out.indexOf("<h1>"), -1, "見出し(h1)が embed で描かれている");
+    assert.ok(out.indexOf('id="grid"') !== -1, "グリッドが描かれていない");
+    assert.ok(out.indexOf('id="stats"') !== -1, "統計カードが描かれていない");
+
+    assert.equal(messageHandlers.length, 1, "message リスナーが1つ登録されていない");
+
+    // 他オリジンのメッセージは無視される
+    messageHandlers[0]({ origin: "https://evil.example", source: fakeParent, data: { type: "run" } });
+    // 同一オリジンでも親以外のウィンドウからは無視(N2)
+    messageHandlers[0]({ origin: "https://example.com", source: {}, data: { type: "run" } });
+    assert.equal(ctx.state.running, false, "親以外からの run が効いてしまった");
+    // 未知の type や、隠したパネルの関数名は message から呼べない(N9)
+    ctx.appendRecord({ t: 1, p: "x", r: 0, c: 0, round: 1, choice: "1", pc: 0.5, conf: 0.5, ok: true });
+    messageHandlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "clearRecords" } });
+    messageHandlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "setSpeed", mode: "warp" } });
+    assert.equal(ctx.getRecords().length, 1, "未知の type で記録が消えた");
+    assert.equal(ctx.state.speedMode, "slow", "不正な setSpeed が通った");
+    assert.equal(ctx.state.running, false, "他オリジンの run が実行されてしまった");
+
+    // 同一オリジンの run は効く
+    messageHandlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "run" } });
+    assert.equal(ctx.state.running, true, "同一オリジンの run が効かない");
+
+    // render() のたびに status が親へ postMessage される(第2引数が origin)
+    assert.ok(parentCalls.length > 0, "status が postMessage されていない");
+    var lastRunning = parentCalls[parentCalls.length - 1];
+    assert.equal(lastRunning.data.type, "status");
+    assert.equal(lastRunning.origin, "https://example.com");
+    assert.equal(lastRunning.data.running, true);
+
+    // stop で running が false になる(in-flight の判定を打ち切る。既存の stop() の挙動)
+    messageHandlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "stop" } });
+    assert.equal(ctx.state.running, false, "同一オリジンの stop が効かない");
+
+    // reset で最初から
+    messageHandlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "reset" } });
+    assert.equal(Object.keys(ctx.state.values).length, 0, "reset で values が空にならない");
+    assert.equal(ctx.state.round, 1);
+
+    // newPuzzle(検証は puzzle= と同じ: 一意解のときだけ差し替わる)
+    var custom = ANSWER_KEY.slice();
+    custom[0] = "." + custom[0].slice(1);
+    messageHandlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "newPuzzle", puzzle: custom.join("") } });
+    assert.deepEqual(hostRows(ctx.GIVEN), custom, "message の newPuzzle が効いていない");
+
+    // 完了まで走らせて、done の status も飛ぶことを確認する
+    messageHandlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "run" } });
+    await waitFor(function () {
+      return ctx.state.done === true;
+    }, "X3: 完了待ち");
+    var lastDone = parentCalls[parentCalls.length - 1];
+    assert.equal(lastDone.data.done, true);
+  }
+);
+
+/**
+ * 比較シェル(GET /compare、Issue #46)のテスト用 document モック。
+ * 実ブラウザでは app.innerHTML への代入がその場で DOM を組み立て、以後
+ * querySelector(All) で見つけられる。この vm ハーネスにはパーサーが無いので、
+ * querySelectorAll(".compare-frame" 等) が呼ばれた最初の1回だけ、スタブ要素を
+ * 作って以後使い回す(renderCompareShell() は一度しか呼ばないため、これで足りる)。
+ * iframe のスタブは contentWindow.postMessage の呼び出しを記録する。
+ */
+function makeCompareDocument() {
+  var app = { innerHTML: "" };
+  var topbarEl = { innerHTML: "" };
+  var statusEls = [{ innerHTML: "" }, { innerHTML: "" }];
+  var frameEls = null;
+  function makeFrame() {
+    var calls = [];
+    return {
+      tagName: "iframe",
+      src: "",
+      contentWindow: {
+        postMessage: function (msg, origin) {
+          calls.push({ msg: msg, origin: origin });
+        },
+      },
+      postMessageCalls: calls,
+    };
+  }
+  return {
+    getElementById: function (id) {
+      return id === "app" ? app : null;
+    },
+    querySelector: function () {
+      return null;
+    },
+    querySelectorAll: function (sel) {
+      if (sel === ".compare-topbar") return [topbarEl];
+      if (sel === ".compare-status") return statusEls;
+      if (sel === ".compare-frame") {
+        if (!frameEls) frameEls = [makeFrame(), makeFrame()];
+        return frameEls;
+      }
+      return [];
+    },
+    createElement: function (tag) {
+      return { tagName: tag, href: "", download: "", click: function () {} };
+    },
+    body: {
+      appendChild: function () {},
+      removeChild: function () {},
+    },
+  };
+}
+
+test("X4: /compare は2つの iframe(jev/claude)と上部バーを描き、「実行」で両方に postMessage する。status で見出しが更新される", async () => {
+  var html = await getPageHtml();
+  var fakeDoc = makeCompareDocument();
+  var messageHandlers = [];
+  var fakeWindow = {
+    parent: null,
+    addEventListener: function (type, handler) {
+      if (type === "message") messageHandlers.push(handler);
+    },
+    postMessage: function () {},
+  };
+  fakeWindow.parent = fakeWindow;
+
+  var ctx = runScript(html, {
+    location: { pathname: "/compare", search: "", origin: "https://example.com" },
+    document: fakeDoc,
+    window: fakeWindow,
+  });
+
+  var out = ctx.appElement.innerHTML;
+  assert.ok(out.indexOf("model=jev") !== -1, "Jev 側の iframe src が無い");
+  assert.ok(out.indexOf("model=claude") !== -1, "Claude 側の iframe src が無い");
+  assert.ok(out.indexOf("新しい問題") !== -1, "上部バーが描かれていない");
+  assert.ok(out.indexOf("typesafe/jev") !== -1, "Jev のモデル名見出しが無い");
+
+  // 両 iframe から最初の status が届くまで「実行」は押せない(読み込み中…)(S3)
+  // 初期描画(app.innerHTML)の上部バーは「読み込み中…」(compareEls.topbar は in-place 更新用のスタブなので初期は空)
+  assert.ok(ctx.appElement.innerHTML.indexOf("読み込み中") !== -1, "読み込み中の表示が無い");
+  ctx.compareRun();
+  assert.equal(ctx.compareFrames.jev.postMessageCalls.length, 0, "読み込み前に run が送られた");
+  assert.equal(messageHandlers.length, 1, "status 用の message リスナーが1つ登録されていない");
+  var initialStatus = { type: "status", model: "typesafe/jev", round: 1, correct: 0, total: 51, remaining: 51, running: false, paused: false, done: false };
+  messageHandlers[0]({ origin: "https://example.com", source: ctx.compareFrames.jev.contentWindow, data: initialStatus });
+  messageHandlers[0]({ origin: "https://example.com", source: ctx.compareFrames.claude.contentWindow, data: Object.assign({}, initialStatus, { model: "claude-opus-5+think" }) });
+  assert.ok(ctx.compareEls.topbar.innerHTML.indexOf("読み込み中") === -1, "status 受信後も読み込み中のまま");
+  assert.ok(ctx.compareEls.statusClaude.innerHTML.indexOf("claude-opus-5+think") !== -1, "Claude 側のモデル名が status の model になっていない(N5)");
+
+  // 「実行」を押すと両 iframe に run が送られる
+  ctx.compareRun();
+  assert.equal(ctx.compareFrames.jev.postMessageCalls.length, 1);
+  assert.equal(ctx.compareFrames.jev.postMessageCalls[0].msg.type, "run");
+  assert.equal(ctx.compareFrames.jev.postMessageCalls[0].origin, "https://example.com");
+  assert.equal(ctx.compareFrames.claude.postMessageCalls.length, 1);
+  assert.equal(ctx.compareFrames.claude.postMessageCalls[0].msg.type, "run");
+
+  // 子(iframe)からの status メッセージで見出しが更新される
+  messageHandlers[0]({
+    origin: "https://example.com",
+    source: ctx.compareFrames.jev.contentWindow,
+    data: { type: "status", model: "typesafe/jev", round: 2, correct: 5, total: 51, remaining: 40, running: true, paused: false, done: false },
+  });
+  assert.ok(ctx.compareEls.statusJev.innerHTML.indexOf("2周目") !== -1, "Jev 側の見出しが status で更新されていない");
+  assert.ok(ctx.compareEls.statusJev.innerHTML.indexOf("正解 5 / 51") !== -1, "Jev 側の正解数が status で更新されていない");
+
+  // 他オリジンの status は無視される
+  ctx.compareEls.statusJev.innerHTML = "__untouched__";
+  messageHandlers[0]({
+    origin: "https://evil.example",
+    source: ctx.compareFrames.jev.contentWindow,
+    data: { type: "status", round: 9 },
+  });
+  assert.equal(ctx.compareEls.statusJev.innerHTML, "__untouched__", "他オリジンの status で更新されてしまった");
 });
