@@ -748,6 +748,13 @@ var PAGE_HTML = `<!doctype html>
   .banner.success { background: var(--correct-bg); color: var(--correct); border: 1px solid var(--correct); }
   .banner.warning { background: var(--incorrect-bg); color: var(--incorrect); border: 1px solid var(--incorrect); }
 
+  .calib-summary { font-size: 12px; color: var(--muted); margin: 0 0 12px; }
+  .calib-charts { display: flex; flex-wrap: wrap; gap: 16px; }
+  .calib-chart { flex: 1 1 220px; min-width: 260px; }
+  .calib-chart-title { font-size: 11px; color: var(--muted); margin: 0 0 6px; text-align: center; }
+  .calib-chart svg { width: 100%; height: auto; display: block; }
+  .calib-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
+
   @media (max-width: 640px) {
     .grid { grid-template-columns: repeat(9, 32px); grid-template-rows: repeat(9, 32px); }
     .cell { font-size: 15px; }
@@ -812,10 +819,53 @@ var PAGE_HTML = `<!doctype html>
     return "continue";
   }
 
+  // 集計ビュー(SPEC F1 拡張2、docs/DESIGN.md 4.2)。records を key("pc" | "conf")の
+  // 値で10%刻み10帯に振り分け、帯ごとの件数・正解数・正解率を返す純粋関数。
+  // 値 v の帯は Math.min(9, Math.floor(v * 10))(1.0 は最後の帯に入る)。
+  // 数値でない・NaN・有限でない値は除外する。
+  function binRecords(records, key) {
+    var bins = [];
+    for (var i = 0; i < 10; i++) {
+      bins.push({ lo: i / 10, hi: (i + 1) / 10, n: 0, correct: 0, rate: null });
+    }
+    var list = Array.isArray(records) ? records : [];
+    for (var j = 0; j < list.length; j++) {
+      var rec = list[j];
+      var v = rec ? rec[key] : undefined;
+      if (typeof v !== "number" || !isFinite(v)) continue;
+      if (v < 0 || v > 1) continue; // 確率の範囲外(0〜1)は帯に押し込めず除外する
+      var idx = Math.min(9, Math.floor(v * 10));
+      bins[idx].n += 1;
+      if (rec.ok) bins[idx].correct += 1;
+    }
+    for (var b = 0; b < 10; b++) {
+      bins[b].rate = bins[b].n === 0 ? null : bins[b].correct / bins[b].n;
+    }
+    return bins;
+  }
+
   // 実行世代のチェック。reset() / showError() で runToken が進むので、
   // 古い世代の fetch / setTimeout のコールバックはここで弾かれる(DESIGN 4.3)。
   function isCurrent(token) {
     return state.running && token === runToken;
+  }
+
+  // 32bit FNV-1a。集計ビュー(SPEC F1 拡張2)の問題IDに使う簡易ハッシュ。
+  // 衝突を厳密に避ける必要はない(あくまで「同じ問題をまとめる」ための目印)。
+  function fnv1a32(text) {
+    var hash = 0x811c9dc5;
+    for (var i = 0; i < text.length; i++) {
+      hash ^= text.charCodeAt(i);
+      hash = (hash + ((hash << 1) + (hash << 4) + (hash << 7) + (hash << 8) + (hash << 24))) >>> 0;
+    }
+    var hex = hash.toString(16);
+    while (hex.length < 8) hex = "0" + hex;
+    return hex;
+  }
+
+  // 現在の問題(GIVEN)のID。GIVEN の9行を結合した文字列のハッシュ。
+  function puzzleId() {
+    return fnv1a32(GIVEN.join(""));
   }
 
   // -------------------------------------------------------------------
@@ -1059,6 +1109,15 @@ var PAGE_HTML = `<!doctype html>
   var FAST_BETWEEN_ROUNDS_MS = 80;
   var MAX_ROUNDS = 15;
 
+  // 集計ビュー(SPEC F1 拡張2、docs/DESIGN.md 4.2)。判定ごとの記録は state ではなく
+  // localStorage(キー RECORDS_STORAGE_KEY)が正本。読み直しのコストを避けるため
+  // モジュールスコープに recordsCache を持ち、getRecords() が初回だけ localStorage を
+  // 読んで以後はそれを使い回す(PR #25 レビュー指摘 should-fix 2)。
+  var RECORDS_STORAGE_KEY = "scc.records.v1";
+  var RECORDS_BROKEN_STORAGE_KEY = RECORDS_STORAGE_KEY + ".broken";
+  var RECORDS_MAX = 5000;
+  var recordsCache = null; // null = まだ一度も読み込んでいない。読み込み後は配列(localStorageの鏡)
+
   var state = {
     round: 1,
     values: {}, // "r-c" -> { value: "4", status: "correct" | "incorrect" }
@@ -1108,6 +1167,90 @@ var PAGE_HTML = `<!doctype html>
   }
 
   // -------------------------------------------------------------------
+  // 集計ビュー: 記録の読み書き(SPEC F1 拡張2、docs/DESIGN.md 4.1 / 4.2)。
+  // localStorage が無い・例外を投げる・壊れた JSON が入っている、いずれの場合も
+  // 例外を外に出さない(呼び出し側の commitFocused / run() を止めないため)。
+  // -------------------------------------------------------------------
+
+  // 壊れた(パースできない・配列でない)値を退避キーに逃がしてから空で作り直す。
+  // 退避そのものに失敗しても(容量超過等)、元々壊れていたデータなので諦める。
+  function stashBrokenRecords(raw) {
+    try {
+      if (typeof localStorage === "undefined" || !localStorage) return;
+      localStorage.setItem(RECORDS_BROKEN_STORAGE_KEY, raw);
+    } catch (e) {
+      // 退避も失敗したら諦める
+    }
+  }
+
+  // localStorage から読む。戻り値は { ok, records }。
+  // - ok:true, records:[]  … 何も保存されていない、または壊れていたので空で作り直した(正常系)
+  // - ok:false, records:[] … localStorage が無い、または getItem が例外を投げた
+  //   (= 「読めなかった」。中身が本当に空なのか分からないので、呼び出し側はこれを
+  //   「空だった」と混同して上書き保存してはいけない。PR #25 レビュー指摘 should-fix 1)
+  function loadRecords() {
+    try {
+      if (typeof localStorage === "undefined" || !localStorage) return { ok: false, records: [] };
+      var raw = localStorage.getItem(RECORDS_STORAGE_KEY);
+      if (!raw) return { ok: true, records: [] };
+      var parsed;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (parseErr) {
+        stashBrokenRecords(raw);
+        return { ok: true, records: [] };
+      }
+      if (!Array.isArray(parsed)) {
+        stashBrokenRecords(raw);
+        return { ok: true, records: [] };
+      }
+      return { ok: true, records: parsed };
+    } catch (e) {
+      // getItem 自体が例外を投げた場合。中身が読めていないので「読めなかった」として扱う。
+      return { ok: false, records: [] };
+    }
+  }
+
+  // records を正本(localStorage)に書き込み、キャッシュも同期する。
+  function saveRecords(records) {
+    recordsCache = records;
+    try {
+      if (typeof localStorage === "undefined" || !localStorage) return;
+      localStorage.setItem(RECORDS_STORAGE_KEY, JSON.stringify(records));
+    } catch (e) {
+      // 保存失敗(容量超過・プライベートモード等)は無視する。記録は補助情報であり、
+      // 判定ループそのものを止める理由にはしない。
+    }
+  }
+
+  // render() / exportRecords() が読む窓口。初回だけ localStorage を読み、以後は
+  // recordsCache を使い回す(PR #25 レビュー指摘 should-fix 2)。読み込みに失敗した
+  // (ok:false)ときはキャッシュを作らず、その場限りの空配列を返す(次回また読み直しを試みる)。
+  function getRecords() {
+    if (recordsCache !== null) return recordsCache;
+    var loaded = loadRecords();
+    if (loaded.ok) recordsCache = loaded.records;
+    return loaded.records;
+  }
+
+  // 1件追記する。上限 RECORDS_MAX を超えたら古いものから捨てる。
+  // キャッシュが無ければ初回だけ localStorage を読むが、読めなかった(ok:false)
+  // ときは中身が分からないまま upsert すると全消しになりかねないので、
+  // 何もせず黙って捨てる(このレコード1件だけを諦める。PR #25 レビュー指摘 should-fix 1)。
+  function appendRecord(rec) {
+    if (recordsCache === null) {
+      var loaded = loadRecords();
+      if (!loaded.ok) return;
+      recordsCache = loaded.records;
+    }
+    recordsCache.push(rec);
+    if (recordsCache.length > RECORDS_MAX) {
+      recordsCache = recordsCache.slice(recordsCache.length - RECORDS_MAX);
+    }
+    saveRecords(recordsCache);
+  }
+
+  // -------------------------------------------------------------------
   // 進行ロジック(docs/DESIGN.md 4.3 状態遷移)
   // -------------------------------------------------------------------
   function run() {
@@ -1151,7 +1294,7 @@ var PAGE_HTML = `<!doctype html>
         return { digit: d, pct: Math.round((typeof p === "number" ? p : 0) * 100), isPick: d === result.choice };
       });
       state.currentProbs = probs;
-      pendingCommit = { r: cell.r, c: cell.c, choice: result.choice, confidence: result.confidence };
+      pendingCommit = { r: cell.r, c: cell.c, choice: result.choice, confidence: result.confidence, probabilities: result.probabilities };
       render();
       var beforeCommitMs = state.speedMode === "slow" ? SLOW_BEFORE_COMMIT_MS : FAST_BEFORE_COMMIT_MS;
       setTimeout(function () {
@@ -1189,6 +1332,21 @@ var PAGE_HTML = `<!doctype html>
     } else {
       roundWrong.push({ r: r, c: c });
     }
+    // 集計ビュー用の記録(SPEC F1 拡張2)。正誤が確定したこの時点で1件追記する。
+    var probs = pendingCommit.probabilities;
+    var pc = probs && typeof probs[pendingCommit.choice] === "number" ? probs[pendingCommit.choice] : null;
+    var conf = typeof pendingCommit.confidence === "number" ? pendingCommit.confidence : null;
+    appendRecord({
+      t: Date.now(),
+      p: puzzleId(),
+      r: r,
+      c: c,
+      round: state.round,
+      choice: pendingCommit.choice,
+      pc: pc,
+      conf: conf,
+      ok: correct
+    });
     // 次の結果が来るまで表示に残す(最速モードでも判定が見えるように)
     state.lastJudgment = {
       r: r,
@@ -1492,6 +1650,139 @@ var PAGE_HTML = `<!doctype html>
     return "<div id=\\"completion-banner\\"></div>";
   }
 
+  // 帯1つ分の較正図(横軸=帯0〜100%、縦軸=正解率0〜100%)を描くインラインSVG。
+  // 対角線(理想の較正線)は薄いグレー、棒はアクセント色(正解/不正解の色とは分ける)。
+  // 件数0の帯は棒を描かない。色は PAGE_HTML の CSS 変数をそのまま使う(ライブラリ不使用)。
+  function renderCalibrationChart(bins, titleText) {
+    var width = 240;
+    var height = 160;
+    var padLeft = 28;
+    var padRight = 8;
+    var padTop = 10;
+    var padBottom = 20;
+    var plotW = width - padLeft - padRight;
+    var plotH = height - padTop - padBottom;
+    var barGap = 2;
+    var barSlot = plotW / 10;
+    var barWidth = barSlot - barGap;
+
+    function xAt(i) {
+      return padLeft + i * barSlot;
+    }
+    function yAt(rate) {
+      return padTop + (1 - rate) * plotH;
+    }
+
+    var svg = "<svg viewBox=\\"0 0 " + width + " " + height + "\\" role=\\"img\\" aria-label=\\"" + escapeHtml(titleText) + "\\">";
+    svg += "<line x1=\\"" + xAt(0) + "\\" y1=\\"" + yAt(0) + "\\" x2=\\"" + xAt(10) + "\\" y2=\\"" + yAt(1) +
+      "\\" style=\\"stroke:var(--muted);stroke-width:1;stroke-dasharray:4 3;opacity:0.6;\\" />";
+    svg += "<line x1=\\"" + padLeft + "\\" y1=\\"" + (padTop + plotH) + "\\" x2=\\"" + (padLeft + plotW) +
+      "\\" y2=\\"" + (padTop + plotH) + "\\" style=\\"stroke:var(--border);stroke-width:1;\\" />";
+    for (var i = 0; i < bins.length; i++) {
+      var bin = bins[i];
+      if (bin.n === 0) continue;
+      // 正解率0%でも、件数>0の帯は高さ0だと n=0(未記録)の帯と見分けがつかないため、
+      // 最低1pxの台座を描く(PR #25 レビュー指摘 nit)。
+      var barH = Math.max(bin.rate * plotH, 1);
+      var bx = xAt(i) + barGap / 2;
+      var by = padTop + plotH - barH;
+      svg += "<rect x=\\"" + bx + "\\" y=\\"" + by + "\\" width=\\"" + barWidth + "\\" height=\\"" + barH +
+        "\\" style=\\"fill:var(--accent);\\" />";
+      svg += "<text x=\\"" + (bx + barWidth / 2) + "\\" y=\\"" + Math.max(9, by - 3) +
+        "\\" text-anchor=\\"middle\\" font-size=\\"8\\" style=\\"fill:var(--muted);\\">" + bin.n + "</text>";
+    }
+    svg += "<text x=\\"" + (padLeft - 4) + "\\" y=\\"" + (padTop + 3) + "\\" text-anchor=\\"end\\" font-size=\\"8\\" style=\\"fill:var(--muted);\\">100</text>";
+    svg += "<text x=\\"" + (padLeft - 4) + "\\" y=\\"" + (padTop + plotH) + "\\" text-anchor=\\"end\\" font-size=\\"8\\" style=\\"fill:var(--muted);\\">0</text>";
+    svg += "<text x=\\"" + padLeft + "\\" y=\\"" + (height - 4) + "\\" font-size=\\"8\\" style=\\"fill:var(--muted);\\">0%</text>";
+    svg += "<text x=\\"" + (padLeft + plotW) + "\\" y=\\"" + (height - 4) + "\\" text-anchor=\\"end\\" font-size=\\"8\\" style=\\"fill:var(--muted);\\">100%</text>";
+    svg += "</svg>";
+
+    return "<div class=\\"calib-chart\\"><p class=\\"calib-chart-title\\">" + escapeHtml(titleText) + "</p>" + svg + "</div>";
+  }
+
+  // binRecords(pc/conf それぞれ)の結果を、件数と最終追記時刻が前回と同じなら
+  // 使い回す軽いキャッシュ(PR #25 レビュー指摘 should-fix 2)。records は毎回
+  // getRecords() から渡ってくるので、記録が増減・追記されていなければ計算し直さない。
+  var calibBinCache = null; // { n, lastT, pcBins, confBins }
+  function computeCalibBins(records) {
+    var n = records.length;
+    var lastT = n > 0 ? records[n - 1].t : null;
+    if (calibBinCache && calibBinCache.n === n && calibBinCache.lastT === lastT) {
+      return calibBinCache;
+    }
+    calibBinCache = {
+      n: n,
+      lastT: lastT,
+      pcBins: binRecords(records, "pc"),
+      confBins: binRecords(records, "conf")
+    };
+    return calibBinCache;
+  }
+
+  // 集計パネル(SPEC F1 拡張2)。records は state ではなく localStorage 由来なので、
+  // getRecords()(初回だけ localStorage を読み、以後はキャッシュを使う)経由で読む。
+  function renderCalibration() {
+    var records = getRecords();
+    var total = records.length;
+    var correctCount = 0;
+    var puzzles = {};
+    for (var i = 0; i < records.length; i++) {
+      var rec = records[i];
+      if (!rec) continue;
+      if (rec.ok) correctCount++;
+      if (typeof rec.p === "string") puzzles[rec.p] = true;
+    }
+    var puzzleCount = Object.keys(puzzles).length;
+    var pct = total === 0 ? 0 : Math.round((correctCount / total) * 100);
+
+    var calibBins = computeCalibBins(records);
+    var pcBins = calibBins.pcBins;
+    var confBins = calibBins.confBins;
+
+    return "<div id=\\"calibration-panel\\" class=\\"panel\\">" +
+      "<p class=\\"panel-title\\">較正図</p>" +
+      "<p class=\\"calib-summary\\">合計 " + total + " 件 / 全体正解率 " + pct + "% / 記録している問題数 " + puzzleCount + "</p>" +
+      "<div class=\\"calib-charts\\">" +
+      renderCalibrationChart(pcBins, "choiceの確率(pc)による較正") +
+      renderCalibrationChart(confBins, "Jevのconfidenceによる較正") +
+      "</div>" +
+      "<div class=\\"calib-actions\\">" +
+      "<button id=\\"export-records-btn\\" onclick=\\"exportRecords()\\">JSONエクスポート</button>" +
+      "<button id=\\"clear-records-btn\\" onclick=\\"clearRecords()\\">記録を消す</button>" +
+      "</div>" +
+      "</div>";
+  }
+
+  function pad2(n) {
+    return n < 10 ? "0" + n : String(n);
+  }
+
+  // ファイル名 sudoku-calibration-YYYYMMDD-HHMMSS.json(ローカル時刻)。
+  function recordsExportFileName() {
+    var d = new Date();
+    return "sudoku-calibration-" + d.getFullYear() + pad2(d.getMonth() + 1) + pad2(d.getDate()) +
+      "-" + pad2(d.getHours()) + pad2(d.getMinutes()) + pad2(d.getSeconds()) + ".json";
+  }
+
+  function exportRecords() {
+    var payload = { version: 1, exported_at: new Date().toISOString(), records: getRecords() };
+    var blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url;
+    a.download = recordsExportFileName();
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
+  function clearRecords() {
+    if (!confirm("記録した判定をすべて削除します。よろしいですか?")) return;
+    saveRecords([]);
+    render();
+  }
+
   function render() {
     var app = document.getElementById("app");
     // 周回ログのスクロール位置を引き継ぐ(innerHTML を作り直すと先頭に戻るため)。
@@ -1510,6 +1801,7 @@ var PAGE_HTML = `<!doctype html>
       renderStats() +
       renderCurrentPanel() +
       renderRoundLog() +
+      renderCalibration() +
       renderBanner() +
       "</div>" +
       "</div>";

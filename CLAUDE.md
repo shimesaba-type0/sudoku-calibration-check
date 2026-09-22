@@ -84,5 +84,6 @@ npm run dev                 # ローカル起動。AIバインディングはリ
 - レート制限のカウンタは Durable Object(`RATE_LIMITER` / `RateLimitCounter`)。`wrangler deploy` が `[[migrations]]` から作るので、ネームスペース作成のような手作業は不要(Issue #10 で Workers KV から移行。KV は結果整合で全体上限が分散アクセスに効かなかった)。PR #14 でマージ・デプロイ済み。`GET /api/status` で残数を読める(#18)
 - マージ済み PR: #7(Worker 本体)、#9(Jev 実レスポンス形式 + KV id)、#11(#7/#9 のレビュー指摘)、#13(フロントエンド)、#14(レート制限を Durable Object に置き換え)、#22(モデル方針)、#23(`/api/status`)
 - 数独ジェネレーター/ソルバー(#5)は実装済み。「新しい問題」ボタンで毎回違う問題を出せる。これに伴い Worker 側の入力検証から固定問題(`GIVEN`)前提の項目を外した(`docs/DESIGN.md` 3.3)
-- 既知の未実装: 集計ビュー(信頼度較正図)(#6)、Playwright E2E スモーク(#17)、AbortController + 振る舞いテスト(#19)、難易度(#21)
+- 集計ビュー(信頼度較正図)(#6)は実装済み。判定結果を `localStorage`(`scc.records.v1`)に蓄積し、`pc` / `conf` それぞれの帯ごとの正解率を較正図として表示する。JSONエクスポート・記録の消去も可能
+- 既知の未実装: AbortController + 振る舞いテスト(#19)、難易度(#21)。Playwright E2E スモーク(#17)は PR #24 でマージ済み(`npm run e2e`)
 - 要判断(オーナー): IP 単位のレート制限(30 回/時)の緩和可否は Issue #20 を参照。上限を緩める変更は作業ルール4によりオーナーの判断が必要
