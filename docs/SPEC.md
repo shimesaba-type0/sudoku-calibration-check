@@ -169,7 +169,7 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 - `probabilities`: キーは `"1"`〜`"9"` の文字列、値は 0〜1(Jev の契約。Worker は有限の数値であることだけを検証し、範囲は検証しない)
 - `choice`: Jev が選んだキー(文字列)
 - `confidence`: Jev が返す独自の確信度。`probabilities[choice]` とは一致しない(実測: 0.20 に対して 0.10 など)。較正の検証には `probabilities` を使う
-- `request`: `env.AI.run` に渡したペイロードそのもの。`state.puzzle` / `state.target` / `state.note` / `questions.digit.{type,instructions,criteria}`(フロントの「Jev に送ったプロンプト」パネルがそのまま表示する。Issue #34)。502 にも付く。400/415/429/503 には付かない(まだ payload を組み立てていないため)
+- `request`: `env.AI.run` に渡したペイロードそのもの。`state.puzzle` / `state.target` / `state.note` / `questions.digit.{type,instructions,criteria}`(フロントの「モデルに送ったプロンプト」パネルがそのまま表示する。Issue #34)。502 にも付く。400/415/429/503 には付かない(まだ payload を組み立てていないため)
 
 エラー(400 / 415 / 429 / 502 / 503):
 
@@ -225,7 +225,7 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 ````json
 {
   "model": "claude-opus-5",
-  "max_tokens": 1024,
+  "max_tokens": 16000,
   "system": "<Jev と同じ NOTE> Answer with JSON only, matching the given schema: ...",
   "messages": [{ "role": "user", "content": "Which digit from 1 to 9 belongs in the target cell of this Sudoku grid?\n{\"puzzle\":[...9行...],\"target\":{\"row\":0,\"col\":2}}" }],
   "output_config": { "format": { "type": "json_schema", "schema": { "...": "choice(1〜9) / probabilities(1〜9 の 9 キー) / confidence" } } },
@@ -233,7 +233,8 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 }
 ````
 
-- `thinking`: 思考ありなら `claude-opus-5` / `claude-sonnet-5` は `{ "type": "adaptive" }`、`claude-haiku-4-5` は `{ "type": "enabled", "budget_tokens": 2048 }`(このとき `max_tokens` は 2048 + 1024)。思考なしなら Opus / Sonnet は `{ "type": "disabled" }`、Haiku は `thinking` を送らない
+- `thinking`: 思考ありなら `claude-opus-5` / `claude-sonnet-5` は `{ "type": "adaptive" }`(このとき `max_tokens` は 16000。思考トークンも `max_tokens` に含まれるため)、`claude-haiku-4-5` は `{ "type": "enabled", "budget_tokens": 2048 }`(このとき `max_tokens` は 2048 + 1024)。思考なしなら Opus / Sonnet は `{ "type": "disabled" }`、Haiku は `thinking` を送らない(`max_tokens` は 1024)
+- 「キーを消す」は実行中・停止中は押せない(次のマスで止まってしまうため)。キー保存の失敗は判定ループを止めず、設定パネル内の注意書きに出す
 - 応答: `content` の最初の `text` ブロックが structured outputs の JSON(`{ "choice": "4", "probabilities": { "1": 0.03, ... }, "confidence": 0.7 }`)。検証は `/api/judge` の 200 と同じ基準(9 キー・有限数・`choice` が 1〜9・`confidence` が数値)。`stop_reason` が `refusal` / `max_tokens`、HTTP が非 2xx(401 キー不正、429、529 など)、ネットワーク失敗は F5 のエラー扱い(理由をエラーボックスに出して停止)
 - `probabilities` / `confidence` は **Claude の自己申告**であり較正されている保証はない。それを Jev の値と同じ較正図で比べるのがこの拡張の目的
 - レート制限(F6)は関与しない(利用者自身のキーと課金)
@@ -271,7 +272,7 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
 ## 7. 今後の拡張(優先度順)
 
 1. ~~**数独ジェネレーター + ソルバー**~~: **実装済み**(Issue #5)。「新しい問題」ボタンで毎回違う問題を出す。ソルバー(`solveCount`)で一意解を確認してから出題する
-2. ~~**集計ビュー**~~: **実装済み**(Issue #6)。判定結果を `localStorage` に蓄積し、`pc`(choiceの確率)/ `conf`(Jevのconfidence)それぞれの帯ごとの実際の正解率を較正図として表示する。JSONエクスポート・記録の消去も可能(3章 F1)
+2. ~~**集計ビュー**~~: **実装済み**(Issue #6)。判定結果を `localStorage` に蓄積し、`pc`(choiceの確率)/ `conf`(モデルのconfidence)それぞれの帯ごとの実際の正解率を較正図として表示する。JSONエクスポート・記録の消去も可能(3章 F1)
 3. ~~**Claude API連携**~~: **実装済み**(Issue #37)。Jevに続く比較対象として Anthropic Claude API を追加。モデル選択(`claude-opus-5` / `claude-sonnet-5` / `claude-haiku-4-5`)と思考の on/off を切り替えられる。BYOK方式(利用者自身のAPIキーをブラウザのlocalStorageに保存し、ブラウザから直接Claude APIを呼ぶ。ClaudeはCORS対応済みなのでサーバー側でのキー中継が不要)。確率は structured outputs で自己申告させる(4章「Claude 経路」)。OpenAI・Grok等への対応は現時点では対象外(必要になったら誰かがフォークして追加すればよい。MITライセンス)
 4. **ログ異常検知への転用**: `digit` の Choice を `is_anomaly` の Noul などに差し替え、ホームラボのログを流す
 5. **管理用の簡易ダッシュボード**: 直近のレート制限ヒット状況や残り回数を確認できる画面。**最小版として `GET /api/status`(残り回数を読むだけで返す。4章)を実装済み**(Issue #18)。画面(ヒット状況の履歴やグラフ)は未実装で、現状は `/api/status`・`X-RateLimit-Remaining-*` ヘッダー・Cloudflare ダッシュボードの Durable Object 参照で代用

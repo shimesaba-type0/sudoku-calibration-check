@@ -113,7 +113,7 @@ Durable Object は同じ名前のインスタンスが世界に1つしか存在�
    - `probabilities` がオブジェクトで、キーがちょうど `"1"`〜`"9"` の9個。値はすべて有限の数値
    - `choice` が文字列で、`"1"`〜`"9"` のいずれか
    - `confidence` が有限の数値。**値の妥当性は見ない**(Jev 独自の確信度で `probabilities[choice]` とは一致しないため。3.4 / SPEC 4章)
-7. `{ probabilities, choice, confidence, request }` に絞って 200 で返す。`confidence` は Jev の値をそのまま通す(`probabilities[choice]` に差し替えない)。`request` は **同じ `payload` をそのまま**渡す(別オブジェクトを組み立て直さない)。フロントの「Jev に送ったプロンプト」パネル(4.2 `renderPromptPanel`)がこれをそのまま表示する(Issue #34)。400/415/429/503 には `request` を付けない(まだ `payload` を組み立てていないため)
+7. `{ probabilities, choice, confidence, request }` に絞って 200 で返す。`confidence` は Jev の値をそのまま通す(`probabilities[choice]` に差し替えない)。`request` は **同じ `payload` をそのまま**渡す(別オブジェクトを組み立て直さない)。フロントの「モデルに送ったプロンプト」パネル(4.2 `renderPromptPanel`)がこれをそのまま表示する(Issue #34)。400/415/429/503 には `request` を付けない(まだ `payload` を組み立てていないため)
 8. `X-RateLimit-Remaining-IP` / `X-RateLimit-Remaining-Global`(その時点の残り回数)は、**レート制限を通過したすべてのレスポンス** に付く(`RATE_LIMITER` バインディングがあるとき。無いフェイルオープン時は残数が存在しないので付かない)。200 だけでなく、その後の 400(入力不正)や 502(AI 失敗・形式不正)にも付く(どれも1回として数えているため)。レート制限より手前で止まる 415 と、制限に引っかかった 429 / 503 には付かない
 
 `state` はオブジェクトで渡す(Jev は string / object / array を受け付ける):
@@ -223,9 +223,13 @@ Cloudflare 側の都合で変わる。形が違っていたらこの節と `hand
   `messages[0].content` = Worker の `INSTRUCTIONS` + 改行 + `{ puzzle, target }`(`buildSnapshot()`。
   対象マスは `.`)。Jev と比較条件を揃えるため、ルール説明と質問文は同一にする
 - **thinking**: `claudeThinkingConfig(model, on)`。Opus 5 / Sonnet 5 は `adaptive` / `disabled`、
-  Haiku 4.5 は `enabled` + `budget_tokens: 2048`(`max_tokens` に上乗せ)/ 省略。記録の `m` は
+  Haiku 4.5 は `enabled` + `budget_tokens: 2048`(`max_tokens` に上乗せ)/ 省略。思考トークンは
+  `max_tokens` に含まれるので、`adaptive` のときは `max_tokens` を 16000 にする(1024 のままだと
+  JSON が出る前に `stop_reason: max_tokens` で終わる)。記録の `m` は
   `<model>+think` / `<model>` で分ける
 - **キーの扱い**: `localStorage` の `scc.anthropic_key.v1`。`x-api-key` ヘッダーにだけ載せ、
+  「キーを消す」は実行中・停止中はロック(次のマスで止まってしまうため)。保存の失敗は判定ループを
+  止めず(`showError` を使わず)パネル内の注意書き(`claudeKeyNotice`)に留める。
   リクエストボディ・`state.lastRequest`(プロンプトパネル)・記録・エクスポート・DOM のどこにも出さない
   (画面は末尾 4 文字のヒントだけ)。`saveAnthropicKey` / `clearAnthropicKey` / `loadAnthropicKey`
 - **エラー**: 非 2xx は `Claude API HTTP <status>: <error.message>`、`stop_reason` が `refusal` /
@@ -329,7 +333,7 @@ var inflightController = null;  // in-flight の /api/judge 用 AbortController(
 | `setDifficulty(mode)` | `state.difficulty`(`"easy"` / `"normal"` / `"hard"`)を切り替えて再描画。変えただけでは盤面は変わらず、次の `newPuzzle()` の目標ヒント数に効く(Issue #21) |
 | `render()` | `state` から DOM(グリッド・統計・バー・ログ・集計パネル・バナー・ボタン)を **全部 innerHTML で再生成**。周回ログのスクロール位置だけは引き継ぐ |
 | `render*()` | `renderGrid` / `renderLegend` / `renderControls`(モデルトグル含む)/ `renderClaudeSettings`(Claude のときだけ)/ `renderErrorBox` / `renderStats`(+`statCard`)/ `renderCurrentPanel`(+`coordLabel` / `renderBars`)/ `renderPromptPanel` / `renderRoundLog` / `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`。それぞれHTML文字列を返すだけで、DOMには触らない |
-| `renderPromptPanel()` | 「現在の判定」パネルの直下の「Jev に送ったプロンプト」枠(SPEC F1、Issue #34)。`state.lastRequest` があれば `coordLabel`(`lastRequest.state.target` の座標。`lastRequestFailed` なら「(このプロンプトで失敗)」を添える)と、`JSON.stringify(lastRequest, null, 2)` を `escapeHtml` して `<pre class="prompt-json">` に表示する。`null` なら「まだ判定していません」。Worker の `handleJudge` が返す `request` をそのまま表示するだけで、フロント側でペイロードを組み立て直さない(二重管理を避けるため) |
+| `renderPromptPanel()` | 「現在の判定」パネルの直下の「モデルに送ったプロンプト」枠(SPEC F1、Issue #34)。`state.lastRequest` があれば `coordLabel`(`lastRequest.state.target` の座標。`lastRequestFailed` なら「(このプロンプトで失敗)」を添える)と、`JSON.stringify(lastRequest, null, 2)` を `escapeHtml` して `<pre class="prompt-json">` に表示する。`null` なら「まだ判定していません」。Jev 経路では Worker の `handleJudge` が返す `request`、Claude 経路ではブラウザが送ったリクエストボディ(`buildClaudeRequest`。ヘッダー = キーは含まない)をそのまま表示する。Jev のペイロードをフロント側で組み立て直さない(二重管理を避けるため) |
 | `buildCellStyle()` | マスの状態(given/pending/correct/incorrect + focused)からインラインstyle文字列を返す |
 | `escapeHtml(text)` | `innerHTML` に入れる前に `& < > " '` を実体参照にする |
 | `fnv1a32(text)` / `puzzleId()` | 集計ビュー(SPEC F1 拡張2)の問題ID用の簡易ハッシュ。32bit FNV-1a を8桁16進で返す。`puzzleId()` は `GIVEN` の9行を結合した文字列をハッシュ化する |
@@ -430,7 +434,7 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
   実行ボタン(`#run-btn`)は実行中は「停止」(`onclick="stop()"`)、停止中は「再開」
   (`onclick="run()"`、無効化しない)、それ以外(未実行・完了・エラー・生成中)は「実行」
   (完了・エラー・生成中は無効化)を出す
-- 「Jev に送ったプロンプト」パネル(`renderPromptPanel`)は「現在の判定」パネルとは独立して
+- 「モデルに送ったプロンプト」パネル(`renderPromptPanel`)は「現在の判定」パネルとは独立して
   `state.lastRequest`(と `lastRequestFailed`)だけを見る。停止中・エラー中でも直前の値をそのまま出し続け、
   `isPaused()` のような特別扱いはしない(消えるのは `reset()` / `newPuzzle()` のときだけ。
   Issue #34)。502 で失敗した判定の `request` は「(このプロンプトで失敗)」付きで表示し、

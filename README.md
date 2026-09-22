@@ -105,7 +105,8 @@ npm run deploy
 (この Worker は関与せず、キーも受け取りません)。キーはそのブラウザの `localStorage` にだけ保存され、
 「キーを消す」で削除できます。利用料は自分の Anthropic アカウントに課金されます。
 モデル(`claude-opus-5` / `claude-sonnet-5` / `claude-haiku-4-5`)と思考の有無を選べ、較正図は
-モデルごとに絞り込めます。確率は structured outputs で Claude 自身に申告させたものです
+モデルごとに絞り込めます。1 問あたり約 78 回呼ぶので、Opus 5 + 思考ありでは 1 問で相応の料金になります
+(この経路に Worker のレート制限は効きません)。確率は structured outputs で Claude 自身に申告させたものです
 (`docs/SPEC.md` 4章「Claude 経路」/ `docs/DESIGN.md` 3.6)。
 
 それ以外のパスは 404 です。`/api/judge` は `content-type: application/json` 以外を 415 で

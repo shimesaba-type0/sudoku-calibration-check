@@ -2048,7 +2048,7 @@ test("V2: Claude 経路はブラウザから api.anthropic.com を直接呼び�
   assert.deepStrictEqual(JSON.parse(JSON.stringify(body.thinking)), { type: "adaptive" }, "既定は思考あり(adaptive)");
   assert.equal(body.output_config.format.type, "json_schema");
   assert.deepStrictEqual(body.output_config.format.schema.required, ["choice", "probabilities", "confidence"]);
-  assert.equal(body.max_tokens, 1024);
+  assert.equal(body.max_tokens, 16000, "adaptive thinking では思考ぶんを含めて max_tokens を大きくする(レビュー M1)");
   assert.ok(typeof body.system === "string" && body.system.includes("Standard Sudoku rules"), "system にルール説明が無い");
   assert.equal(body.messages.length, 1);
   assert.equal(body.messages[0].role, "user");
@@ -2095,13 +2095,14 @@ test("V3: thinking の指定はモデルごとに変わる(Opus/Sonnet: adaptive
   ctx.setClaudeThinking(false);
   var offBody = ctx.buildClaudeRequest(puzzle, 0, 2);
   assert.deepStrictEqual(JSON.parse(JSON.stringify(offBody.thinking)), { type: "disabled" });
-  assert.equal(offBody.max_tokens, 1024);
+  assert.equal(offBody.max_tokens, 1024, "思考なしは JSON 1 件ぶんの max_tokens");
 
   ctx.setClaudeModel("claude-sonnet-5");
   ctx.setClaudeThinking(true);
   var sonnetBody = ctx.buildClaudeRequest(puzzle, 0, 2);
   assert.equal(sonnetBody.model, "claude-sonnet-5");
   assert.deepStrictEqual(JSON.parse(JSON.stringify(sonnetBody.thinking)), { type: "adaptive" });
+  assert.equal(sonnetBody.max_tokens, 16000, "adaptive は思考ぶんを含めて 16000");
 
   ctx.setClaudeModel("claude-haiku-4-5");
   var haikuOn = ctx.buildClaudeRequest(puzzle, 0, 2);
@@ -2279,4 +2280,118 @@ test("V7: ページ内の NOTE / INSTRUCTIONS は Worker が Jev に渡す文言
   assert.equal(ctx.NOTE, data.request.state.note, "ページの NOTE が Worker の note と違う");
   assert.equal(ctx.INSTRUCTIONS, data.request.questions.digit.instructions, "ページの INSTRUCTIONS が Worker の instructions と違う");
   assert.ok(ctx.CLAUDE_SYSTEM.startsWith(ctx.NOTE), "CLAUDE_SYSTEM が NOTE で始まっていない");
+});
+
+test("V8: stop_reason が max_tokens ならエラー、content の先頭が thinking ブロックでも text ブロックから JSON を取る", { timeout: 10000 }, async () => {
+  async function runOnce(mutate) {
+    var af = makeAbortAwareFetch();
+    var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+    ctx.saveAnthropicKey(TEST_KEY);
+    ctx.setModelMode("claude");
+    ctx.run();
+    await waitFor(function () {
+      return af.pending.length === 1;
+    }, "V8: fetch 待ち");
+    var entry = af.pending.shift();
+    var body = JSON.parse(entry.init.body);
+    var target = JSON.parse(body.messages[0].content.split("\n")[1]).target;
+    var res = makeClaudeResponse(ctx, target.row, target.col);
+    var orig = res.json;
+    res.json = function () {
+      return orig().then(mutate);
+    };
+    entry.resolve(res);
+    await waitFor(function () {
+      return ctx.state.errorMessage !== null || ctx.state.values[target.row + "-" + target.col] !== undefined;
+    }, "V8: 結果待ち");
+    return ctx;
+  }
+
+  var ctxMax = await runOnce(function (data) {
+    data.stop_reason = "max_tokens";
+    data.content = [{ type: "thinking", thinking: "…", signature: "x" }];
+    return data;
+  });
+  assert.ok(ctxMax.state.errorMessage && ctxMax.state.errorMessage.includes("max_tokens"), "max_tokens の文言: " + ctxMax.state.errorMessage);
+  assert.equal(ctxMax.state.running, false);
+
+  var ctxThink = await runOnce(function (data) {
+    data.content = [{ type: "thinking", thinking: "…", signature: "x" }].concat(data.content);
+    return data;
+  });
+  assert.equal(ctxThink.state.errorMessage, null, "thinking ブロック付きの応答でエラーになった: " + ctxThink.state.errorMessage);
+  assert.equal(ctxThink.getRecords().length, 1, "thinking ブロック付きの応答が確定していない");
+});
+
+test("V9: Claude 経路でも reset() が in-flight の fetch を abort し、AbortError はエラー表示にならない", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.saveAnthropicKey(TEST_KEY);
+  ctx.setModelMode("claude");
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "V9: fetch 待ち");
+  var entry = af.pending[0];
+  var aborted = false;
+  entry.init.signal.addEventListener("abort", function () {
+    aborted = true;
+  });
+  ctx.reset();
+  assert.equal(aborted, true, "reset() で Claude 経路の fetch が abort されていない");
+  for (var i = 0; i < 20; i++) await tick();
+  assert.equal(ctx.state.errorMessage, null, "AbortError がエラー表示に流れた");
+  assert.equal(ctx.state.running, false);
+  assert.equal(ctx.state.modelMode, "claude", "reset() でモデル設定が消えた");
+});
+
+test("V10: 入力欄からの保存は先に入力欄を空にし、キー保存の失敗は判定ループを止めずパネルの注意書きに出る。実行中は「キーを消す」が無効", { timeout: 10000 }, async () => {
+  var storage = makeLocalStorage();
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch, localStorage: storage });
+  ctx.setModelMode("claude");
+  var fakeInput = { value: TEST_KEY };
+  ctx.document.getElementById = function (id) {
+    if (id === "app") return ctx.appElement;
+    if (id === "anthropic-key-input") return fakeInput;
+    return null;
+  };
+  ctx.saveAnthropicKeyFromInput();
+  assert.equal(fakeInput.value, "", "保存後に入力欄が空になっていない");
+  assert.equal(storage.getItem("scc.anthropic_key.v1"), TEST_KEY, "localStorage に保存されていない");
+  assert.ok(!ctx.appElement.innerHTML.includes(TEST_KEY));
+
+  // 空の入力は保存しない(注意書きだけ)
+  fakeInput.value = "   ";
+  ctx.saveAnthropicKeyFromInput();
+  assert.equal(storage.getItem("scc.anthropic_key.v1"), TEST_KEY, "空の入力で既存のキーが消えた");
+  assert.ok(ctx.appElement.innerHTML.includes("キーが空です"), "空入力の注意書きが出ていない");
+
+  // 実行中に保存が失敗しても判定ループは止まらない
+  ctx.run();
+  await waitFor(function () {
+    return af.pending.length === 1;
+  }, "V10: fetch 待ち");
+  var originalSetItem = storage.setItem;
+  storage.setItem = function (key, value) {
+    if (key === "scc.anthropic_key.v1") throw new Error("QuotaExceededError を模す");
+    return originalSetItem.call(storage, key, value);
+  };
+  fakeInput.value = "sk-ant-new-0000000000000000";
+  ctx.saveAnthropicKeyFromInput();
+  assert.equal(fakeInput.value, "", "失敗時も入力欄は空にする");
+  assert.equal(ctx.state.running, true, "キー保存の失敗で判定ループが止まった");
+  assert.equal(ctx.state.errorMessage, null, "キー保存の失敗がエラーボックスに出た");
+  assert.equal(af.pending.length, 1, "in-flight の fetch が捨てられた");
+  assert.ok(ctx.appElement.innerHTML.includes("API キーを保存できません"), "保存失敗の注意書きが出ていない");
+  assert.equal(storage.getItem("scc.anthropic_key.v1"), TEST_KEY, "古いキーが消えた");
+  storage.setItem = originalSetItem;
+
+  // 実行中は「キーを消す」が無効で、呼んでも消えない
+  assert.ok(/id="clear-key-btn"[^>]*disabled/.test(ctx.appElement.innerHTML), "実行中に「キーを消す」が無効化されていない");
+  ctx.clearAnthropicKey();
+  assert.equal(storage.getItem("scc.anthropic_key.v1"), TEST_KEY, "実行中にキーが消えた");
+  ctx.reset();
+  ctx.clearAnthropicKey();
+  assert.equal(storage.getItem("scc.anthropic_key.v1"), null, "停止後に「キーを消す」が効かない");
 });

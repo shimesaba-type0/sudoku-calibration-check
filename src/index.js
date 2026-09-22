@@ -738,6 +738,8 @@ var PAGE_HTML = `<!doctype html>
     padding: 7px 10px;
   }
   input[type="password"] { min-width: 220px; }
+  select option { background: var(--panel-bg); color: var(--text); }
+  .claude-notice { font-size: 12px; color: var(--incorrect); }
   #calib-model-filter { font-size: 12px; padding: 3px 6px; }
 
   #error-box.error {
@@ -1167,7 +1169,8 @@ var PAGE_HTML = `<!doctype html>
   var CLAUDE_MODELS = ["claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
   var DEFAULT_CLAUDE_MODEL = "claude-opus-5";
   var CLAUDE_HAIKU_THINKING_BUDGET = 2048; // Haiku 4.5 は budget_tokens 方式(adaptive 非対応)
-  var CLAUDE_MAX_TOKENS = 1024;            // JSON 1 件ぶん。思考ぶんは budget_tokens を上乗せする
+  var CLAUDE_ANSWER_MAX_TOKENS = 1024;     // JSON 1 件ぶん(思考なし)
+  var CLAUDE_ADAPTIVE_MAX_TOKENS = 16000;  // adaptive thinking は思考トークンも max_tokens に含まれるので余裕を持たせる
   var JEV_MODEL_ID = "typesafe/jev";
   // Worker が Jev に渡すのと同じルール説明・質問文(比較条件を揃える)。Worker 側の
   // 定数をテンプレートに埋め込んでいるので、二重管理にならない。
@@ -1276,7 +1279,7 @@ var PAGE_HTML = `<!doctype html>
   // -------------------------------------------------------------------
   // 判定 1 件。スナップショットはここで 1 回だけ作り(フォーカス確定後、SPEC F3)、
   // モデルトグルに応じて Jev(Worker 経由)か Claude(ブラウザ直呼び)に渡す。
-  function judgeCell(r, c, signal) {
+  async function judgeCell(r, c, signal) {
     var puzzle = buildSnapshot();
     if (state.modelMode === "claude") return judgeCellClaude(puzzle, r, c, signal);
     return judgeCellJev(puzzle, r, c, signal);
@@ -1319,13 +1322,23 @@ var PAGE_HTML = `<!doctype html>
     }
   }
 
+  // 設定系の失敗は判定ループを止めない(showError は runToken を進めて in-flight を
+  // 捨てるので、設定パネルの失敗には重すぎる。レビュー指摘 S3)。パネル内の注意書きに留める。
+  var claudeKeyNotice = null;
+
   function saveAnthropicKey(key) {
     var trimmed = String(key || "").trim();
-    if (!trimmed) return false;
+    if (!trimmed) {
+      claudeKeyNotice = "キーが空です";
+      render();
+      return false;
+    }
     try {
       localStorage.setItem(ANTHROPIC_KEY_STORAGE_KEY, trimmed);
+      claudeKeyNotice = null;
     } catch (e) {
-      showError("API キーを保存できません(localStorage が使えません)");
+      claudeKeyNotice = "API キーを保存できません(localStorage が使えません)";
+      render();
       return false;
     }
     render();
@@ -1335,15 +1348,19 @@ var PAGE_HTML = `<!doctype html>
   function saveAnthropicKeyFromInput() {
     var el = document.getElementById("anthropic-key-input");
     if (!el) return;
-    if (saveAnthropicKey(el.value)) el.value = "";
+    var value = el.value;
+    el.value = ""; // 保存の成否にかかわらず、まず入力欄から消す(render() の実装に依存しない)
+    saveAnthropicKey(value);
   }
 
   function clearAnthropicKey() {
+    if (modelSettingsLocked()) return; // 実行中・停止中に消すと次のマスで止まる(S2)
     try {
       localStorage.removeItem(ANTHROPIC_KEY_STORAGE_KEY);
     } catch (e) {
       // 読めない・消せない localStorage は「未設定」と同じ扱い
     }
+    claudeKeyNotice = null;
     render();
   }
 
@@ -1430,7 +1447,7 @@ var PAGE_HTML = `<!doctype html>
   function buildClaudeRequest(puzzle, r, c) {
     var body = {
       model: state.claudeModel,
-      max_tokens: CLAUDE_MAX_TOKENS,
+      max_tokens: CLAUDE_ANSWER_MAX_TOKENS,
       system: CLAUDE_SYSTEM,
       messages: [
         {
@@ -1443,7 +1460,10 @@ var PAGE_HTML = `<!doctype html>
     var thinking = claudeThinkingConfig(state.claudeModel, state.claudeThinking);
     if (thinking) {
       body.thinking = thinking;
-      if (typeof thinking.budget_tokens === "number") body.max_tokens = thinking.budget_tokens + CLAUDE_MAX_TOKENS;
+      // 思考トークンは出力トークンとして max_tokens に含まれる。小さいままだと JSON が
+      // 1 トークンも出ずに stop_reason: max_tokens で終わる(レビュー指摘 M1)。
+      if (thinking.type === "adaptive") body.max_tokens = CLAUDE_ADAPTIVE_MAX_TOKENS;
+      if (typeof thinking.budget_tokens === "number") body.max_tokens = thinking.budget_tokens + CLAUDE_ANSWER_MAX_TOKENS;
     }
     return body;
   }
@@ -1524,6 +1544,7 @@ var PAGE_HTML = `<!doctype html>
     try {
       data = await res.json();
     } catch (e) {
+      if (e && e.name === "AbortError") throw e; // abort 中の reject は別のエラーに化かさない
       data = null;
     }
     if (!res.ok) {
@@ -2068,10 +2089,11 @@ var PAGE_HTML = `<!doctype html>
       "<label for=\\"anthropic-key-input\\">API キー</label>" +
       "<input id=\\"anthropic-key-input\\" type=\\"password\\" placeholder=\\"sk-ant-…\\" autocomplete=\\"off\\" spellcheck=\\"false\\">" +
       "<button id=\\"save-key-btn\\" onclick=\\"saveAnthropicKeyFromInput()\\">保存</button>" +
-      "<button id=\\"clear-key-btn\\" onclick=\\"clearAnthropicKey()\\" " + (hasKey ? "" : "disabled") + ">キーを消す</button>" +
+      "<button id=\\"clear-key-btn\\" onclick=\\"clearAnthropicKey()\\" " + (hasKey && !modelSettingsLocked() ? "" : "disabled") + ">キーを消す</button>" +
       "<span class=\\"muted\\">" + escapeHtml(anthropicKeyHint()) + "</span>" +
+      (claudeKeyNotice ? "<span class=\\"claude-notice\\">" + escapeHtml(claudeKeyNotice) + "</span>" : "") +
       "</div>" +
-      "<p class=\\"muted\\">キーはこのブラウザの localStorage にだけ保存し、api.anthropic.com への呼び出し以外には送りません(この Worker には渡りません)。利用料は自分の Anthropic アカウントに課金されます。</p>" +
+      "<p class=\\"muted\\">キーはこのブラウザの localStorage にだけ保存し、api.anthropic.com への呼び出し以外には送りません(この Worker には渡りません)。利用料は自分の Anthropic アカウントに課金されます(1 問あたり約 78 回呼びます。この経路にレート制限はありません)。</p>" +
       "<div class=\\"claude-row\\">" +
       "<label for=\\"claude-model\\">モデル</label>" +
       "<select id=\\"claude-model\\" onchange=\\"setClaudeModel(this.value)\\" " + locked + ">" + options + "</select>" +
@@ -2174,7 +2196,7 @@ var PAGE_HTML = `<!doctype html>
     return head + "<p class=\\"muted\\">待機中</p>" + tail;
   }
 
-  // 「Jev に送ったプロンプト」パネル(Issue #34)。Worker が env.AI.run に渡した
+  // 「モデルに送ったプロンプト」パネル(Issue #34、#37)。Jev なら Worker が env.AI.run に渡した
   // ペイロード(request)をそのまま JSON で表示する。フロント側で組み立て直さない
   // (handleJudge と二重管理にしないため)。停止中・エラー時も直近の値を残す。
   function renderPromptPanel() {
@@ -2269,17 +2291,38 @@ var PAGE_HTML = `<!doctype html>
   // binRecords(pc/conf それぞれ)の結果を、件数と最終追記時刻が前回と同じなら
   // 使い回す軽いキャッシュ(PR #25 レビュー指摘 should-fix 2)。records は毎回
   // getRecords() から渡ってくるので、記録が増減・追記されていなければ計算し直さない。
-  var calibBinCache = null; // { n, lastT, pcBins, confBins }
-  function computeCalibBins(records, filter) {
-    var n = records.length;
-    var lastT = n > 0 ? records[n - 1].t : null;
+  var calibBinCache = null; // { n, lastT, filter, models, total, correctCount, puzzleCount, pcBins, confBins }
+  // 較正図の表示に必要なもの(モデル一覧・フィルタ後の記録・合計/正解率/問題数・帯)を
+  // まとめて計算し、記録数・最終追記時刻・フィルタが前回と同じなら再計算しない
+  // (render() のたびに全件をなめない。PR #25 のキャッシュ方針を維持。レビュー指摘 S5)。
+  function computeCalibView(allRecords, filter) {
+    var n = allRecords.length;
+    var lastT = n > 0 && allRecords[n - 1] ? allRecords[n - 1].t : null;
     if (calibBinCache && calibBinCache.n === n && calibBinCache.lastT === lastT && calibBinCache.filter === filter) {
       return calibBinCache;
+    }
+    var modelSet = {};
+    var records = [];
+    var correctCount = 0;
+    var puzzles = {};
+    for (var i = 0; i < allRecords.length; i++) {
+      var rec = allRecords[i];
+      if (!rec) continue;
+      var id = recordModelId(rec);
+      modelSet[id] = true;
+      if (filter !== "all" && id !== filter) continue;
+      records.push(rec);
+      if (rec.ok) correctCount++;
+      if (typeof rec.p === "string") puzzles[rec.p] = true;
     }
     calibBinCache = {
       n: n,
       lastT: lastT,
       filter: filter,
+      models: Object.keys(modelSet).sort(),
+      total: records.length,
+      correctCount: correctCount,
+      puzzleCount: Object.keys(puzzles).length,
       pcBins: binRecords(records, "pc"),
       confBins: binRecords(records, "conf")
     };
@@ -2299,36 +2342,19 @@ var PAGE_HTML = `<!doctype html>
 
   function renderCalibration() {
     var allRecords = getRecords();
-    // 記録に現れるモデルの一覧(フィルタの選択肢)。m の無い古い記録は Jev 扱い。
-    var modelSet = {};
-    for (var k = 0; k < allRecords.length; k++) {
-      if (allRecords[k]) modelSet[recordModelId(allRecords[k])] = true;
-    }
-    var models = Object.keys(modelSet).sort();
     var filter = state.calibModelFilter;
-    if (filter !== "all" && !modelSet[filter]) filter = "all"; // 記録に無いモデルは「すべて」扱い
-    var records = allRecords;
-    if (filter !== "all") {
-      records = [];
-      for (var j = 0; j < allRecords.length; j++) {
-        if (allRecords[j] && recordModelId(allRecords[j]) === filter) records.push(allRecords[j]);
-      }
+    var view = computeCalibView(allRecords, filter);
+    // 記録に無いモデルを選んでいたら「すべて」扱いで計算し直す(state の値は保持する)。
+    if (filter !== "all" && view.models.indexOf(filter) === -1) {
+      filter = "all";
+      view = computeCalibView(allRecords, filter);
     }
-    var total = records.length;
-    var correctCount = 0;
-    var puzzles = {};
-    for (var i = 0; i < records.length; i++) {
-      var rec = records[i];
-      if (!rec) continue;
-      if (rec.ok) correctCount++;
-      if (typeof rec.p === "string") puzzles[rec.p] = true;
-    }
-    var puzzleCount = Object.keys(puzzles).length;
-    var pct = total === 0 ? 0 : Math.round((correctCount / total) * 100);
-
-    var calibBins = computeCalibBins(records, filter);
-    var pcBins = calibBins.pcBins;
-    var confBins = calibBins.confBins;
+    var models = view.models;
+    var total = view.total;
+    var puzzleCount = view.puzzleCount;
+    var pct = total === 0 ? 0 : Math.round((view.correctCount / total) * 100);
+    var pcBins = view.pcBins;
+    var confBins = view.confBins;
 
     var options = "<option value=\\"all\\"" + (filter === "all" ? " selected" : "") + ">すべて</option>";
     for (var m = 0; m < models.length; m++) {
