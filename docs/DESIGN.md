@@ -44,13 +44,17 @@ export default {
     var url = new URL(request.url);
     if (url.pathname === "/api/judge" && request.method === "POST") return handleJudge(request, env);
     if (url.pathname === "/api/status" && request.method === "GET") return readRateLimitStatus(request, env);
-    if (url.pathname === "/" && request.method === "GET") return new Response(PAGE_HTML, { headers: { "content-type": "text/html; charset=utf-8" } });
+    if ((url.pathname === "/" || url.pathname === "/compare") && request.method === "GET") {
+      return new Response(PAGE_HTML, { headers: PAGE_HEADERS });
+    }
     return new Response("Not found", { status: 404 });
   },
 };
 ````
 
 `GET /api/status` は `readRateLimitStatus(request, env)`(3.2)。レート制限のカウンタを `peek` だけで読んで残り回数を返す。判定はしないので `AI.run` は呼ばない(SPEC 4章)。
+
+`GET /compare`(比較モード、Issue #46)は `GET /` と**同じ** `PAGE_HTML` / `PAGE_HEADERS` を返す。Worker 側で盤面や質問の中身が変わるわけではなく、差は「フロントが比較シェルを描くかどうか」だけなので、Worker 側にはルーティング1行を足すだけで済む(判定ロジックは一切触らない)。どちらの画面を描くかはフロントの `location.pathname` 判定に委ねる(4.2)。
 
 ### 3.2 `checkRateLimit(request, env)`
 
@@ -324,7 +328,30 @@ var started = false;
 var pendingCommit = null;       // API結果を受けて確定待ちの1件
 var runToken = 0;               // 実行の世代。reset() / showError() で +1 する(4.3)
 var inflightController = null;  // in-flight の /api/judge 用 AbortController(4.3、Issue #19)
+var embedMode = false;          // GET /?embed=1 で true(比較モードの iframe。Issue #46)。
+                                 // render() の描画範囲と postStatus() の要否を分ける
+// 比較シェル(GET /compare)専用のモジュール変数(Issue #46)。8章参照
+var compareStatus = { jev: null, claude: null };  // 直近の status メッセージ(iframe ごと)
+var compareStartedAt = null;    // 「実行」を押した時刻(ミリ秒)。経過秒の表示に使う
+var compareFrames = { jev: null, claude: null };  // <iframe> 要素への参照
+var compareEls = { topbar: null, statusJev: null, statusClaude: null }; // 直接更新する sub要素
+var compareGenerating = false;  // 「新しい問題」(比較シェル版)で生成中か
 ````
+
+**`readUrlOptions()` の結果(Issue #46)。** 通常ページ(`GET /`、`location.pathname !== "/compare"`)は起動時に一度だけ `location.search` を読み、`applyUrlOptions()` で次のように反映する。`localStorage` の設定より優先するが、`localStorage` には一切書き戻さない(通常ページの設定を汚さないため。`saveClaudeSettings()` を呼ばない)。
+
+````javascript
+{
+  puzzle: "<81文字>" | undefined, // 形式(9行×9文字、"1"〜"9"と"."のみ)が正しいときだけセット。
+                                   // 採用は applyPuzzleFromString() が一意解を確認してから
+  model:  "jev" | "claude" | undefined,
+  order:  "scan" | "confidence" | undefined,
+  speed:  "slow" | "fast" | undefined,
+  embed:  true | false             // "1" と一致したときだけ true
+}
+````
+
+`applyPuzzleFromString(str)` は `parsePuzzleString()`(81文字の正規表現チェック)→ `solveCount(rows, 2, solutions)` が1のときだけ `GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize` を差し替える(`newPuzzle()` がジェネレーターの結果を差し替えるのと同じ4項目)。形式不正・非一意解はそのまま無視され、固定問題(または直前の盤面)が残る。`readUrlOptions()` のパースは `URLSearchParams` を使わず、素朴な `parseQueryString()` で行う(node:vm のテストハーネスに追加のグローバルを増やさないため)。
 
 **集計ビューの記録は `state` に持たない。** 判定結果の記録(SPEC F1 拡張2、Issue #6)は
 `state.values` のような「今の実行」の状態ではなく、複数の問題・複数回の実行をまたいで
@@ -397,6 +424,11 @@ var inflightController = null;  // in-flight の /api/judge 用 AbortController(
 | `renderCalibration()` / `renderCalibrationChart(bins, title)` / `setCalibModelFilter(v)` / `recordModelId(rec)` | 集計パネル(見出し「較正図」)。`getRecords()` を読み、`state.calibModelFilter` でモデル(`rec.m`。無ければ `typesafe/jev`)を絞り込んでから(記録に無いモデルは「すべて」扱い)、合計件数・全体正解率・記録している問題数(`p` のユニーク数)を出したあと、`binRecords` の結果(記録数と最終追記時刻が前回と同じなら再計算しない軽いキャッシュ付き)を `pc` / `conf` 各10帯のインラインSVGの棒グラフ(対角線は理想の較正線)として横並びで描く。件数0の帯は棒を描かない。件数>0だが正解率0%の帯は高さ1pxの台座を描き、件数0の帯と見分けられるようにする(should-fix 2 / nit)。色は CSS 変数(`--accent` / `--muted` / `--border`)をそのまま使う |
 | `exportRecords()` | `getRecords()` の内容を `{ version:1, exported_at, records }` として `Blob` + `<a download>` でダウンロードさせる。ファイル名 `sudoku-calibration-YYYYMMDD-HHMMSS.json`(ローカル時刻) |
 | `clearRecords()` | `confirm()` で確認したうえで `saveRecords([])` し、再描画する |
+| `readUrlOptions()` / `applyUrlOptions(opts)` / `parseQueryString(search)` / `parsePuzzleString(str)` / `applyPuzzleFromString(str)` | URL パラメータ(Issue #46、SPEC F1')。`readUrlOptions()` は `location.search` を1回読んでパースするだけ(副作用なし)。`applyUrlOptions()` がそれを `state.modelMode` / `state.orderMode` / `state.speedMode` / `embedMode` に反映し、`puzzle` があれば `applyPuzzleFromString()` に渡す。`applyPuzzleFromString()` は `newPuzzle()` の「盤面差し替え」部分(`GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize`)をジェネレーターの代わりに一意解チェック(`solveCount(rows, 2, solutions)`)だけで行う共通処理で、埋め込みモードの `message` の `newPuzzle` からも呼ぶ |
+| `countCorrectValues()` | `state.values` で `status === "correct"` の件数。`renderStats()` と `postStatus()` の両方が使う(重複計算を避ける) |
+| `postStatus()` | 埋め込みモード(`embedMode`)の `render()` のたびに呼ばれる。`window.parent === window`(iframe でない)なら何もしない。`{ type:"status", model, round, correct, total, remaining, running, paused, done, roundsToSolve, stoppedAtLimit, errorMessage }` を `window.parent.postMessage(payload, location.origin)` する(SPEC F1') |
+| `setupEmbedMessageListener()` | 埋め込みモードの起動時に1回呼ぶ。`window.addEventListener("message", ...)` で親からの操作を受け、`event.origin === location.origin` のときだけ `run()` / `stop()` / `reset()` / (`newPuzzle` なら `applyPuzzleFromString()` → `reset()`) / `setSpeed()` / `setOrderMode()` を呼ぶ |
+| `renderCompareShell()` / `compareRun()` / `compareStop()` / `compareReset()` / `compareNewPuzzle()` / `compareSetSpeed()` / `compareSetOrderMode()` / `compareSetDifficulty()` / `updateCompareStatus()` / `setupCompareMessageListener()` | 比較シェル(`GET /compare`、Issue #46、8章)。`renderCompareShell()` は `app.innerHTML` を**最初の1回だけ**組み立て(上部バー・2つの `<iframe class="compare-frame">`・各ステータス欄)、直後に `document.querySelectorAll(".compare-topbar" / ".compare-status" / ".compare-frame")` で要素を拾って `compareEls` / `compareFrames` に保持する。以後の更新(`compareRun()` 等)は `app.innerHTML` を触らず、`compareEls.topbar.innerHTML` / `compareEls.statusJev.innerHTML` / `compareEls.statusClaude.innerHTML` だけを差し替える(iframe の再読み込みを避けるため)。`comparePostToFrames(message)` が両 `iframe.contentWindow` に同じメッセージを `postMessage(message, location.origin)` する。`setupCompareMessageListener()` は子からの `status` メッセージ(`event.origin` と `event.source`(どちらの `contentWindow` か)を確認)を `updateCompareStatus()` に振り分ける |
 
 ### 4.3 状態遷移(1マス)
 
@@ -570,7 +602,8 @@ new_sqlite_classes = ["RateLimitCounter"]
 - 上限を緩める(数値を大きくする、または `RATE_LIMITER` バインディングを外す)と、コストの上限が無くなる。特にバインディングを外すとフェイルオープンの設計上、制限なしで動いてしまう(カウンタが一時的に落ちた場合は 3.2 のとおりフェイルクローズで 503)。**理由なく緩めない**
 - リポジトリには秘密情報を置かない。`account_id` も置かない
 - `/api/judge` には CORS ヘッダーを付けない。加えて **`content-type` のメディアタイプが `application/json` でないリクエストは 415 で弾く**(`handleJudge` の最初、レート制限より前)。この2つはセットで意味を持つ: `application/json` の POST はブラウザで必ずプリフライトが必要になり、CORS ヘッダーを返していないのでプリフライトが通らず、他サイトのページからは呼べない。一方 `text/plain` などプリフライト不要の content-type はフォーム送信等でクロスサイトに投げられてしまうため、415 で入口を閉じる(第三者のサイトに埋め込まれて Workers AI のコストを消費される経路を塞ぐ)。`curl` 等からの直接アクセスはレート制限で頭打ちにする
-- `GET /` のレスポンスには `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、`Content-Security-Policy: frame-ancestors 'none'` を付ける(クリックジャッキング対策。インラインスクリプトを使うため、それ以上の CSP はかけない)
+- `GET /` `GET /compare` のレスポンスには `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、`Content-Security-Policy: frame-ancestors 'self'` を付ける(クリックジャッキング対策。インラインスクリプトを使うため、それ以上の CSP はかけない)。**`'self'`**(同一オリジンの iframe だけ許可)なのは、比較モード(`/compare`、Issue #46)が自分自身を `<iframe>` で2枚埋め込むため。他サイトの `<iframe>` に埋め込まれることは引き続き禁止(`'none'` のままだと比較モードが自分自身すら埋め込めなくなるので、そこだけを緩めた最小限の変更)
+- 埋め込みモード(`embed=1`)・比較シェル(`GET /compare`)間の `postMessage` は、双方向とも受信側で **`event.origin === location.origin` を確認してから処理する**(7章の CORS/415 と同じ「同一オリジンだけ許可」の考え方を `postMessage` にも適用したもの)。比較シェルはさらに `event.source`(どちらの `iframe.contentWindow` から届いたか)で送信元を区別する。送信側も `postMessage(payload, location.origin)` と `targetOrigin` を明示的に指定し、`"*"`(任意オリジン)は使わない
 - 3.3 の検証を通った盤面文字列だけが Jev に渡る(形式・対象マスが空であること・埋まっているマスが17個以上であることまで見る)
 - Claude 経路(3.6)の API キーは利用者のブラウザの `localStorage` にだけあり、`x-api-key` ヘッダーで `api.anthropic.com` にだけ送る。Worker・リポジトリ・記録・エクスポート・プロンプト表示・DOM のどこにも出ない(テスト V2 / V4 で確認)。公開ページに他人のキーを入れる行為自体のリスク(端末の共有・XSS)は利用者の判断に委ね、画面にその旨を書く
 - `SOLUTION` は Wikipedia の例題の答えなので秘密ではない。守るべきは「Jev に渡る `state` に `SOLUTION` が混ざらないこと」であり、そのために `SOLUTION` をブラウザ用スクリプトの中にだけ置き、Worker の判定コードから構造的に隔離する(8 章)
@@ -595,6 +628,8 @@ new_sqlite_classes = ["RateLimitCounter"]
 | Claude はブラウザから直接呼ぶ(BYOK)。Worker で中継しない | Worker で中継するとオーナーのキーで公開デモを動かすことになりコストの青天井、かつレート制限をもう一段作る羽目になる。利用者自身のキーなら課金は利用者持ちで Worker はステートレスなまま(3.6)。SDK を使わないのはビルドステップが無いため |
 | Claude の確率は structured outputs で自己申告させる | Claude には Jev のような確率出力が無い。JSON スキーマで `probabilities` を強制し、Jev と同じ形に揃えて以降の処理(バー・採点・記録・較正図)を共通化する。較正されている保証が無いことは実験の前提 |
 | Cloudflare 公式のテストツールでなく `node:test` | 単一ファイルの Module Worker をモックの `env` で直接呼ぶだけなら Node 22 の標準機能で足りる。依存を増やさず、Cloudflare の認証なしで CI が回る |
+| 比較モードは Jev/Claude を2インスタンス化せず、同じページを iframe で2枚並べる(Issue #46) | 判定ループの `state` / `queue` / 実行世代(`runToken`)はモジュールスコープの変数で、ページに1組しかない前提で書かれている(4.1・4.3)。これをモデルごとに2組持つよう書き直すと、`focusNext` / `finalizeRound` / `stop` などループ本体のほぼ全関数がどの組を触っているかを意識する必要が出て、既存の停止/再開・世代トークンの不変条件(4.3)を壊すリスクが大きい。iframe は「同じページをもう1つ、別のブラウジングコンテキストで動かす」だけなので、ページ側のロジックは一切変えずに済む。2枚が同一オリジンなので `localStorage`(記録・Claude のキー・設定)は自然に共有され、較正図には両モデルの記録が(モデルフィルタで見分けがつく形で)溜まる |
+| 比較シェルは `app.innerHTml` を最初の1回だけ組み立て、以後は sub要素だけを更新する | `render()` のように毎回 `innerHTML` を丸ごと作り直す方針(4.4)を比較シェルにもそのまま適用すると、ステータス表示(経過時間や周番号)が変わるたびに `<iframe>` タグ自体が新しい DOM ノードとして再生成され、**そのたびに iframe が再読み込みされて中の判定ループが最初からやり直しになる**。これでは比較にならないため、比較シェルだけは例外的に「初期構築(innerHTML 1回)+ 更新は対象 sub要素への直接代入」という、他の画面より一段 DOM 寄りの方針にしてある |
 
 ## 9. 変更時の不変条件
 
@@ -673,4 +708,9 @@ new_sqlite_classes = ["RateLimitCounter"]
     - W5: 2周目(1周目で1マス不正解になるスタブ)のマス選びの候補(`ask:"cell"` の `puzzle` の空マス)が不正解マスだけになること。周回ログの形式は従来どおり
     - W6: Claude 経路のマス選びのリクエストが `api.anthropic.com` へ行き、スキーマの `choice.enum` / `probabilities.required` が `selectionKeys()` と一致し、`system` が `CELL_NOTE` を含むこと(vm レルムの配列は `Array.prototype.slice.call` で host 側に移し替えてから比較する。hostRows と同じ理由)
     - W7: 確信度順でヒートマップの背景(`rgba(125, 211, 252`)がグリッドに出て、選択後にパネルへ「マス選び: N 候補中」が出ること。実行中は順番トグルが `disabled` になること
+  - **比較モード**(`test/page.test.js` X1〜X4、Issue #46)。`runScript` の harness に `opts.location`(`{ pathname, search, origin }`、既定 `{ pathname:"/", search:"", origin:"https://example.com" }`)と `opts.window`(`{ parent, addEventListener, postMessage }`、既定は自分自身が `parent` の自己参照オブジェクト)を追加。`opts.document` は丸ごと差し替えられる(比較シェルの iframe / `querySelectorAll` を検査する X4 用)
+    - X1: `puzzle=` で `GIVEN` / `SOLUTION` / `TOTAL_EMPTY` が差し替わること。矛盾した盤面(解0個)・形式不正(長さ81でない)はいずれも無視され、固定問題のままであること
+    - X2: `model=claude&order=confidence&speed=fast` で初期 `state` が変わること。`localStorage`(`scc.claude_settings.v1`)には一切書き戻らないこと。既定(`location.pathname==="/"`、`search:""`)では従来どおり(`jev`/`scan`/`slow`)であること
+    - X3: `embed=1` でコントロール・Claude設定・較正図・プロンプト枠・見出し(h1)が描かれず、グリッド・統計は描かれること。`message` の `run`/`stop`/`reset`/`newPuzzle` が同一オリジンのときだけ効き、他オリジンは無視されること。`render()` のたびに `status` が `window.parent.postMessage(payload, location.origin)` されること(第2引数が origin であることを含む)
+    - X4: `/compare` で2つの `iframe.compare-frame`(`model=jev` / `model=claude`)と上部バーが描かれること。「実行」(`compareRun()`)で両 `iframe.contentWindow.postMessage` に `{type:"run"}` が飛ぶこと。子からの `status` メッセージ(`event.source` で送信元を判定)で該当する見出し(`compareEls.statusJev` / `statusClaude`)だけが更新され、他オリジンの `status` は無視されること
 - CI(`.github/workflows/ci.yml`)は push と PR で `npm ci` → `npm test` → `npm run check` を実行する。`check` は `wrangler deploy --dry-run` で、認証なしで動く
