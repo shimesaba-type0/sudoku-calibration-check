@@ -3019,11 +3019,20 @@ test(
     assert.equal(messageHandlers.length, 1, "message リスナーが1つ登録されていない");
 
     // 他オリジンのメッセージは無視される
-    messageHandlers[0]({ origin: "https://evil.example", data: { type: "run" } });
+    messageHandlers[0]({ origin: "https://evil.example", source: fakeParent, data: { type: "run" } });
+    // 同一オリジンでも親以外のウィンドウからは無視(N2)
+    messageHandlers[0]({ origin: "https://example.com", source: {}, data: { type: "run" } });
+    assert.equal(ctx.state.running, false, "親以外からの run が効いてしまった");
+    // 未知の type や、隠したパネルの関数名は message から呼べない(N9)
+    ctx.appendRecord({ t: 1, p: "x", r: 0, c: 0, round: 1, choice: "1", pc: 0.5, conf: 0.5, ok: true });
+    messageHandlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "clearRecords" } });
+    messageHandlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "setSpeed", mode: "warp" } });
+    assert.equal(ctx.getRecords().length, 1, "未知の type で記録が消えた");
+    assert.equal(ctx.state.speedMode, "slow", "不正な setSpeed が通った");
     assert.equal(ctx.state.running, false, "他オリジンの run が実行されてしまった");
 
     // 同一オリジンの run は効く
-    messageHandlers[0]({ origin: "https://example.com", data: { type: "run" } });
+    messageHandlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "run" } });
     assert.equal(ctx.state.running, true, "同一オリジンの run が効かない");
 
     // render() のたびに status が親へ postMessage される(第2引数が origin)
@@ -3034,22 +3043,22 @@ test(
     assert.equal(lastRunning.data.running, true);
 
     // stop で running が false になる(in-flight の判定を打ち切る。既存の stop() の挙動)
-    messageHandlers[0]({ origin: "https://example.com", data: { type: "stop" } });
+    messageHandlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "stop" } });
     assert.equal(ctx.state.running, false, "同一オリジンの stop が効かない");
 
     // reset で最初から
-    messageHandlers[0]({ origin: "https://example.com", data: { type: "reset" } });
+    messageHandlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "reset" } });
     assert.equal(Object.keys(ctx.state.values).length, 0, "reset で values が空にならない");
     assert.equal(ctx.state.round, 1);
 
     // newPuzzle(検証は puzzle= と同じ: 一意解のときだけ差し替わる)
     var custom = ANSWER_KEY.slice();
     custom[0] = "." + custom[0].slice(1);
-    messageHandlers[0]({ origin: "https://example.com", data: { type: "newPuzzle", puzzle: custom.join("") } });
+    messageHandlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "newPuzzle", puzzle: custom.join("") } });
     assert.deepEqual(hostRows(ctx.GIVEN), custom, "message の newPuzzle が効いていない");
 
     // 完了まで走らせて、done の status も飛ぶことを確認する
-    messageHandlers[0]({ origin: "https://example.com", data: { type: "run" } });
+    messageHandlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "run" } });
     await waitFor(function () {
       return ctx.state.done === true;
     }, "X3: 完了待ち");
@@ -3135,6 +3144,18 @@ test("X4: /compare は2つの iframe(jev/claude)と上部バーを描き、「�
   assert.ok(out.indexOf("新しい問題") !== -1, "上部バーが描かれていない");
   assert.ok(out.indexOf("typesafe/jev") !== -1, "Jev のモデル名見出しが無い");
 
+  // 両 iframe から最初の status が届くまで「実行」は押せない(読み込み中…)(S3)
+  // 初期描画(app.innerHTML)の上部バーは「読み込み中…」(compareEls.topbar は in-place 更新用のスタブなので初期は空)
+  assert.ok(ctx.appElement.innerHTML.indexOf("読み込み中") !== -1, "読み込み中の表示が無い");
+  ctx.compareRun();
+  assert.equal(ctx.compareFrames.jev.postMessageCalls.length, 0, "読み込み前に run が送られた");
+  assert.equal(messageHandlers.length, 1, "status 用の message リスナーが1つ登録されていない");
+  var initialStatus = { type: "status", model: "typesafe/jev", round: 1, correct: 0, total: 51, remaining: 51, running: false, paused: false, done: false };
+  messageHandlers[0]({ origin: "https://example.com", source: ctx.compareFrames.jev.contentWindow, data: initialStatus });
+  messageHandlers[0]({ origin: "https://example.com", source: ctx.compareFrames.claude.contentWindow, data: Object.assign({}, initialStatus, { model: "claude-opus-5+think" }) });
+  assert.ok(ctx.compareEls.topbar.innerHTML.indexOf("読み込み中") === -1, "status 受信後も読み込み中のまま");
+  assert.ok(ctx.compareEls.statusClaude.innerHTML.indexOf("claude-opus-5+think") !== -1, "Claude 側のモデル名が status の model になっていない(N5)");
+
   // 「実行」を押すと両 iframe に run が送られる
   ctx.compareRun();
   assert.equal(ctx.compareFrames.jev.postMessageCalls.length, 1);
@@ -3144,7 +3165,6 @@ test("X4: /compare は2つの iframe(jev/claude)と上部バーを描き、「�
   assert.equal(ctx.compareFrames.claude.postMessageCalls[0].msg.type, "run");
 
   // 子(iframe)からの status メッセージで見出しが更新される
-  assert.equal(messageHandlers.length, 1, "status 用の message リスナーが1つ登録されていない");
   messageHandlers[0]({
     origin: "https://example.com",
     source: ctx.compareFrames.jev.contentWindow,

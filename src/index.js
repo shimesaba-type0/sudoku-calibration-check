@@ -1085,7 +1085,7 @@ var PAGE_HTML = `<!doctype html>
   .compare-status h2 { margin: 0 0 4px; font-size: 14px; font-family: "IBM Plex Mono", monospace; }
   .compare-meta { color: var(--muted); font-size: 12px; }
   .compare-notice { color: var(--incorrect); font-size: 12px; margin-top: 4px; }
-  .compare-frame { width: 100%; height: 900px; border: 1px solid var(--panel-border); border-radius: 10px; background: var(--panel-bg); }
+  .compare-frame { width: 100%; height: 1100px; border: 1px solid var(--panel-border); border-radius: 10px; background: var(--panel-bg); }
 
   @media (max-width: 900px) {
     .compare-frames { flex-direction: column; }
@@ -2170,16 +2170,19 @@ var PAGE_HTML = `<!doctype html>
   // ときは中身が分からないまま upsert すると全消しになりかねないので、
   // 何もせず黙って捨てる(このレコード1件だけを諦める。PR #25 レビュー指摘 should-fix 1)。
   function appendRecord(rec) {
-    if (recordsCache === null) {
-      var loaded = loadRecords();
-      if (!loaded.ok) return;
-      recordsCache = loaded.records;
+    // 追記のたびに localStorage を読み直す。比較モード(#46)では同一オリジンの 2 ページが
+    // 同じキーに書くので、自分のキャッシュに足して丸ごと書き戻すと相手の書き込みを踏み潰す
+    // (lost update。PR #49 レビュー指摘 M1)。読み取りキャッシュ(getRecords)は描画用に残し、
+    // ここで最新に置き換える。1 判定 = 1 API 往復なので JSON.parse 1 回のコストは無視できる。
+    var loaded = loadRecords();
+    if (!loaded.ok) return; // 読めない状態を「空」と取り違えて上書きしない(PR #25)
+    var records = loaded.records;
+    records.push(rec);
+    if (records.length > RECORDS_MAX) {
+      records = records.slice(records.length - RECORDS_MAX);
     }
-    recordsCache.push(rec);
-    if (recordsCache.length > RECORDS_MAX) {
-      recordsCache = recordsCache.slice(recordsCache.length - RECORDS_MAX);
-    }
-    saveRecords(recordsCache);
+    saveRecords(records);
+    recordsCache = records;
   }
 
   // -------------------------------------------------------------------
@@ -2696,6 +2699,8 @@ var PAGE_HTML = `<!doctype html>
   function setupEmbedMessageListener() {
     window.addEventListener("message", function (event) {
       if (!event || event.origin !== location.origin) return;
+      // 親(比較シェル)からのメッセージだけを受け付ける(同一オリジンの他ウィンドウは無視)
+      if (event.source !== window.parent) return;
       var data = event.data;
       if (!data || typeof data !== "object") return;
       if (data.type === "run") { run(); return; }
@@ -2705,7 +2710,7 @@ var PAGE_HTML = `<!doctype html>
         if (applyPuzzleFromString(data.puzzle)) reset();
         return;
       }
-      if (data.type === "setSpeed" && typeof data.mode === "string") { setSpeed(data.mode); return; }
+      if (data.type === "setSpeed" && (data.mode === "slow" || data.mode === "fast")) { setSpeed(data.mode); return; }
       if (data.type === "setOrderMode" && typeof data.mode === "string") { setOrderMode(data.mode); return; }
     });
   }
@@ -2725,8 +2730,20 @@ var PAGE_HTML = `<!doctype html>
     return "/?" + qs;
   }
 
-  function compareBothRunning() {
-    return !!(compareStatus.jev && compareStatus.jev.running) && !!(compareStatus.claude && compareStatus.claude.running);
+  // どちらか一方でも実行中なら「停止」を出す(片方がエラーで止まっても、もう片方を止められる
+  // ように。レビュー指摘 S1)。子の stop() は止まっている側には何もしない。
+  function compareEitherRunning() {
+    return !!(compareStatus.jev && compareStatus.jev.running) || !!(compareStatus.claude && compareStatus.claude.running);
+  }
+
+  function compareEitherPaused() {
+    return !!(compareStatus.jev && compareStatus.jev.paused) || !!(compareStatus.claude && compareStatus.claude.paused);
+  }
+
+  // 両 iframe から最初の status が届くまで(= 埋め込みページの message リスナーが用意できるまで)
+  // 「実行」を押させない。押しても届かずに無言で終わるため(S3)。
+  function compareFramesReady() {
+    return compareStatus.jev !== null && compareStatus.claude !== null;
   }
 
   function compareStatusText(status) {
@@ -2746,9 +2763,13 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function renderCompareTopbarHtml() {
-    var bothRunning = compareBothRunning();
-    var runLabel = bothRunning ? "停止" : "実行";
-    var runOnclick = bothRunning ? "compareStop()" : "compareRun()";
+    var running = compareEitherRunning();
+    var ready = compareFramesReady();
+    var runLabel = running ? "停止" : ready ? "実行" : "読み込み中…";
+    var runOnclick = running ? "compareStop()" : "compareRun()";
+    var runDisabled = ready ? "" : "disabled";
+    // 順番は実行中・停止中(周の途中)に変えない(子の setOrderMode と同じロック。S2)
+    var orderDisabled = running || compareEitherPaused() ? "disabled" : "";
     var slowActive = state.speedMode === "slow" ? " active" : "";
     var fastActive = state.speedMode === "fast" ? " active" : "";
     var scanActive = state.orderMode === "scan" ? " active" : "";
@@ -2759,7 +2780,7 @@ var PAGE_HTML = `<!doctype html>
     var newDisabled = compareGenerating ? "disabled" : "";
     var newLabel = compareGenerating ? "生成中…" : "新しい問題";
     return "<div class=\\"controls\\">" +
-      "<button id=\\"compare-run-btn\\" onclick=\\"" + runOnclick + "\\">" + runLabel + "</button>" +
+      "<button id=\\"compare-run-btn\\" onclick=\\"" + runOnclick + "\\" " + runDisabled + ">" + runLabel + "</button>" +
       "<button id=\\"compare-reset-btn\\" onclick=\\"compareReset()\\">リセット</button>" +
       "<button id=\\"compare-new-btn\\" onclick=\\"compareNewPuzzle()\\" " + newDisabled + ">" + newLabel + "</button>" +
       "<div id=\\"speed-toggle\\">" +
@@ -2767,8 +2788,8 @@ var PAGE_HTML = `<!doctype html>
       "<button class=\\"speed-btn" + fastActive + "\\" onclick=\\"compareSetSpeed('fast')\\">最速</button>" +
       "</div>" +
       "<div id=\\"order-toggle\\">" +
-      "<button class=\\"order-btn" + scanActive + "\\" onclick=\\"compareSetOrderMode('scan')\\">左上から</button>" +
-      "<button class=\\"order-btn" + confidenceActive + "\\" onclick=\\"compareSetOrderMode('confidence')\\">確信度順</button>" +
+      "<button class=\\"order-btn" + scanActive + "\\" onclick=\\"compareSetOrderMode('scan')\\" " + orderDisabled + ">左上から</button>" +
+      "<button class=\\"order-btn" + confidenceActive + "\\" onclick=\\"compareSetOrderMode('confidence')\\" " + orderDisabled + ">確信度順</button>" +
       "</div>" +
       "<div id=\\"difficulty-toggle\\">" +
       "<button class=\\"difficulty-btn" + easyActive + "\\" onclick=\\"compareSetDifficulty('easy')\\">やさしい</button>" +
@@ -2779,11 +2800,12 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function renderCompareStatusHtml(which) {
-    var modelId = which === "jev" ? JEV_MODEL_ID : state.claudeModel;
     var status = compareStatus[which];
-    var round = status ? status.round : 1;
-    var correct = status ? status.correct : 0;
-    var total = status ? status.total : TOTAL_EMPTY;
+    // モデル名は子が status で申告したもの(子の設定を正とする)。届く前は親の設定で仮表示。
+    var modelId = status && typeof status.model === "string" ? status.model : which === "jev" ? JEV_MODEL_ID : state.claudeModel;
+    var round = escapeHtml(String(status ? status.round : 1));
+    var correct = escapeHtml(String(status ? status.correct : 0));
+    var total = escapeHtml(String(status ? status.total : TOTAL_EMPTY));
     var notice = "";
     if (which === "claude" && loadAnthropicKey() === null) {
       notice = "<div class=\\"compare-notice\\">Claude のキー未設定(通常ページの設定パネルで保存してください)</div>";
@@ -2812,7 +2834,8 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function compareRun() {
-    if (compareBothRunning()) { compareStop(); return; }
+    if (compareEitherRunning()) { compareStop(); return; }
+    if (!compareFramesReady()) return;
     compareStartedAt = Date.now();
     comparePostToFrames({ type: "run" });
     renderCompareTopbarInPlace();
@@ -2841,6 +2864,7 @@ var PAGE_HTML = `<!doctype html>
 
   function compareSetOrderMode(mode) {
     if (mode !== "scan" && mode !== "confidence") return;
+    if (compareEitherRunning() || compareEitherPaused()) return; // 子と同じロック(S2)
     state.orderMode = mode;
     comparePostToFrames({ type: "setOrderMode", mode: mode });
     renderCompareTopbarInPlace();
@@ -2902,6 +2926,7 @@ var PAGE_HTML = `<!doctype html>
   // renderCompareStatusInPlace() が sub要素だけを差し替える。docs/DESIGN.md 8章)。
   function renderCompareShell() {
     var app = document.getElementById("app");
+    if (app.style) app.style.maxWidth = "1600px"; // 通常ページの 960px では 2 枚並べると窮屈(S5)
     app.innerHTML =
       "<h1>数独キャリブレーションチェック — 比較モード</h1>" +
       "<p class=\\"subtitle\\">同じ問題を Jev と Claude に同時に解かせて見比べる ・ <a href=\\"/\\">通常モードへ</a></p>" +
