@@ -619,7 +619,7 @@ var compareGenerating = false;  // 「新しい問題」(比較シェル版)で�
 | `buildClaudeAllRequest(puzzle,keys)` / `buildClaudeAllSchema(keys)` | 一括モード(Claude 経路)の1チャンクぶんのリクエスト組み立て(3.6)。`max_tokens` は既存の規則と一括専用の最低値の `Math.max`。`keys` はそのチャンクのキーだけ(呼び出し全体の `queue` ではない) |
 | `extractClaudeText(data)` | Messages API の応答から `stop_reason` のチェックとテキストブロックの取り出しだけを行う共通部分。`parseClaudeAnswer` / `parseClaudeAllAnswer` が共有する(重複していた抽出ロジックを一本化。Issue #48) |
 | `validateClaudeAllAnswer(answer,expectedKeys)` / `parseClaudeAllAnswer(data,expectedKeys)` | 一括モードの応答検証(3.6)。`answer` は `expectedKeys` をちょうど持つオブジェクトで、各値が `validateClaudeAnswer(answer[key], DIGITS)` と同じ基準を満たすこと。どのマスで落ちたかが文言に出る。Claude 経路はチャンク分割(Issue #74)されるので `expectedKeys` はそのチャンクのキーだけ(その周の `queue` 全体ではない)。Jev 経路(Worker、`ask:"all"`)はチャンク分割が無いので従来どおり `queue` 全体 |
-| `loadAnthropicKey()` / `saveAnthropicKey(key)` / `saveAnthropicKeyFromInput()` / `clearAnthropicKey()` | キーの読み書き(`scc.anthropic_key.v1`)。画面にはキーの値そのものも末尾のヒントも出さない(Issue #80。`renderClaudeSettings()` は `loadAnthropicKey() !== null` の真偽だけを「設定済み/未設定」に使う) |
+| `loadAnthropicKey()` / `saveAnthropicKey(key)` / `saveAnthropicKeyFromInput()` / `clearAnthropicKey()` | キーの読み書き(`scc.anthropic_key.v1`)。画面にはキーの値そのものも末尾のヒントも出さない(Issue #80 の追加要望、#84。`renderClaudeSettings()` は `loadAnthropicKey() !== null` の真偽だけを「設定済み/未設定」に使う) |
 | `loadClaudeSettings()` / `saveClaudeSettings()` / `setModelMode(mode)` / `setClaudeModel(model)` / `setClaudeThinking(on)` / `modelSettingsLocked()` / `currentModelId()` | モデル設定(`scc.claude_settings.v1`)。実行中・停止中(`isPaused()`)はロックして切り替えない。`currentModelId()` は記録の `m` に入れる識別子 |
 | `setOrderMode(mode)` | 順番トグル(Issue #38・#48)。`"scan"` / `"confidence"` / `"all"` のいずれか。`modelSettingsLocked()` と同じ条件でロックする(周の途中でマスの選び方が混ざらないように)。`localStorage` には保存しない |
 | `setHistoryMode(on)` / `setRuleMode(on)` | 消去法の2トグル(履歴 Issue #61 / ルール候補 Issue #63)。`setOrderMode` と同じ条件(`modelSettingsLocked()`)でロックし、`localStorage` には保存しない |
@@ -873,7 +873,11 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
   一括+最速の演出省略(`commitAllInstant()`)の「`render()` を挟まない」設計と無関係に
   常に動く)。`stopElapsedTicker()` を `haltRun()`(停止)・`showError()`(エラー停止)・
   `reset()`・`finalizeRound()` の完了/強制終了分岐で呼び、走っていないときは更新しない
-  (最後の値のまま。DESIGN 4.4 の既存方針と同じ)
+  (最後の値のまま。DESIGN 4.4 の既存方針と同じ)。**埋め込みモードでは
+  `tickElapsedDisplay()` が10 tick(≒1秒)に1回 `postStatus()` も呼ぶ**(Opus レビュー
+  S3)。比較シェルの見出しの「経過 X ms」は子(iframe)が `postStatus()` で申告した値を
+  表示するだけなので、これが無いと一括モードの応答待ち中はシェル側の数字だけ
+  止まって見えてしまう(`render()` 頻度に頼らない、という上記と同じ理由)
 - `innerHTML` を作り直すと周回ログのスクロールが先頭に戻るので、`render()` は置き換えの前に
   `#round-log ul` の `scrollTop` を保存し、置き換えの後に戻す。末尾に居たときは末尾のままにする
 - 速度モード(`setSpeed`)は実行中でも切り替えられる。**予約済みの `setTimeout` の残り時間は
@@ -924,12 +928,14 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
   見出し(`<summary>`)には `loadAnthropicKey() !== null` から「API キー(設定済み)」
   「API キー(未設定)」とだけ出し、以前あった `anthropicKeyHint()`(末尾4文字のヒント
   「保存済み(末尾 …xxxx)」)は不要という要望で関数ごと削除した。`saveAnthropicKey()` /
-  `clearAnthropicKey()` は従来どおり `render()` を呼ぶため、比較モードの
-  `prompt-details` と同じ理由(`render()` が `innerHTML` を丸ごと作り直す)で開閉状態を
+  `clearAnthropicKey()` は従来どおり `render()` を呼ぶため、一括モードのプロンプト枠
+  (`prompt-details`)と同じ理由(`render()` が `innerHTML` を丸ごと作り直す)で開閉状態を
   引き継ぐ必要があり、`render()` に `oldKeyDetails`/`keyDetailsWasOpen` の対を
   `document.querySelector("details.claude-key-details")` で別建てし(`prompt-details`
   とは class が違うので `document.querySelector()` が別々に拾える。互いに干渉しない)、
   保存/削除操作の直後にパネルが閉じて `claudeKeyNotice`(注意文)が見えなくなる回帰を防いだ
+  (**比較シェルの `prompt-details` はこの仕組みの対象外**で開閉状態を引き継がない。上記
+  「比較モードのプロンプト可視化」参照)
 - **確信度順モード(Issue #38)** は `state.orderMode` だけで分岐し、`buildCellStyle` /
   `renderCurrentPanel` / `renderPromptPanel` / `renderLegend` / `renderControls` の既存の
   関数にロジックを足す形にしてある(専用のコンポーネントを新設しない)。ヒートマップは
@@ -1182,7 +1188,7 @@ new_sqlite_classes = ["RateLimitCounter"]
   - **UI レイアウト刷新(Issue #76)**(`test/page.test.js` AC1・AC2)
     - AC1: `renderBanner()` の完了バナーに `formatMs(totalElapsedMs)` の所要時間が「(所要 X ms)」として添えられること、強制終了バナーにも同様に出ること、未完了(`state.done===false`)のときはバナー自体が空(`<div id="completion-banner"></div>`)のままなこと
     - AC2(PR #78 の Opus レビュー S1): `document.activeElement` が `.top-controls` 内の `<select>`(`isControlSelectFocused()` が見る6つの id のいずれか)のとき `render()` が `app.innerHTML` を書き換えずに早期リターンすること(state 自体は更新される)。`<select>` 以外の要素にフォーカスがあるときはガードされないこと。フォーカスが外れたあとの次の `render()` で最新の state が反映されること(`git stash` でガード導入前のコードに戻すと落ちることを確認済み)
-  - **一括+最速の描画省略・現在の判定の経過時間・比較モードのプロンプト可視化(Issue #80、オーナー要望 2026-09-23)**(`test/page.test.js` AD1〜AD9)
+  - **一括+最速の描画省略・現在の判定の経過時間・比較モードのプロンプト可視化(Issue #80・#84、オーナー要望 2026-09-23)**(`test/page.test.js` AD1〜AD11)
     - AD1: 一括+最速+`instantMode` で応答が届いたあと、`document.getElementById("app").innerHTML` への書き込み回数(render 回数)が1マスずつのときと比べて少数(2回以下)で完了まで至ること。全マスが確定し、記録の `m`/`o` が通常の一括モードと同じで、usage(`makeAllResponse().json()` に `usage` を足したもの)が周の先頭レコードだけに付くこと(`git stash` で `commitAllInstant()` 導入前のコードに戻すと落ちることを確認済み)
     - AD2: `renderControls()` の `instant-toggle` が「左上から+じっくり」「一括+じっくり」では無効化され、「一括+最速」でだけ有効になること。実行中(`state.running=true`)はロックされ、`setInstantMode()` を直接呼んでも `modelSettingsLocked()` で無視されること。選択肢のラベル(「毎回表示」/「省略(最速)」)が出ること
     - AD3: `state.instantMode=true` のまま `orderMode="all"`・`speedMode="slow"` で `run()` すると(UI 上は無効化される組み合わせを直接 state で立てても)、`commitAllInstant()` ではなく従来どおり `focusCellFromCache()` の1マスずつのフローに入ること(応答直後に即完了せず、1マス目がフォーカスされるまで `state.done===false` のままであることを確認する)
@@ -1191,6 +1197,8 @@ new_sqlite_classes = ["RateLimitCounter"]
     - AD6: `document.activeElement` が `.top-controls` 内の `<select>` でも `state.running===false` のときは `render()` がガードされないこと(Opus レビュー M1)。`setSpeed("fast")` を select にフォーカスがある状態で呼んでも、`instant-toggle` の無効化状態が最新の `state` に更新されること
     - AD7(オーナー追加要望): `run()` が `startElapsedTicker()` で `setInterval(tickElapsedDisplay, 100)` を1つ登録すること(`ctx.intervalRegistry` から確認)。登録された関数を手動で1回呼ぶと、`render()` を挟まなくても(`document.getElementById("app").innerHTML` を書き換えなくても)`#current-elapsed` の `textContent` が `currentTotalElapsedMs()` の最新値に更新されること。完了(`state.done=true`)すると `setInterval` がクリアされること
     - AD8: `renderClaudeSettings()` がモデル選択・思考トグルを常に見える位置に、API キーの入力欄・保存/削除ボタンを `<details class="claude-key-details">`(既定で閉じている)の中に分けて出すこと。見出しには「API キー(設定済み)」「API キー(未設定)」の状態だけが出て、末尾4文字のヒント(`anthropicKeyHint()`。この PR で関数ごと削除)は出ないこと
-    - AD9: `saveAnthropicKey()` / `clearAnthropicKey()` は `render()` を呼ぶが、`details.claude-key-details` が開いていた場合は閉じずに引き継ぐこと(`render()` の `oldKeyDetails`/`keyDetailsWasOpen` の仕組み。開いたまま保存に失敗すると `claudeKeyNotice` の注意文が見えなくなる回帰を防ぐ)
+    - AD9: `saveAnthropicKeyFromInput()`(空入力で保存失敗)は `render()` を呼ぶが、`details.claude-key-details` が開いていた場合は閉じずに引き継ぎ、`claudeKeyNotice`(「キーが空です」)が開いたままのパネルにちゃんと出ること(`render()` の `oldKeyDetails`/`keyDetailsWasOpen` の仕組み。Opus レビュー N4 で、直接 `render()` を呼ぶだけだったものを実際の保存失敗経路に差し替えた)
+    - AD10(Opus レビュー S1): `setInterval` が手動 `stop()`・一時的な失敗(429)による停止・エラー停止(400)・強制終了(`MAX_ROUNDS` を縮めて再現)・実行中の `reset()` のどの経路でも `intervalRegistry` から消えること(各経路ごとに新しい `runScript()` で確認)
+    - AD11(Opus レビュー S3): 埋め込みモードでは `tickElapsedDisplay()` が10回に1回(`ELAPSED_TICK_POST_EVERY`)`postStatus()` を送ること。`intervalRegistry` から取り出した tick 関数を手動で9回・10回目と呼び分けて確認する
 - E2E モック(`scripts/e2e/smoke.mjs`)の `/api/judge` 応答(`digit` / `cell` / `all` すべて)に固定の `usage`(`{ input_tokens, output_tokens }`)を足し、周回ログの1行目(`[2]` `[7]` `[9]` `[8]`)に `— <N,NNN> ms / $<...>` の形が出ることをチェックに追加した(Issue #55・#56)。`digit` / `all` は `body.exclude`(消去法。Issue #61・#63)を読み、残りの数字だけを `probabilities` / `choice` の候補にする(`remainingDigitsMock()`)。統計カードが5枚になった(Issue #60)ため `[1]` の `statValues` の件数・添字を更新した
 - CI(`.github/workflows/ci.yml`)は push と PR で `npm ci` → `npm test` → `npm run check` を実行する。`check` は `wrangler deploy --dry-run` で、認証なしで動く

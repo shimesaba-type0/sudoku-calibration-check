@@ -2360,17 +2360,30 @@ var PAGE_HTML = `<!doctype html>
     return roundElapsedMs + (runningSince !== null && roundStarted ? nowMs() - runningSince : 0);
   }
 
-  // 「現在の判定」パネルの経過時間をリアルタイムに更新する(オーナー要望 2026-09-23、Issue #80
-  // 追加要望)。以前は render() のたびにしか更新されず、一括モードの fetch 待ち中(数秒〜数十秒
+  // 「現在の判定」パネルの経過時間をリアルタイムに更新する(オーナー要望 2026-09-23、Issue #84)。
+  // 以前は render() のたびにしか更新されず、一括モードの fetch 待ち中(数秒〜数十秒
   // render() が挟まらない)は止まって見えていた。render() を丸ごと呼ぶ代わりに
   // #current-elapsed の textContent だけを書き換えるので、top-controls の <select> に
   // フォーカスがある間 render() を止めるガード(4.4)や、一括モードの演出省略
   // (commitAllInstant()、Issue #80)の「render() を挟まない」設計とも無関係に、常に動く。
   var elapsedTimer = null;
   var ELAPSED_TICK_MS = 100; // 「ミリ秒単位で」に対して見た目が滑らかに動く程度の間隔
+  var elapsedTickCount = 0;
+  // 埋め込みモード(比較シェルの iframe)では、この iframe の postStatus() を何 tick に
+  // 1回送るか。postStatus() は一括モードの lastAllRequest 等も含みやや重いので、
+  // 100msごとではなく1000ms(10 tick)に1回にする(Opus レビュー S3、Issue #84)。
+  var ELAPSED_TICK_POST_EVERY = 10;
   function tickElapsedDisplay() {
     var el = document.getElementById("current-elapsed");
     if (el) el.textContent = formatMs(currentTotalElapsedMs());
+    // 比較シェルの見出しの「経過 X ms」は子(iframe)が postStatus() で申告した値を
+    // そのまま表示するだけなので(DESIGN 4.2)、render() を待たずにこの tick からも
+    // 定期的に申告しないと、一括モードの応答待ち中はシェル側の数字だけ止まって見える
+    // (「Claude が動いているか分からない」に似た「止まって見える」問題。Issue #84 追加)。
+    if (embedMode) {
+      elapsedTickCount++;
+      if (elapsedTickCount % ELAPSED_TICK_POST_EVERY === 0) postStatus();
+    }
   }
   function startElapsedTicker() {
     stopElapsedTicker();
@@ -3101,7 +3114,7 @@ var PAGE_HTML = `<!doctype html>
   // 戻り値は judgeCellJev と同じ形 { probabilities, choice, confidence, request }。
   async function judgeCellClaude(puzzle, r, c, exclude, signal) {
     var key = loadAnthropicKey();
-    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」でキーを保存してください)");
+    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」の「API キー(未設定)」を開いて保存してください)");
     var body = buildClaudeRequest(puzzle, r, c, exclude);
     var res;
     try {
@@ -3158,7 +3171,7 @@ var PAGE_HTML = `<!doctype html>
   // 戻り値は askCellJev と同じ形 { probabilities, choice, confidence, request, cell }。
   async function askCellClaude(puzzle, signal) {
     var key = loadAnthropicKey();
-    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」でキーを保存してください)");
+    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」の「API キー(未設定)」を開いて保存してください)");
     var keys = selectionKeys();
     var body = buildClaudeCellRequest(puzzle, keys);
     var res;
@@ -3292,7 +3305,7 @@ var PAGE_HTML = `<!doctype html>
   // docs/DESIGN.md 3.6)
   async function askAllClaude(puzzle, excludeByKey, signal) {
     var key = loadAnthropicKey();
-    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」でキーを保存してください)");
+    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」の「API キー(未設定)」を開いて保存してください)");
     var keys = selectionKeys();
     var chunks = chunkArray(keys, CLAUDE_ALL_CHUNK_SIZE);
     var settled = await Promise.allSettled(chunks.map(function (chunkKeys) {
@@ -5340,7 +5353,7 @@ var PAGE_HTML = `<!doctype html>
     // 1マスごとに render() が走るので、引き継がないと開いた直後に閉じてしまう。
     var oldDetails = document.querySelector("details.prompt-details");
     var detailsWasOpen = oldDetails ? oldDetails.open === true : false;
-    // API キー設定の折りたたみ(Issue #80 追加要望)も同じ理由で引き継ぐ。既定で
+    // API キー設定の折りたたみ(Issue #80 の追加要望、#84)も同じ理由で引き継ぐ。既定で
     // 閉じているが、保存/削除のボタンは render() を呼ぶので、開いたまま操作した直後に
     // 閉じてしまうとエラー表示(claudeKeyNotice)が見えなくなる。別クラスにしてあるので
     // 上の「一括モードのプロンプト枠」の追跡とは独立に動く。

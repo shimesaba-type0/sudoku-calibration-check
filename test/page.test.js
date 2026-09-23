@@ -135,7 +135,7 @@ function runScript(html, options) {
   // 振る舞いテスト(#32 T3)がタイマーの発火タイミングそのものを制御したいときに使う)。
   // opts.setTimeout が無ければ従来どおり setImmediate で即座に(delay を無視して)実行する。
   var setTimeoutCalls = [];
-  // startElapsedTicker()(Issue #80 追加要望)の setInterval/clearInterval。テストは自動で
+  // startElapsedTicker()(Issue #84)の setInterval/clearInterval。テストは自動で
   // 定期実行させず(vm を無限に回さない)、intervalRegistry から手動で1回ぶんの fn を
   // 呼んでティックをシミュレートする。id は setInterval の戻り値をそのまま使う。
   var intervalRegistry = {};
@@ -5775,12 +5775,135 @@ test("AD9: API キー設定の折りたたみは render() をまたいで開閉�
   ctx.setModelMode("claude");
   ctx.saveAnthropicKey(TEST_KEY);
 
-  // ユーザーが開いた状態を模してから、保存/削除ボタンと同じ経路(render() を呼ぶ関数)を通す
+  // ユーザーが開いた状態を模してから、実際の保存ボタンの経路(saveAnthropicKeyFromInput()。
+  // 中で render() を呼ぶ)で空の入力を保存させ、失敗の注意書き(claudeKeyNotice)が
+  // ちゃんと出る・かつ折りたたみが閉じないことを確認する(レビュー N4: このテストが
+  // 防ぎたい回帰そのもの — 開いたまま保存に失敗すると、以前は render() で閉じてしまい
+  // 注意書きが見えなくなっていた)
   keyDetailsEl.open = true;
-  ctx.render();
-  assert.equal(keyDetailsEl.open, true, "開いていた API キー設定が render() で閉じてしまった(保存直後の注意書きが見えなくなる)");
+  var fakeInput = { value: "   " };
+  fakeDoc.getElementById = function (id) {
+    if (id === "app") return app;
+    if (id === "anthropic-key-input") return fakeInput;
+    return null;
+  };
+  ctx.saveAnthropicKeyFromInput();
+  assert.equal(keyDetailsEl.open, true, "開いていた API キー設定が render() で閉じてしまった(保存失敗の注意書きが見えなくなる)");
+  assert.ok(htmlValue.includes("キーが空です"), "開いたままのはずなのに保存失敗の注意書きが出ていない: " + htmlValue);
 
   keyDetailsEl.open = false;
   ctx.render();
   assert.equal(keyDetailsEl.open, false, "閉じていたのに render() で勝手に開いた");
+});
+
+test("AD10: 経過時間の setInterval は停止・一時的な失敗・エラー停止・強制終了・リセットのどの経路でも確実に止まる(Opus レビュー S1)", { timeout: 20000 }, async () => {
+  function activeIntervalCount(ctx) {
+    return Object.keys(ctx.intervalRegistry).length;
+  }
+
+  // (a) 手動 stop()(haltRun 経由)
+  {
+    var af = makeAbortAwareFetch();
+    var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+    ctx.run();
+    await waitFor(function () { return af.pending.length === 1; }, "AD10a: fetch 待ち");
+    assert.equal(activeIntervalCount(ctx), 1, "run() 直後に setInterval が1つ登録されていない");
+    ctx.stop();
+    assert.equal(activeIntervalCount(ctx), 0, "手動 stop() 後も setInterval が残っている(haltRun 経由)");
+  }
+
+  // (b) 一時的な失敗(429)による停止(pauseForTransientError → haltRun 経由)
+  {
+    var af = makeAbortAwareFetch();
+    var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+    ctx.run();
+    await waitFor(function () { return af.pending.length === 1; }, "AD10b: fetch 待ち");
+    assert.equal(activeIntervalCount(ctx), 1);
+    af.pending.shift().resolve({
+      ok: false,
+      status: 429,
+      json: function () { return Promise.resolve({ error: "レート制限" }); },
+    });
+    await waitFor(function () { return ctx.isPaused(); }, "AD10b: 一時的な失敗の停止待ち");
+    assert.equal(activeIntervalCount(ctx), 0, "一時的な失敗の停止後も setInterval が残っている(haltRun 経由)");
+  }
+
+  // (c) エラー停止(400、showError 経由)
+  {
+    var af = makeAbortAwareFetch();
+    var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+    ctx.run();
+    await waitFor(function () { return af.pending.length === 1; }, "AD10c: fetch 待ち");
+    assert.equal(activeIntervalCount(ctx), 1);
+    af.pending.shift().resolve({
+      ok: false,
+      status: 400,
+      json: function () { return Promise.resolve({ error: "入力が不正です" }); },
+    });
+    await waitFor(function () { return ctx.state.errorMessage !== null; }, "AD10c: エラー停止待ち");
+    assert.equal(activeIntervalCount(ctx), 0, "エラー停止後も setInterval が残っている(showError 経由)");
+  }
+
+  // (d) 強制終了(finalizeRound の limit 分岐)。MAX_ROUNDS を縮めてすぐ再現する
+  {
+    var af = makeAbortAwareFetch();
+    var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+    assert.ok(ctx.applyPuzzleFromString(blankCells(ANSWER_KEY, [[0, 0]])), "AD10d: 1マス盤面の適用に失敗した");
+    ctx.MAX_ROUNDS = 2; // 2周とも不正解にして、2周で強制終了させる
+    ctx.run();
+    for (var i = 0; i < 1000 && !ctx.state.done; i++) {
+      while (af.pending.length) {
+        var item = af.pending.shift();
+        if (item.settled) continue;
+        var body = JSON.parse(item.init.body);
+        var correctDigit = ctx.SOLUTION[body.target.row][body.target.col];
+        var wrongDigit = correctDigit === "1" ? "2" : "1";
+        var probabilities = {};
+        ["1", "2", "3", "4", "5", "6", "7", "8", "9"].forEach(function (d) { probabilities[d] = d === wrongDigit ? 0.9 : 0.0125; });
+        item.resolve({ ok: true, json: async function () { return { probabilities: probabilities, choice: wrongDigit, confidence: 0.5, request: {} }; } });
+      }
+      await tick();
+    }
+    assert.equal(ctx.state.stoppedAtLimit, true, "AD10d: 前提(強制終了)が崩れている");
+    assert.equal(activeIntervalCount(ctx), 0, "強制終了後も setInterval が残っている(finalizeRound の limit 分岐)");
+  }
+
+  // (e) 実行中の reset()(SPEC F5: 実行中でも押せる)
+  {
+    var af = makeAbortAwareFetch();
+    var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+    ctx.run();
+    await waitFor(function () { return af.pending.length === 1; }, "AD10e: fetch 待ち");
+    assert.equal(activeIntervalCount(ctx), 1);
+    ctx.reset();
+    assert.equal(activeIntervalCount(ctx), 0, "実行中の reset() 後も setInterval が残っている");
+  }
+});
+
+test("AD11: 埋め込みモードでは経過時間のティックが10回に1回 postStatus() も送る(Opus レビュー S3: 比較シェルの経過時間表示が一括モードの応答待ち中に止まって見える問題への対応)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var posted = [];
+  var fakeWindow = {
+    parent: { postMessage: function (payload, origin) { posted.push({ payload: payload, origin: origin }); } },
+    addEventListener: function () {},
+  };
+  var ctx = runScript(await getPageHtml(), {
+    fetch: af.fetch,
+    location: { pathname: "/", search: "embed=1", origin: "https://example.com" },
+    window: fakeWindow,
+  });
+  ctx.run();
+  await waitFor(function () { return af.pending.length === 1; }, "AD11: fetch 待ち");
+
+  var ids = Object.keys(ctx.intervalRegistry);
+  assert.equal(ids.length, 1, "run() が setInterval を1つ登録していない");
+  var tickFn = ctx.intervalRegistry[ids[0]].fn;
+
+  var postsBeforeTicks = posted.length; // render() 自体も postStatus() を送るので、ここを基準にする
+  for (var i = 1; i <= 9; i++) tickFn();
+  assert.equal(posted.length, postsBeforeTicks, "10回未満のティックで postStatus() が送られてしまった: " + posted.length);
+  tickFn(); // 10回目
+  assert.ok(posted.length > postsBeforeTicks, "10回目のティックで postStatus() が送られていない(比較シェルの数字が止まって見える)");
+  var last = posted[posted.length - 1];
+  assert.equal(typeof last.payload.elapsedMs, "number", "ティック経由の postStatus() の payload に elapsedMs が無い");
 });
