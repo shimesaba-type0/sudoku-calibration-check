@@ -1208,7 +1208,7 @@ var PAGE_HTML = `<!doctype html>
   .speed-btn.active, .difficulty-btn.active, .model-btn.active, .thinking-btn.active, .order-btn.active { background: var(--accent); color: #0b1220; }
   .claude-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 8px; }
   .claude-row label { font-size: 13px; color: var(--muted); }
-  input[type="password"], select {
+  input[type="password"], input[type="number"], select {
     font-family: inherit;
     font-size: 13px;
     color: var(--text);
@@ -1221,6 +1221,12 @@ var PAGE_HTML = `<!doctype html>
   select option { background: var(--panel-bg); color: var(--text); }
   .claude-notice { font-size: 12px; color: var(--incorrect); }
   #calib-model-filter { font-size: 12px; padding: 3px 6px; }
+
+  /* 単価パネル(Issue #56) */
+  .price-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 6px; font-size: 13px; }
+  .price-row .price-model { flex: 0 0 170px; color: var(--muted); font-family: "IBM Plex Mono", monospace; font-size: 12px; }
+  .price-row label { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
+  .price-row input[type="number"] { width: 90px; padding: 5px 8px; }
 
   #error-box.error {
     background: var(--error-bg);
@@ -1275,6 +1281,8 @@ var PAGE_HTML = `<!doctype html>
 
   #round-log ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
   #round-log li { font-size: 12px; font-family: "IBM Plex Mono", monospace; color: var(--muted); }
+  #round-log li.round-log-total { color: var(--text); font-weight: 600; }
+  .elapsed-line { margin-top: 8px; }
 
   .banner { border-radius: 8px; padding: 12px 14px; font-size: 14px; font-weight: 600; }
   .banner.success { background: var(--correct-bg); color: var(--correct); border: 1px solid var(--correct); }
@@ -1925,20 +1933,293 @@ var PAGE_HTML = `<!doctype html>
   // (iframe を含む app.innerHTML を丸ごと作り直すと、そのたびに両 iframe が再読み込み
   // されて進行状況が消えてしまうため。docs/DESIGN.md 8章)。
   var compareStatus = { jev: null, claude: null }; // 直近の status メッセージ(iframe ごと)
-  var compareStartedAt = null; // 「実行」を押した時刻(ミリ秒)。経過秒の表示に使う
   var compareFrames = { jev: null, claude: null }; // <iframe> 要素(DOM参照)
   var compareEls = { topbar: null, statusJev: null, statusClaude: null }; // 更新対象の sub要素
   var compareGenerating = false; // 「新しい問題」で生成中か(比較シェル版)
+  // 比較シェル自身の経過時間計測(compareStartedAt)は Issue #55 で廃止。子(iframe)が
+  // postStatus() で elapsedMs / costUsd を申告してくるので、親はそれをそのまま表示する
+  // (再開で親側の計測がリセットされてしまう問題も、子任せにすることで解消する)。
+
+  // -------------------------------------------------------------------
+  // 計時・コスト(Issue #55・#56、docs/DESIGN.md 4.1・5章)。
+  // - 周ごと/全体の「走っている時間」は、停止中(手動 stop() / 一時的な失敗による停止)を
+  //   数えない。runningSince(現在の実行区間の開始時刻。null なら停止中)+
+  //   roundElapsedMs / totalElapsedMs(それぞれの積算)という形で持つ。
+  // - 周の計測は「その周で最初のリクエストを送った時刻」から始める(周をまたぐ待ち時間は
+  //   全体の計測にだけ入れる)。markRoundStarted() がその切り替え点。
+  // - Date.now() は必ず nowMs() 経由にする(テストで差し替えられるように)。
+  // -------------------------------------------------------------------
+  function nowMs() {
+    return Date.now();
+  }
+
+  var runningSince = null;  // 現在の実行区間の開始時刻(nowMs())。null なら停止中
+  var totalElapsedMs = 0;   // 「実行」から完了/強制終了までの走っている時間の累計
+  var roundElapsedMs = 0;   // 今の周で最初のリクエストを送ってから走っている時間の累計
+  var roundStarted = false; // 今の周でまだ最初のリクエストを送っていないか
+  var totalCostUsd = 0;     // この実行(reset() されるまで)の累計コスト
+  var roundCostUsd = 0;     // 今の周の累計コスト
+  // 一括モード(Issue #48)の周の先頭1件にだけ usage/レイテンシを付けるための一時置き場
+  // (askAllRound() の応答で立て、focusCellFromCache() の最初の確定で消費して null に戻す)。
+  var pendingAllUsage = null;
+
+  // 周の最初のリクエストを送る直前に呼ぶ(focusCellForDigit / selectNextCell /
+  // askAllRound の先頭)。二度目以降は roundStarted で弾かれるので無条件に呼んでよい。
+  // それまでの経過(周をまたぐ待ちなど)は全体の計測にだけ入れて、周の計測はここから測り直す。
+  function markRoundStarted() {
+    if (roundStarted) return;
+    if (runningSince !== null) {
+      totalElapsedMs += nowMs() - runningSince;
+      runningSince = nowMs();
+    }
+    roundStarted = true;
+  }
+
+  // 停止(手動 stop() / 一時的な失敗による停止 / エラー停止)で呼ぶ。走っている区間の分を
+  // 両方の累計に足し込み、時計を止める(周の積算は保ったまま。再開すれば続きから測れる)。
+  function pauseClock() {
+    if (runningSince === null) return;
+    var delta = nowMs() - runningSince;
+    totalElapsedMs += delta;
+    if (roundStarted) roundElapsedMs += delta;
+    runningSince = null;
+  }
+
+  // 周の終わり(finalizeRound)で呼ぶ。走っている区間の分を両方の累計に足し込み、
+  // この周の最終値を返してから、次の周のために周の積算をリセットする。keepRunning が
+  // true(次の周へ続く)なら時計は動かしたまま(再アンカー)、false(完了/強制終了)なら止める。
+  function closeRoundClock(keepRunning) {
+    if (runningSince !== null) {
+      var delta = nowMs() - runningSince;
+      totalElapsedMs += delta;
+      if (roundStarted) roundElapsedMs += delta;
+      runningSince = keepRunning ? nowMs() : null;
+    }
+    var ms = roundElapsedMs;
+    roundElapsedMs = 0;
+    roundStarted = false;
+    return ms;
+  }
+
+  // 表示用(読み取るだけで状態を変えない)。走っていないときは最後の値のまま(DESIGN 4.4)。
+  function currentTotalElapsedMs() {
+    return totalElapsedMs + (runningSince !== null ? nowMs() - runningSince : 0);
+  }
+  function currentRoundElapsedMs() {
+    return roundElapsedMs + (runningSince !== null && roundStarted ? nowMs() - runningSince : 0);
+  }
+
+  // 較正図のモデルフィルタと同じ考え方で、一括モード(Issue #48)は "/all" を足した識別子を使う
+  // (commitFocused() の記録の m と同じ組み立て方)。
+  function activeModelIdForPricing() {
+    return state.orderMode === "all" ? currentModelId() + "/all" : currentModelId();
+  }
+
+  // 3桁ごとにカンマを入れる(Intl に頼らず、node:vm のテストハーネスでも決定的に動くように)。
+  function formatThousands(n) {
+    var neg = n < 0;
+    var s = String(Math.round(Math.abs(n)));
+    var out = "";
+    while (s.length > 3) {
+      out = "," + s.slice(-3) + out;
+      s = s.slice(0, -3);
+    }
+    out = s + out;
+    return neg ? "-" + out : out;
+  }
+
+  // ミリ秒の表示("3,214 ms")。負値・非数値は 0 扱い。
+  function formatMs(ms) {
+    var n = typeof ms === "number" && isFinite(ms) ? ms : 0;
+    if (n < 0) n = 0;
+    return formatThousands(n) + " ms";
+  }
+
+  // ドルの表示。$0.01 以上は小数4桁まで(末尾0は削る)、それ未満は有効数字2桁程度
+  // ($0.00003、$0.0004、$0.012)。0 以下は "$0"(SPEC 5章)。
+  function formatUsd(x) {
+    var v = typeof x === "number" && isFinite(x) && x > 0 ? x : 0;
+    if (v === 0) return "$0";
+    var digits;
+    if (v >= 0.01) {
+      digits = v.toFixed(4);
+    } else {
+      var exp = Math.floor(Math.log10(v));
+      var decimals = Math.min(20, Math.max(0, -exp + 1));
+      digits = v.toFixed(decimals);
+    }
+    digits = digits.replace(/0+$/, "").replace(/\\.$/, "");
+    return "$" + digits;
+  }
+
+  // 単価が見つからないモデルには "(単価未設定)" を添える(SPEC 5章)。
+  function formatUsdForModel(x, modelId) {
+    var text = formatUsd(x);
+    if (!isPricedModel(modelId)) text += "(単価未設定)";
+    return text;
+  }
+
+  // -------------------------------------------------------------------
+  // 単価(コスト計算、Issue #56)。100万トークンあたりの USD。既定値は SPEC 5章。
+  // -------------------------------------------------------------------
+  var PRICES_STORAGE_KEY = "scc.prices.v1";
+
+  // 呼び出しのたびに新しいオブジェクトを返す(呼び出し元が書き換えても定数を汚さない)。
+  function defaultPrices() {
+    return {
+      "typesafe/jev": { in: 0.042, out: 0 },
+      "claude-opus-5": { in: 5, out: 25 },
+      "claude-sonnet-5": { in: 3, out: 15 },
+      "claude-haiku-4-5": { in: 1, out: 5 }
+    };
+  }
+
+  function isValidPriceEntry(v) {
+    return !!v && typeof v === "object" &&
+      typeof v.in === "number" && isFinite(v.in) && v.in >= 0 &&
+      typeof v.out === "number" && isFinite(v.out) && v.out >= 0;
+  }
+
+  // localStorage(scc.prices.v1)から読む。既定値をベースに、形式が正しいモデルの
+  // エントリだけ上書きする(不正値・壊れた JSON は黙って既定値にフォールバック。SPEC 5章)。
+  function loadPrices() {
+    var base = defaultPrices();
+    try {
+      var raw = localStorage.getItem(PRICES_STORAGE_KEY);
+      if (!raw) return base;
+      var parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return base;
+      var keys = Object.keys(base);
+      for (var i = 0; i < keys.length; i++) {
+        var k = keys[i];
+        if (isValidPriceEntry(parsed[k])) base[k] = { in: parsed[k].in, out: parsed[k].out };
+      }
+    } catch (e) {
+      // 読めない・壊れている場合は既定値のまま
+    }
+    return base;
+  }
+
+  function savePrices(next) {
+    try {
+      localStorage.setItem(PRICES_STORAGE_KEY, JSON.stringify(next));
+    } catch (e) {
+      // 保存できなくても動作には影響しない(次回開いたときに既定値に戻るだけ)
+    }
+  }
+
+  // render() / costOf() が読む窓口。初回だけ localStorage を読み、以後はキャッシュを使う
+  // (getRecords() と同じ考え方)。
+  var pricesCache = null;
+  function getPrices() {
+    if (!pricesCache) pricesCache = loadPrices();
+    return pricesCache;
+  }
+
+  // 設定パネルの入力欄から1エントリだけ更新する。不正な値(数値でない・負)は無視する。
+  function setPrice(modelId, field, value) {
+    var base = getPrices();
+    if (!Object.prototype.hasOwnProperty.call(base, modelId)) return;
+    if (field !== "in" && field !== "out") return;
+    var num = Number(value);
+    if (!isFinite(num) || num < 0) return;
+    var next = {};
+    var keys = Object.keys(base);
+    for (var i = 0; i < keys.length; i++) next[keys[i]] = { in: base[keys[i]].in, out: base[keys[i]].out };
+    next[modelId][field] = num;
+    savePrices(next);
+    pricesCache = next;
+    render();
+  }
+
+  function resetPrices() {
+    pricesCache = defaultPrices();
+    savePrices(pricesCache);
+    render();
+  }
+
+  // 記録の m からモデルを引く。"typesafe/jev/all" のように "/all" が付いていれば外し、
+  // Claude の "+think" も外す(SPEC 5章)。
+  function priceModelKey(m) {
+    var id = typeof m === "string" && m ? m : JEV_MODEL_ID;
+    if (id.slice(-4) === "/all") id = id.slice(0, -4);
+    if (id.slice(-6) === "+think") id = id.slice(0, -6);
+    return id;
+  }
+
+  function isPricedModel(m) {
+    return !!getPrices()[priceModelKey(m)];
+  }
+
+  // 記録1件のコスト(USD)。単価が見つからないモデル・usage の無い記録は 0。
+  // (u.i * 入力単価 + ci * 入力単価 * 0.1 + u.o * 出力単価) / 1e6(SPEC 5章)。
+  function costOf(rec) {
+    if (!rec || !rec.u) return 0;
+    var pricing = getPrices()[priceModelKey(rec.m)];
+    if (!pricing) return 0;
+    var inputTokens = typeof rec.u.i === "number" && isFinite(rec.u.i) ? rec.u.i : 0;
+    var outputTokens = typeof rec.u.o === "number" && isFinite(rec.u.o) ? rec.u.o : 0;
+    var cacheTokens = typeof rec.ci === "number" && isFinite(rec.ci) ? rec.ci : 0;
+    return (inputTokens * pricing.in + cacheTokens * pricing.in * 0.1 + outputTokens * pricing.out) / 1e6;
+  }
+
+  // -------------------------------------------------------------------
+  // usage(トークン使用量)の記録用変換(Issue #56)。Jev(Worker)は
+  // { input_tokens, output_tokens }、Claude は追加で cache_read_input_tokens を持つ。
+  // 記録の形 { i, o, ci? } に揃える。
+  // -------------------------------------------------------------------
+  function toRecordUsage(usage) {
+    if (!usage || typeof usage !== "object") return null;
+    var i = typeof usage.input_tokens === "number" && isFinite(usage.input_tokens) ? usage.input_tokens : 0;
+    var o = typeof usage.output_tokens === "number" && isFinite(usage.output_tokens) ? usage.output_tokens : 0;
+    var out = { i: i, o: o };
+    if (typeof usage.cache_read_input_tokens === "number" && isFinite(usage.cache_read_input_tokens) && usage.cache_read_input_tokens > 0) {
+      out.ci = usage.cache_read_input_tokens;
+    }
+    return out;
+  }
+
+  // 確信度順モード(Issue #38)はマス選び+数字の2呼び出しぶんを足して1件の記録にする(SPEC 5章)。
+  function combineRecordUsage(a, b) {
+    if (!a && !b) return null;
+    var ra = a || { i: 0, o: 0 };
+    var rb = b || { i: 0, o: 0 };
+    var out = { i: (ra.i || 0) + (rb.i || 0), o: (ra.o || 0) + (rb.o || 0) };
+    var ci = (ra.ci || 0) + (rb.ci || 0);
+    if (ci > 0) out.ci = ci;
+    return out;
+  }
+
+  // Claude(Anthropic Messages API)の応答から usage を取り出す。Jev の extractUsage
+  // (Worker 側、3.3節)と同じ考え方: 欠けている・壊れていれば undefined を返し、
+  // 呼び出し側は usage ごと省略する(判定結果の検証には影響させない)。
+  function extractClaudeUsage(data) {
+    var usage = data && data.usage;
+    if (!usage || typeof usage !== "object") return undefined;
+    var inputTokens = usage.input_tokens;
+    var outputTokens = usage.output_tokens;
+    if (typeof inputTokens !== "number" || !isFinite(inputTokens) || inputTokens < 0) return undefined;
+    if (typeof outputTokens !== "number" || !isFinite(outputTokens) || outputTokens < 0) return undefined;
+    var result = { input_tokens: inputTokens, output_tokens: outputTokens };
+    var cacheRead = usage.cache_read_input_tokens;
+    if (typeof cacheRead === "number" && isFinite(cacheRead) && cacheRead >= 0) {
+      result.cache_read_input_tokens = cacheRead;
+    }
+    return result;
+  }
 
   // -------------------------------------------------------------------
   // API呼び出し
   // -------------------------------------------------------------------
   // 判定 1 件。スナップショットはここで 1 回だけ作り(フォーカス確定後、SPEC F3)、
   // モデルトグルに応じて Jev(Worker 経由)か Claude(ブラウザ直呼び)に渡す。
+  // _t(ミリ秒。fetch開始→応答JSON取得までのレイテンシ、Issue #55)を結果に添える。
   async function judgeCell(r, c, signal) {
     var puzzle = buildSnapshot();
-    if (state.modelMode === "claude") return judgeCellClaude(puzzle, r, c, signal);
-    return judgeCellJev(puzzle, r, c, signal);
+    var startedAt = nowMs();
+    var result = state.modelMode === "claude" ? await judgeCellClaude(puzzle, r, c, signal) : await judgeCellJev(puzzle, r, c, signal);
+    result._t = nowMs() - startedAt;
+    return result;
   }
 
   async function judgeCellJev(puzzle, r, c, signal) {
@@ -1984,11 +2265,14 @@ var PAGE_HTML = `<!doctype html>
 
   // 確信度順モード(Issue #38)のマス選び1件。スナップショットはここで1回だけ作り
   // (buildSelectionSnapshot()。queue の全マスを "." にしたもの)、モデルトグルに応じて
-  // Jev / Claude に渡す。戻り値は { probabilities, choice, confidence, request, cell }。
+  // Jev / Claude に渡す。戻り値は { probabilities, choice, confidence, request, cell }
+  // (+ _t、Issue #55)。
   async function askCell(signal) {
     var puzzle = buildSelectionSnapshot();
-    if (state.modelMode === "claude") return askCellClaude(puzzle, signal);
-    return askCellJev(puzzle, signal);
+    var startedAt = nowMs();
+    var result = state.modelMode === "claude" ? await askCellClaude(puzzle, signal) : await askCellJev(puzzle, signal);
+    result._t = nowMs() - startedAt;
+    return result;
   }
 
   async function askCellJev(puzzle, signal) {
@@ -2018,11 +2302,13 @@ var PAGE_HTML = `<!doctype html>
   // 一括モード(Issue #48)の1周ぶん。スナップショットはここで1回だけ作り
   // (buildSelectionSnapshot()。queue の全マスを "." にしたもの)、モデルトグルに応じて
   // Jev / Claude に渡す。戻り値はどちらも { cells, request }(cells はマスのキー →
-  // { choice, probabilities, confidence })。
+  // { choice, probabilities, confidence })+ _t(Issue #55)。
   async function askAll(signal) {
     var puzzle = buildSelectionSnapshot();
-    if (state.modelMode === "claude") return askAllClaude(puzzle, signal);
-    return askAllJev(puzzle, signal);
+    var startedAt = nowMs();
+    var result = state.modelMode === "claude" ? await askAllClaude(puzzle, signal) : await askAllJev(puzzle, signal);
+    result._t = nowMs() - startedAt;
+    return result;
   }
 
   async function askAllJev(puzzle, signal) {
@@ -2433,7 +2719,8 @@ var PAGE_HTML = `<!doctype html>
       probabilities: parsed.answer.probabilities,
       choice: parsed.answer.choice,
       confidence: parsed.answer.confidence,
-      request: body
+      request: body,
+      usage: extractClaudeUsage(data)
     };
   }
 
@@ -2497,7 +2784,8 @@ var PAGE_HTML = `<!doctype html>
       choice: choice,
       confidence: parsed.answer.confidence,
       request: body,
-      cell: { row: Number(m[1]), col: Number(m[2]) }
+      cell: { row: Number(m[1]), col: Number(m[2]) },
+      usage: extractClaudeUsage(data)
     };
   }
 
@@ -2550,7 +2838,7 @@ var PAGE_HTML = `<!doctype html>
       formatErr.request = body;
       throw formatErr;
     }
-    return { cells: parsed.answer, request: body };
+    return { cells: parsed.answer, request: body, usage: extractClaudeUsage(data) };
   }
 
   // -------------------------------------------------------------------
@@ -2659,7 +2947,16 @@ var PAGE_HTML = `<!doctype html>
       }
       roundSize = queue.length;
       roundTally = { correct: 0, total: 0 };
+      // 計時・コスト(Issue #55・#56)。初回の「実行」でだけ累計を0に戻す
+      // (停止からの再開では積算を保つ)。
+      totalElapsedMs = 0;
+      roundElapsedMs = 0;
+      roundStarted = false;
+      totalCostUsd = 0;
+      roundCostUsd = 0;
     }
+    // running=false → true になった区間の開始(停止中は数えない。DESIGN 4.1)
+    runningSince = nowMs();
     render();
     focusNext();
   }
@@ -2698,6 +2995,8 @@ var PAGE_HTML = `<!doctype html>
     pendingCommit = null;
     render();
 
+    // この周の最初のリクエスト(マス選び)を送る(Issue #55)。
+    markRoundStarted();
     inflightController = new AbortController();
     askCell(inflightController.signal).then(function (result) {
       if (!isCurrent(token)) return;
@@ -2742,7 +3041,10 @@ var PAGE_HTML = `<!doctype html>
       };
       var cell = queue.splice(idx, 1)[0];
       state.selecting = false;
-      focusCellForDigit(cell, token); // この中で render() する
+      // マス選びの usage/レイテンシ(Issue #55・#56)。数字判定と合算して1件の記録に付ける
+      // (確信度順は1マス=2回の呼び出しなので、SPEC 5章のとおり両方を足す)。
+      var priorUsage = { usage: toRecordUsage(result.usage), latencyMs: result._t };
+      focusCellForDigit(cell, token, priorUsage); // この中で render() する
     }, function (err) {
       if (!isCurrent(token)) return;
       if (err && err.name === "AbortError") return;
@@ -2763,8 +3065,10 @@ var PAGE_HTML = `<!doctype html>
   }
 
   // 1マスの数字判定(従来の focusNext() の本体そのもの)。cell を queue から取り出す
-  // 部分だけが呼び出し元(focusNext / selectNextCell)側に分かれている。
-  function focusCellForDigit(cell, token) {
+  // 部分だけが呼び出し元(focusNext / selectNextCell)側に分かれている。priorUsage は
+  // 確信度順モード(Issue #38)のマス選びぶんの { usage, latencyMs }(scan/all からの
+  // 呼び出しでは undefined)。
+  function focusCellForDigit(cell, token, priorUsage) {
     // 先にフォーカスを立てる。buildSnapshot() は state.focusedKey のマスを "." に
     // するので、この順序が「対象マスを空にして送る」不変条件そのもの(SPEC F3)。
     state.focusedKey = cell.r + "-" + cell.c;
@@ -2772,6 +3076,9 @@ var PAGE_HTML = `<!doctype html>
     pendingCommit = null;
     render();
 
+    // この周の最初のリクエストなら計時を始める(Issue #55。確信度順はマス選びで
+    // 既に始まっているので、ここでは何もしない = markRoundStarted() は冪等)。
+    markRoundStarted();
     // このリクエスト専用の AbortController。reset() / showError() が abort() すると
     // 下の fetch が AbortError で reject される(Issue #19)。
     inflightController = new AbortController();
@@ -2788,7 +3095,18 @@ var PAGE_HTML = `<!doctype html>
         state.lastRequest = result.request;
         state.lastRequestFailed = false;
       }
-      pendingCommit = { r: cell.r, c: cell.c, choice: result.choice, confidence: result.confidence, probabilities: result.probabilities };
+      // usage/レイテンシ(Issue #55・#56)。確信度順はマス選びぶんと合算する。
+      var usage = combineRecordUsage(priorUsage && priorUsage.usage, toRecordUsage(result.usage));
+      var latencyMs = (priorUsage && typeof priorUsage.latencyMs === "number" ? priorUsage.latencyMs : 0) + result._t;
+      pendingCommit = {
+        r: cell.r,
+        c: cell.c,
+        choice: result.choice,
+        confidence: result.confidence,
+        probabilities: result.probabilities,
+        usage: usage,
+        latencyMs: latencyMs
+      };
       render();
       var beforeCommitMs = state.speedMode === "slow" ? SLOW_BEFORE_COMMIT_MS : FAST_BEFORE_COMMIT_MS;
       setTimeout(function () {
@@ -2852,6 +3170,8 @@ var PAGE_HTML = `<!doctype html>
     pendingCommit = null;
     render();
 
+    // この周の最初(で唯一)のリクエスト(Issue #55)。
+    markRoundStarted();
     var requestedCount = queue.length;
     inflightController = new AbortController();
     askAll(inflightController.signal).then(function (result) {
@@ -2859,6 +3179,9 @@ var PAGE_HTML = `<!doctype html>
       if (result.request && typeof result.request === "object") {
         state.lastAllRequest = { request: result.request, failed: false, count: requestedCount };
       }
+      // 一括の usage/レイテンシ(Issue #55・#56)は周の先頭1件の記録にだけ付ける
+      // (focusCellFromCache() が最初の commitFocused() で消費して null に戻す)。
+      pendingAllUsage = { usage: toRecordUsage(result.usage), latencyMs: result._t };
       var cells = result.cells;
       if (cells === null || typeof cells !== "object") {
         showError("一括の応答に cells がありません");
@@ -2923,7 +3246,18 @@ var PAGE_HTML = `<!doctype html>
       return { digit: d, pct: Math.round((typeof p === "number" ? p : 0) * 100), isPick: d === result.choice };
     });
     state.currentProbs = probs;
-    pendingCommit = { r: cell.r, c: cell.c, choice: result.choice, confidence: result.confidence, probabilities: result.probabilities };
+    // 一括の usage/レイテンシは周の先頭1件だけ(Issue #55・#56、SPEC 5章)。
+    // pendingAllUsage は消費したら null に戻し、この周の2件目以降には付けない。
+    pendingCommit = {
+      r: cell.r,
+      c: cell.c,
+      choice: result.choice,
+      confidence: result.confidence,
+      probabilities: result.probabilities,
+      usage: pendingAllUsage ? pendingAllUsage.usage : null,
+      latencyMs: pendingAllUsage ? pendingAllUsage.latencyMs : undefined
+    };
+    pendingAllUsage = null;
     render();
     var beforeCommitMs = state.speedMode === "slow" ? SLOW_BEFORE_COMMIT_MS : FAST_BEFORE_COMMIT_MS;
     setTimeout(function () {
@@ -2960,9 +3294,9 @@ var PAGE_HTML = `<!doctype html>
     // Claude なら例 "claude-opus-5+think/all")にし、o:"all" を添える(較正図で typesafe/jev/all のように
     // 別項目として絞り込めるように。SPEC 3章)。他のモードは従来どおり currentModelId()。
     var isAll = state.orderMode === "all";
-    var modelId = isAll ? currentModelId() + "/all" : currentModelId();
+    var modelId = activeModelIdForPricing();
     var record = {
-      t: Date.now(),
+      at: nowMs(),
       p: puzzleId(),
       r: r,
       c: c,
@@ -2974,7 +3308,19 @@ var PAGE_HTML = `<!doctype html>
       m: modelId // どのモデルの判定か(Issue #37)。無い記録は Jev 扱い
     };
     if (isAll) record.o = "all";
+    // usage(トークン使用量)とレイテンシ(Issue #55・#56、SPEC 5章)。u/t が無い記録は
+    // 較正には使うがコスト計算からは自然に除外される(costOf() が u の無い記録を 0 とする)。
+    if (pendingCommit.usage) {
+      record.u = { i: pendingCommit.usage.i, o: pendingCommit.usage.o };
+      if (typeof pendingCommit.usage.ci === "number") record.ci = pendingCommit.usage.ci;
+    }
+    if (typeof pendingCommit.latencyMs === "number" && isFinite(pendingCommit.latencyMs)) {
+      record.t = Math.round(pendingCommit.latencyMs);
+    }
     appendRecord(record);
+    var cost = costOf(record);
+    roundCostUsd += cost;
+    totalCostUsd += cost;
     // 次の結果が来るまで表示に残す(最速モードでも判定が見えるように)
     state.lastJudgment = {
       r: r,
@@ -2998,8 +3344,21 @@ var PAGE_HTML = `<!doctype html>
     // 一括モード(Issue #48)のこの周のキャッシュは、周が変わるたびに空にする
     // (次の周は改めて askAllRound() で1回聞く)。
     allResults = null;
-    state.roundLog.push(formatRoundSummary(state.round, roundTally.correct, roundTally.total));
+    pendingAllUsage = null;
     var decision = shouldStop(state.round, roundWrong.length);
+    // 周の計測を締める(継続するなら時計は動かしたまま、完了/強制終了ならここで止める。
+    // Issue #55)。roundCostUsd も同じタイミングで取り出してから次の周のために0に戻す。
+    var roundMs = closeRoundClock(decision === "continue");
+    var roundCost = roundCostUsd;
+    roundCostUsd = 0;
+    state.roundLog.push({
+      round: state.round,
+      correct: roundTally.correct,
+      total: roundTally.total,
+      ms: roundMs,
+      cost: roundCost,
+      m: activeModelIdForPricing()
+    });
     if (decision === "solved") {
       state.done = true;
       state.running = false;
@@ -3062,6 +3421,8 @@ var PAGE_HTML = `<!doctype html>
    */
   function haltRun(reason) {
     if (!state.running) return;
+    // 計時を止める(周・全体とも。停止中は数えない。Issue #55)。
+    pauseClock();
     // 世代を進めて、進行中の fetch / setTimeout のコールバックを無効化する
     runToken += 1;
     // in-flight の /api/judge があれば打ち切る(reset() / showError() と同じ、Issue #19)
@@ -3113,6 +3474,8 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function showError(message) {
+    // 計時を止める(エラー停止も「走っている時間」には数えない。Issue #55)。
+    pauseClock();
     // 世代を進めて、進行中の fetch / setTimeout のコールバックを無効化する
     runToken += 1;
     // in-flight の /api/judge があれば打ち切る(Issue #19)
@@ -3200,6 +3563,14 @@ var PAGE_HTML = `<!doctype html>
     started = false;
     pendingCommit = null;
     allResults = null; // 一括モード(Issue #48)のキャッシュもリセット/新しい問題で捨てる
+    pendingAllUsage = null;
+    // 計時・コスト(Issue #55・#56)もリセット/新しい問題で0に戻す。
+    runningSince = null;
+    totalElapsedMs = 0;
+    roundElapsedMs = 0;
+    roundStarted = false;
+    totalCostUsd = 0;
+    roundCostUsd = 0;
     render();
   }
 
@@ -3332,7 +3703,11 @@ var PAGE_HTML = `<!doctype html>
       done: state.done,
       roundsToSolve: state.roundsToSolve,
       stoppedAtLimit: state.stoppedAtLimit,
-      errorMessage: state.errorMessage
+      errorMessage: state.errorMessage,
+      // 全体の走っている時間(ミリ秒)と累計コスト(Issue #55・#56)。比較シェルはこれを
+      // そのまま表示する(親側で経過時間を測り直さない。docs/DESIGN.md 4.2)。
+      elapsedMs: currentTotalElapsedMs(),
+      costUsd: totalCostUsd
     };
     try {
       window.parent.postMessage(payload, location.origin);
@@ -3404,11 +3779,6 @@ var PAGE_HTML = `<!doctype html>
     return "未実行";
   }
 
-  function compareElapsedSeconds() {
-    if (!compareStartedAt) return 0;
-    return Math.max(0, Math.floor((Date.now() - compareStartedAt) / 1000));
-  }
-
   function renderCompareTopbarHtml() {
     var running = compareEitherRunning();
     var ready = compareFramesReady();
@@ -3455,12 +3825,17 @@ var PAGE_HTML = `<!doctype html>
     var round = escapeHtml(String(status ? status.round : 1));
     var correct = escapeHtml(String(status ? status.correct : 0));
     var total = escapeHtml(String(status ? status.total : TOTAL_EMPTY));
+    // 経過時間・コストは子(iframe)が postStatus() で申告してくる値をそのまま使う
+    // (親側での計測はしない。Issue #55、docs/DESIGN.md 4.2)。
+    var elapsedMs = status && typeof status.elapsedMs === "number" ? status.elapsedMs : 0;
+    var costUsd = status && typeof status.costUsd === "number" ? status.costUsd : 0;
     var notice = "";
     if (which === "claude" && loadAnthropicKey() === null) {
       notice = "<div class=\\"compare-notice\\">Claude のキー未設定(通常ページの設定パネルで保存してください)</div>";
     }
     return "<h2>" + escapeHtml(modelId) + "</h2>" +
-      "<div class=\\"compare-meta\\">経過 " + compareElapsedSeconds() + "秒 ・ " + round + "周目 ・ 正解 " + correct + " / " + total + " ・ " + escapeHtml(compareStatusText(status)) + "</div>" +
+      "<div class=\\"compare-meta\\">経過 " + escapeHtml(formatMs(elapsedMs)) + " ・ " + round + "周目 ・ 正解 " + correct + " / " + total +
+      " ・ " + escapeHtml(compareStatusText(status)) + " ・ " + escapeHtml(formatUsd(costUsd)) + "</div>" +
       notice;
   }
 
@@ -3485,7 +3860,6 @@ var PAGE_HTML = `<!doctype html>
   function compareRun() {
     if (compareEitherRunning()) { compareStop(); return; }
     if (!compareFramesReady()) return;
-    compareStartedAt = Date.now();
     comparePostToFrames({ type: "run" });
     renderCompareTopbarInPlace();
   }
@@ -3496,7 +3870,6 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function compareReset() {
-    compareStartedAt = null;
     compareStatus = { jev: null, claude: null };
     comparePostToFrames({ type: "reset" });
     renderCompareTopbarInPlace();
@@ -3540,7 +3913,6 @@ var PAGE_HTML = `<!doctype html>
         SOLUTION = puzzle.solution;
         TOTAL_EMPTY = countEmpty(GIVEN);
         roundSize = TOTAL_EMPTY;
-        compareStartedAt = null;
         compareStatus = { jev: null, claude: null };
         comparePostToFrames({ type: "newPuzzle", puzzle: GIVEN.join("") });
       } finally {
@@ -3776,6 +4148,31 @@ var PAGE_HTML = `<!doctype html>
       "</div>";
   }
 
+  // 単価パネル(Issue #56)。モデルごとの入力/出力単価(100万トークンあたり USD)の
+  // 入力欄と「既定値に戻す」ボタン。常時表示(Jev の単価も編集できるように、Claude
+  // モードに限定しない)。localStorage(scc.prices.v1)に保存。
+  function renderPricesPanel() {
+    var current = getPrices();
+    var order = [JEV_MODEL_ID, "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
+    var rows = "";
+    for (var i = 0; i < order.length; i++) {
+      var id = order[i];
+      var entry = current[id] || { in: 0, out: 0 };
+      rows += "<div class=\\"price-row\\">" +
+        "<span class=\\"price-model\\">" + escapeHtml(id) + "</span>" +
+        "<label>入力 <input type=\\"number\\" min=\\"0\\" step=\\"any\\" value=\\"" + entry.in +
+        "\\" onchange=\\"setPrice('" + id + "','in',this.value)\\"></label>" +
+        "<label>出力 <input type=\\"number\\" min=\\"0\\" step=\\"any\\" value=\\"" + entry.out +
+        "\\" onchange=\\"setPrice('" + id + "','out',this.value)\\"></label>" +
+        "</div>";
+    }
+    return "<div id=\\"prices-panel\\" class=\\"panel\\">" +
+      "<p class=\\"panel-title\\">単価(100万トークンあたり USD)</p>" +
+      rows +
+      "<button id=\\"reset-prices-btn\\" onclick=\\"resetPrices()\\">既定値に戻す</button>" +
+      "</div>";
+  }
+
   function renderErrorBox() {
     if (!state.errorMessage) return "<div id=\\"error-box\\"></div>";
     return "<div id=\\"error-box\\" class=\\"error\\">" + escapeHtml(state.errorMessage) + "</div>";
@@ -3825,12 +4222,16 @@ var PAGE_HTML = `<!doctype html>
   function renderCurrentPanel() {
     var head = "<div id=\\"current-panel\\" class=\\"panel\\"><p class=\\"panel-title\\">現在の判定</p>";
     var tail = "</div>";
+    // 実行中の経過(ミリ秒)と累計コスト(Issue #55・#56)。render() のたびに更新するだけで、
+    // 走っていないとき(currentTotalElapsedMs() が totalElapsedMs のまま)は最後の値が残る。
+    var elapsedLine = "<p class=\\"muted elapsed-line\\">経過 " + formatMs(currentTotalElapsedMs()) +
+      " / " + formatUsdForModel(totalCostUsd, activeModelIdForPricing()) + "</p>";
 
     // 停止中(Issue #32): 残りマス数を示し、フォーカスの枠線は消える
     // (state.focusedKey が null なので buildCellStyle 側で自然に消える)。
     // 直前に確定した判定があれば、参考として下に残す。
     if (isPaused()) {
-      var pausedBody = "<p class=\\"muted\\">停止中(残り " + queue.length + " マス)</p>";
+      var pausedBody = elapsedLine + "<p class=\\"muted\\">停止中(残り " + queue.length + " マス)</p>";
       // 一時的な失敗による停止(Issue #43)は理由を添える。手動停止(state.pauseReason
       // が null のまま)では出ない。
       if (state.pauseReason) {
@@ -3854,7 +4255,7 @@ var PAGE_HTML = `<!doctype html>
 
     // 一括モード(Issue #48)の呼び出し中: 応答が届くまでは座標もバーも無い。
     if (state.allFetching) {
-      return head + "<p class=\\"muted\\">一括で判定中…(" + queue.length + " マス)</p>" + tail;
+      return head + elapsedLine + "<p class=\\"muted\\">一括で判定中…(" + queue.length + " マス)</p>" + tail;
     }
 
     // 結果が届いている最中のマス: 座標とバーをそのまま出す
@@ -3865,14 +4266,14 @@ var PAGE_HTML = `<!doctype html>
         confidenceText = "<span class=\\"confidence\\">confidence " + Math.round(pendingCommit.confidence * 100) + "%</span>";
       }
       var selLine1 = state.orderMode === "confidence" ? renderSelectionLine() : "";
-      return head + selLine1 +
+      return head + elapsedLine + selLine1 +
         "<div class=\\"coords\\">" + coordLabel(Number(parts[0]), Number(parts[1])) + confidenceText + "</div>" +
         "<div class=\\"bars\\">" + renderBars(state.currentProbs) + "</div>" + tail;
     }
 
     // 待ち時間中は「いま聞いているマス」+「直前に確定した判定」を並べる。
     // 最速モードでも結果が一瞬で消えないようにするため(DESIGN 4.4)。
-    var body = "";
+    var body = elapsedLine;
     if (state.focusedKey) {
       if (state.orderMode === "confidence") body += renderSelectionLine();
       var p2 = state.focusedKey.split("-");
@@ -3958,13 +4359,30 @@ var PAGE_HTML = `<!doctype html>
     return head + body + tail;
   }
 
+  // 周回ログ1行ぶん(Issue #55・#56)。「N周目: M中K正解 (P%) — 3,214 ms / $0.0004」。
+  // entry は finalizeRound() が state.roundLog に積む { round, correct, total, ms, cost, m }。
+  function formatRoundLogLine(entry) {
+    return formatRoundSummary(entry.round, entry.correct, entry.total) + " — " +
+      formatMs(entry.ms) + " / " + formatUsdForModel(entry.cost, entry.m);
+  }
+
+  // 完了/強制終了時に周回ログの末尾に添える合計行。「合計 12,345 ms / $0.0012(3周)」。
+  function formatTotalSummary() {
+    var modelId = activeModelIdForPricing();
+    return "合計 " + formatMs(totalElapsedMs) + " / " + formatUsdForModel(totalCostUsd, modelId) +
+      "(" + state.roundLog.length + "周)";
+  }
+
   function renderRoundLog() {
     if (state.roundLog.length === 0) {
       return "<div id=\\"round-log\\" class=\\"panel\\"><p class=\\"panel-title\\">周回ログ</p><p class=\\"muted\\">まだ記録はありません</p></div>";
     }
-    var items = state.roundLog.map(function (line) {
-      return "<li>" + escapeHtml(line) + "</li>";
+    var items = state.roundLog.map(function (entry) {
+      return "<li>" + escapeHtml(formatRoundLogLine(entry)) + "</li>";
     }).join("");
+    if (state.done) {
+      items += "<li class=\\"round-log-total\\">" + escapeHtml(formatTotalSummary()) + "</li>";
+    }
     return "<div id=\\"round-log\\" class=\\"panel\\"><p class=\\"panel-title\\">周回ログ</p><ul>" + items + "</ul></div>";
   }
 
@@ -4031,14 +4449,15 @@ var PAGE_HTML = `<!doctype html>
   // binRecords(pc/conf それぞれ)の結果を、件数と最終追記時刻が前回と同じなら
   // 使い回す軽いキャッシュ(PR #25 レビュー指摘 should-fix 2)。records は毎回
   // getRecords() から渡ってくるので、記録が増減・追記されていなければ計算し直さない。
-  var calibBinCache = null; // { n, lastT, filter, models, total, correctCount, puzzleCount, pcBins, confBins }
+  // 記録の「追記時刻」は at(Issue #55 で t をレイテンシに転用したため改名。旧称 t)。
+  var calibBinCache = null; // { n, lastAt, filter, models, total, correctCount, puzzleCount, pcBins, confBins }
   // 較正図の表示に必要なもの(モデル一覧・フィルタ後の記録・合計/正解率/問題数・帯)を
   // まとめて計算し、記録数・最終追記時刻・フィルタが前回と同じなら再計算しない
   // (render() のたびに全件をなめない。PR #25 のキャッシュ方針を維持。レビュー指摘 S5)。
   function computeCalibView(allRecords, filter) {
     var n = allRecords.length;
-    var lastT = n > 0 && allRecords[n - 1] ? allRecords[n - 1].t : null;
-    if (calibBinCache && calibBinCache.n === n && calibBinCache.lastT === lastT && calibBinCache.filter === filter) {
+    var lastAt = n > 0 && allRecords[n - 1] ? allRecords[n - 1].at : null;
+    if (calibBinCache && calibBinCache.n === n && calibBinCache.lastAt === lastAt && calibBinCache.filter === filter) {
       return calibBinCache;
     }
     var modelSet = {};
@@ -4057,7 +4476,7 @@ var PAGE_HTML = `<!doctype html>
     }
     calibBinCache = {
       n: n,
-      lastT: lastT,
+      lastAt: lastAt,
       filter: filter,
       models: Object.keys(modelSet).sort(),
       total: records.length,
@@ -4183,6 +4602,7 @@ var PAGE_HTML = `<!doctype html>
         "<div class=\\"side-panel\\">" +
         renderControls() +
         renderClaudeSettings() +
+        renderPricesPanel() +
         renderStats() +
         renderCurrentPanel() +
         renderPromptPanel() +

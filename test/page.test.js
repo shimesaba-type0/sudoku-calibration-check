@@ -2716,10 +2716,17 @@ test("W5: 2周目のマス選びの候補は不正解マスだけで、それら
   }
   assert.deepEqual(dots, [wrongKey], "2周目のマス選びの候補が不正解マスだけになっていない: " + JSON.stringify(dots));
 
-  // 周回ログの形式は従来どおり
+  // 周回ログは round/correct/total の集計自体は従来どおり(表示は Issue #55 で
+  // { round, correct, total, ms, cost, m } の構造体に変わった。AA2 で書式を検証する)
   assert.equal(ctx.state.roundLog.length, 2, "周回ログが2行でない");
-  assert.match(ctx.state.roundLog[0], /^1周目: 51中50正解 \(98%\)$/, "1周目のログ形式が違う: " + ctx.state.roundLog[0]);
-  assert.match(ctx.state.roundLog[1], /^2周目: 1中1正解 \(100%\)$/, "2周目のログ形式が違う: " + ctx.state.roundLog[1]);
+  assert.equal(ctx.state.roundLog[0].round, 1);
+  assert.equal(ctx.state.roundLog[0].correct, 50);
+  assert.equal(ctx.state.roundLog[0].total, 51);
+  assert.match(ctx.formatRoundLogLine(ctx.state.roundLog[0]), /^1周目: 51中50正解 \(98%\) — /, "1周目のログ形式が違う: " + ctx.formatRoundLogLine(ctx.state.roundLog[0]));
+  assert.equal(ctx.state.roundLog[1].round, 2);
+  assert.equal(ctx.state.roundLog[1].correct, 1);
+  assert.equal(ctx.state.roundLog[1].total, 1);
+  assert.match(ctx.formatRoundLogLine(ctx.state.roundLog[1]), /^2周目: 1中1正解 \(100%\) — /, "2周目のログ形式が違う: " + ctx.formatRoundLogLine(ctx.state.roundLog[1]));
 });
 
 test("W6: Claude 経路の確信度順マス選び(スキーマの候補キーと system の CELL_NOTE)", { timeout: 10000 }, async () => {
@@ -3967,8 +3974,14 @@ test("Z6: 一括モードの2周目は不正解マスだけを聞く(候補が�
   assert.deepEqual(dots, [wrongKey], "2周目の一括の候補が不正解マスだけになっていない: " + JSON.stringify(dots));
 
   assert.equal(ctx.state.roundLog.length, 2, "周回ログが2行でない");
-  assert.match(ctx.state.roundLog[0], /^1周目: 51中50正解 \(98%\)$/, "1周目のログ形式が違う: " + ctx.state.roundLog[0]);
-  assert.match(ctx.state.roundLog[1], /^2周目: 1中1正解 \(100%\)$/, "2周目のログ形式が違う: " + ctx.state.roundLog[1]);
+  assert.equal(ctx.state.roundLog[0].round, 1);
+  assert.equal(ctx.state.roundLog[0].correct, 50);
+  assert.equal(ctx.state.roundLog[0].total, 51);
+  assert.match(ctx.formatRoundLogLine(ctx.state.roundLog[0]), /^1周目: 51中50正解 \(98%\) — /, "1周目のログ形式が違う: " + ctx.formatRoundLogLine(ctx.state.roundLog[0]));
+  assert.equal(ctx.state.roundLog[1].round, 2);
+  assert.equal(ctx.state.roundLog[1].correct, 1);
+  assert.equal(ctx.state.roundLog[1].total, 1);
+  assert.match(ctx.formatRoundLogLine(ctx.state.roundLog[1]), /^2周目: 1中1正解 \(100%\) — /, "2周目のログ形式が違う: " + ctx.formatRoundLogLine(ctx.state.roundLog[1]));
 });
 
 test("Z7: URL パラメータ order=all、setOrderMode(\"all\")、比較シェルの順番トグルとURL組み立てに「一括」がある", async () => {
@@ -4076,4 +4089,294 @@ test("Z8: 一括モードの Claude 経路で全マスが確定し、記録の m
   assert.equal(Object.keys(ctx2.state.values).length, 0, "欠けた応答なのにマスが確定した");
   assert.equal(ctx2.getRecords().length, 0, "欠けた応答なのに記録が増えた");
   assert.equal(ctx2.queue.length, ctx2.TOTAL_EMPTY, "欠けた応答なのに queue が減った");
+});
+
+// ---------------------------------------------------------------------------
+// 計時・コスト(Issue #55・#56、SPEC 3章 F1・F1'・5章)。S/T/W/Y/Z 系と同じ
+// runScript / makeAbortAwareFetch / waitFor を使う。nowMs() を差し替えて
+// Date.now() に頼らず決定的に検証する。
+// ---------------------------------------------------------------------------
+
+/** ANSWER_KEY(完成盤)の指定セルだけを "." にした81文字の盤面文字列を作る。 */
+function blankCells(solved, cells) {
+  var rows = solved.map(function (r) { return r.split(""); });
+  cells.forEach(function (rc) { rows[rc[0]][rc[1]] = "."; });
+  return rows.map(function (r) { return r.join(""); }).join("");
+}
+
+/** 数値の近似比較(浮動小数点の丸め誤差を許容する)。 */
+function approxEqual(actual, expected, label) {
+  assert.ok(Math.abs(actual - expected) < 1e-9, (label || "") + ": " + actual + " !== " + expected);
+}
+
+test("AA1: 周の処理時間は nowMs() の差し替えで確定値になり、停止中を数えない(停止→時間経過→再開→完了)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+
+  // 空マス2つ(離れた位置)だけの小さい盤面に差し替える。一意解(ANSWER_KEY に戻るはず)。
+  var puzzleStr = blankCells(ANSWER_KEY, [[0, 0], [4, 4]]);
+  assert.ok(ctx.applyPuzzleFromString(puzzleStr), "テスト用の小さい盤面の適用に失敗した(一意解でない?)");
+  assert.equal(ctx.TOTAL_EMPTY, 2);
+
+  var fakeNow = 1000;
+  ctx.nowMs = function () { return fakeNow; };
+
+  ctx.run();
+  assert.equal(ctx.runningSince, 1000, "run() で runningSince が立っていない");
+
+  // 1マス目: 300ms かけて応答が返る想定
+  await waitFor(function () { return af.pending.length === 1; }, "AA1: 1マス目の fetch 待ち");
+  var e1 = af.pending.shift();
+  var b1 = JSON.parse(e1.init.body);
+  fakeNow = 1300;
+  e1.resolve(makeCorrectResponse(ctx, b1.target.row, b1.target.col, b1.puzzle));
+  await waitFor(function () { return Object.keys(ctx.state.values).length === 1; }, "AA1: 1マス目の確定待ち");
+
+  // 2マス目: in-flight のまま 100ms 進めて stop()
+  await waitFor(function () { return af.pending.length === 1; }, "AA1: 2マス目の fetch 待ち");
+  fakeNow = 1400;
+  ctx.stop();
+  var stale = af.pending.shift();
+  assert.equal(stale.settled, true, "stop() で in-flight の fetch が abort されていない");
+  assert.equal(ctx.state.running, false);
+  assert.equal(ctx.runningSince, null, "停止したのに runningSince が残っている");
+  assert.equal(ctx.totalElapsedMs, 400, "停止時点の累計が 400ms でない: " + ctx.totalElapsedMs);
+  assert.equal(ctx.roundElapsedMs, 400, "停止時点の周の累計が 400ms でない: " + ctx.roundElapsedMs);
+
+  // 停止中に 3600ms 経過(数えないはず)
+  fakeNow = 5000;
+
+  // 再開。2マス目からやり直す
+  ctx.run();
+  assert.equal(ctx.runningSince, 5000, "run() で runningSince が再アンカーされていない");
+  await waitFor(function () { return af.pending.length === 1; }, "AA1: 再開後の2マス目の fetch 待ち");
+  var e2 = af.pending.shift();
+  var b2 = JSON.parse(e2.init.body);
+  fakeNow = 5200;
+  e2.resolve(makeCorrectResponse(ctx, b2.target.row, b2.target.col, b2.puzzle));
+
+  await waitFor(function () { return ctx.state.done === true; }, "AA1: 完了待ち");
+
+  assert.equal(ctx.state.roundsToSolve, 1);
+  assert.equal(ctx.state.roundLog.length, 1);
+  // 停止中の 3600ms(1400 → 5000)は数えない: 400(1000〜1400) + 200(5000〜5200) = 600ms
+  assert.equal(ctx.state.roundLog[0].ms, 600, "周の処理時間が停止中を除いた 600ms になっていない: " + ctx.state.roundLog[0].ms);
+  assert.equal(ctx.totalElapsedMs, 600, "全体の処理時間も 600ms のはず(この実行は1周だけなので)");
+  assert.equal(ctx.roundElapsedMs, 0, "完了後は次周のために周の積算が0に戻っているはず");
+});
+
+test("AA2: 周回ログの行と合計行の書式(formatRoundLogLine/formatTotalSummary/formatMs/formatUsd)", async () => {
+  var ctx = runScript(await getPageHtml());
+
+  assert.equal(ctx.formatMs(0), "0 ms");
+  assert.equal(ctx.formatMs(3214), "3,214 ms");
+  assert.equal(ctx.formatMs(12345), "12,345 ms");
+  assert.equal(ctx.formatMs(-5), "0 ms", "負値は0扱いのはず");
+
+  assert.equal(ctx.formatUsd(0), "$0");
+  assert.equal(ctx.formatUsd(0.00003), "$0.00003");
+  assert.equal(ctx.formatUsd(0.0004), "$0.0004");
+  assert.equal(ctx.formatUsd(0.012), "$0.012");
+  assert.equal(ctx.formatUsd(0.0012), "$0.0012");
+  assert.equal(ctx.formatUsd(0.01), "$0.01");
+
+  var entry = { round: 1, correct: 12, total: 51, ms: 3214, cost: 0.0004, m: "typesafe/jev" };
+  assert.equal(
+    ctx.formatRoundLogLine(entry),
+    "1周目: 51中12正解 (24%) — 3,214 ms / $0.0004",
+    "周回ログの1行の書式が違う: " + ctx.formatRoundLogLine(entry)
+  );
+
+  ctx.state.roundLog = [entry, entry, entry];
+  ctx.totalElapsedMs = 12345;
+  ctx.totalCostUsd = 0.0012;
+  assert.equal(
+    ctx.formatTotalSummary(),
+    "合計 12,345 ms / $0.0012(3周)",
+    "合計行の書式が違う: " + ctx.formatTotalSummary()
+  );
+});
+
+test("AA3: 記録に u/t が付く。一括モードは周の先頭1件だけ、確信度順はマス選び+数字の合算", { timeout: 10000 }, async () => {
+  // (a) 左上から(Jev): その呼び出しの usage がそのまま record.u に載り、t(レイテンシ)も付く
+  {
+    var af = makeAbortAwareFetch();
+    var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+    ctx.applyPuzzleFromString(blankCells(ANSWER_KEY, [[0, 0]]));
+    ctx.run();
+    await waitFor(function () { return af.pending.length === 1; }, "AA3a: fetch 待ち");
+    var e = af.pending.shift();
+    var b = JSON.parse(e.init.body);
+    var res = await makeCorrectResponse(ctx, b.target.row, b.target.col, b.puzzle).json();
+    res.usage = { input_tokens: 700, output_tokens: 90 };
+    e.resolve({ ok: true, json: function () { return Promise.resolve(res); } });
+    await waitFor(function () { return ctx.state.done === true; }, "AA3a: 完了待ち");
+    var records = ctx.getRecords();
+    assert.equal(records.length, 1);
+    // records[0].u は vm レルムのオブジェクトなので deepEqual ではなく値で比較する(hostRows と同じ理由)
+    assert.equal(records[0].u.i, 700, "usage が record.u に載っていない: " + JSON.stringify(records[0].u));
+    assert.equal(records[0].u.o, 90);
+    assert.equal(typeof records[0].t, "number", "t(レイテンシ)が付いていない");
+    assert.ok(records[0].t >= 0);
+  }
+
+  // (b) 確信度順(Jev): マス選び + 数字の usage を合算して1件に付ける
+  {
+    var af2 = makeAbortAwareFetch();
+    var ctx2 = runScript(await getPageHtml(), { fetch: af2.fetch });
+    ctx2.applyPuzzleFromString(blankCells(ANSWER_KEY, [[0, 0]]));
+    ctx2.setOrderMode("confidence");
+    ctx2.run();
+    await waitFor(function () { return af2.pending.length === 1; }, "AA3b: マス選びの fetch 待ち");
+    var selEntry = af2.pending.shift();
+    var selBody = JSON.parse(selEntry.init.body);
+    var keys = ctx2.selectionKeys();
+    var selRes = await makeCellResponse(selBody.puzzle, keys, keys[0]).json();
+    selRes.usage = { input_tokens: 300, output_tokens: 20 };
+    selEntry.resolve({ ok: true, json: function () { return Promise.resolve(selRes); } });
+
+    await waitFor(function () { return af2.pending.length === 1; }, "AA3b: 数字判定の fetch 待ち");
+    var digitEntry = af2.pending.shift();
+    var digitBody = JSON.parse(digitEntry.init.body);
+    var digitRes = await makeCorrectResponse(ctx2, digitBody.target.row, digitBody.target.col, digitBody.puzzle).json();
+    digitRes.usage = { input_tokens: 700, output_tokens: 90 };
+    digitEntry.resolve({ ok: true, json: function () { return Promise.resolve(digitRes); } });
+
+    await waitFor(function () { return ctx2.state.done === true; }, "AA3b: 完了待ち");
+    var records2 = ctx2.getRecords();
+    assert.equal(records2.length, 1);
+    assert.equal(records2[0].u.i, 1000, "マス選び+数字の usage が合算されていない: " + JSON.stringify(records2[0].u));
+    assert.equal(records2[0].u.o, 110);
+    assert.equal(typeof records2[0].t, "number");
+  }
+
+  // (c) 一括(Jev): 周の先頭1件だけに u/t が付く(2件目以降は付かない=二重計上しない)
+  {
+    var af3 = makeAbortAwareFetch();
+    var ctx3 = runScript(await getPageHtml(), { fetch: af3.fetch });
+    ctx3.applyPuzzleFromString(blankCells(ANSWER_KEY, [[0, 0], [4, 4]]));
+    ctx3.setOrderMode("all");
+    ctx3.run();
+    await waitFor(function () { return af3.pending.length === 1; }, "AA3c: 一括の fetch 待ち");
+    var allEntry = af3.pending.shift();
+    var allBody = JSON.parse(allEntry.init.body);
+    var allKeys = ctx3.selectionKeys();
+    var allRes = await makeAllResponse(ctx3, allBody.puzzle, allKeys, []).json();
+    allRes.usage = { input_tokens: 9000, output_tokens: 4000 };
+    allEntry.resolve({ ok: true, json: function () { return Promise.resolve(allRes); } });
+    await waitFor(function () { return ctx3.state.done === true; }, "AA3c: 完了待ち");
+    var records3 = ctx3.getRecords();
+    assert.equal(records3.length, 2);
+    assert.equal(records3[0].u.i, 9000, "一括の先頭レコードに usage が付いていない");
+    assert.equal(records3[0].u.o, 4000);
+    assert.equal(records3[1].u, undefined, "一括の2件目以降にも usage が付いている(二重計上)");
+    assert.equal(typeof records3[0].t, "number");
+    assert.equal(records3[1].t, undefined, "一括の2件目にも t が付いている");
+  }
+});
+
+test("AA4: costOf() と formatUsd()(Jev出力無料・Claudeの入力/出力単価・+think/allの剥がし・未知モデル)", async () => {
+  var ctx = runScript(await getPageHtml());
+
+  // Jev: 入力 0.042 / 100万トークン、出力無料
+  approxEqual(ctx.costOf({ m: "typesafe/jev", u: { i: 1000000, o: 1000000 } }), 0.042, "Jev の入力単価");
+  // "/all" を剥がして typesafe/jev の単価を引く
+  approxEqual(ctx.costOf({ m: "typesafe/jev/all", u: { i: 1000000, o: 0 } }), 0.042, "typesafe/jev/all");
+  // Claude opus(+think を剥がす。入力5・出力25)
+  approxEqual(ctx.costOf({ m: "claude-opus-5+think", u: { i: 1000000, o: 1000000 } }), 30, "claude-opus-5+think");
+  // "+think" と "/all" の両方を剥がす
+  approxEqual(ctx.costOf({ m: "claude-opus-5+think/all", u: { i: 1000000, o: 0 } }), 5, "claude-opus-5+think/all");
+  // cache_read_input_tokens(ci)は入力単価の10%
+  approxEqual(ctx.costOf({ m: "claude-sonnet-5", u: { i: 0, o: 0 }, ci: 1000000 }), 0.3, "ci(キャッシュ読み)は入力単価の10%");
+
+  // 単価未設定のモデルは 0 扱い
+  assert.equal(ctx.costOf({ m: "some-unknown-model", u: { i: 1000000, o: 1000000 } }), 0);
+  assert.equal(ctx.isPricedModel("some-unknown-model"), false);
+  assert.equal(ctx.isPricedModel("typesafe/jev"), true);
+
+  // usage の無い記録は 0
+  assert.equal(ctx.costOf({ m: "typesafe/jev" }), 0);
+  assert.equal(ctx.costOf(null), 0);
+
+  // formatUsd: $0.01以上は小数4桁まで(末尾0は削る)、それ未満は有効数字2桁程度
+  assert.equal(ctx.formatUsd(0), "$0");
+  assert.equal(ctx.formatUsd(0.00003), "$0.00003");
+  assert.equal(ctx.formatUsd(0.0004), "$0.0004");
+  assert.equal(ctx.formatUsd(0.012), "$0.012");
+  assert.equal(ctx.formatUsd(0.01), "$0.01");
+  assert.equal(ctx.formatUsd(1), "$1");
+
+  // formatUsdForModel: 単価未設定なら「(単価未設定)」が付く
+  assert.ok(ctx.formatUsdForModel(0, "some-unknown-model").indexOf("単価未設定") !== -1);
+  assert.equal(ctx.formatUsdForModel(0.042, "typesafe/jev"), "$0.042");
+});
+
+test("AA5: 単価の保存・読み込み・既定値に戻す・不正値のフォールバック", async () => {
+  var ctx = runScript(await getPageHtml());
+  var defaults = ctx.defaultPrices();
+  assert.deepEqual(ctx.getPrices(), defaults);
+
+  ctx.setPrice("typesafe/jev", "in", "0.1");
+  assert.equal(ctx.getPrices()["typesafe/jev"].in, 0.1, "単価の変更が反映されていない");
+  // localStorage を読み直しても残る(保存されている)
+  assert.equal(ctx.loadPrices()["typesafe/jev"].in, 0.1);
+
+  // 不正値(負・数値でない)は無視される
+  ctx.setPrice("typesafe/jev", "in", "-5");
+  assert.equal(ctx.getPrices()["typesafe/jev"].in, 0.1, "負の値が反映されてしまった");
+  ctx.setPrice("typesafe/jev", "in", "abc");
+  assert.equal(ctx.getPrices()["typesafe/jev"].in, 0.1, "数値でない値が反映されてしまった");
+
+  // 未知のモデル・フィールドは無視される
+  ctx.setPrice("unknown-model", "in", "1");
+  assert.equal(Object.prototype.hasOwnProperty.call(ctx.getPrices(), "unknown-model"), false);
+  ctx.setPrice("typesafe/jev", "bogus-field", "1");
+  assert.equal(ctx.getPrices()["typesafe/jev"].in, 0.1);
+
+  // 既定値に戻す
+  ctx.resetPrices();
+  assert.deepEqual(ctx.getPrices(), defaults);
+
+  // 壊れた localStorage は既定値にフォールバックする
+  ctx.localStorage.setItem("scc.prices.v1", "not json");
+  assert.deepEqual(ctx.loadPrices(), defaults, "壊れたJSONで既定値に戻っていない");
+  ctx.localStorage.setItem("scc.prices.v1", JSON.stringify([1, 2, 3]));
+  assert.deepEqual(ctx.loadPrices(), defaults, "配列(オブジェクトでない)で既定値に戻っていない");
+  ctx.localStorage.setItem("scc.prices.v1", JSON.stringify({ "typesafe/jev": { in: -1, out: 0 } }));
+  assert.equal(
+    ctx.loadPrices()["typesafe/jev"].in,
+    defaults["typesafe/jev"].in,
+    "不正なエントリ(負値)が採用されてしまった"
+  );
+});
+
+test("AA6: postStatus() に elapsedMs/costUsd が乗り、比較シェルの見出しに ms と $ が出る", async () => {
+  var posted = [];
+  var fakeWindow = {
+    parent: {
+      postMessage: function (payload, origin) { posted.push({ payload: payload, origin: origin }); },
+    },
+    addEventListener: function () {},
+  };
+  var ctx = runScript(await getPageHtml(), {
+    location: { pathname: "/", search: "embed=1", origin: "https://example.com" },
+    window: fakeWindow,
+  });
+  ctx.render();
+  assert.ok(posted.length > 0, "postMessage が呼ばれていない(embed=1 なのに)");
+  var last = posted[posted.length - 1];
+  assert.equal(typeof last.payload.elapsedMs, "number", "elapsedMs が status に乗っていない");
+  assert.equal(typeof last.payload.costUsd, "number", "costUsd が status に乗っていない");
+
+  // 比較シェル: renderCompareStatusHtml が status.elapsedMs / costUsd を ms / $ で表示する
+  var compareCtx = runScript(await getPageHtml(), {
+    location: { pathname: "/compare", search: "", origin: "https://example.com" },
+  });
+  compareCtx.compareStatus.jev = {
+    type: "status", model: "typesafe/jev", round: 2, correct: 5, total: 51, remaining: 40,
+    running: true, paused: false, done: false, elapsedMs: 12345, costUsd: 0.0012,
+  };
+  var html = compareCtx.renderCompareStatusHtml("jev");
+  assert.ok(html.indexOf("12,345 ms") !== -1, "比較シェルの見出しに ms 表記が出ていない: " + html);
+  assert.ok(html.indexOf("$0.0012") !== -1, "比較シェルの見出しに $ 表記が出ていない: " + html);
 });
