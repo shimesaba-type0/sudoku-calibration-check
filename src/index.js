@@ -3258,24 +3258,44 @@ var PAGE_HTML = `<!doctype html>
   // Anthropic の構造化出力が 400(compiled grammar is too large)を返すため(Issue #74)、
   // CLAUDE_ALL_CHUNK_SIZE 件ずつのチャンクに分けて並列に呼び、結果をマージする
   // (どのチャンクも同じ AbortController を共有するので、停止すればまとめて中断される)。
-  // 戻り値は askAllJev と同じ形 { cells, request, usage } + chunkCount(先頭チャンクの
+  // 戻り値は askAllJev と同じ形 { cells, request, usage } + chunkCount(成功した先頭チャンクの
   // request だけを返す。プロンプト枠は renderAllRequestBlock() 参照)。
+  // Promise.all ではなく Promise.allSettled を使う(PR #75 の Opus レビュー should-fix S1):
+  // 一部のチャンクだけ失敗しても、既に成功していたチャンクぶんの usage(実際に課金された
+  // トークン)を失わないよう、投げるエラーに partialUsage / chunkCount を載せる。呼び出し側
+  // (askAllRound)がそれを carryUsage(4.1)に積むので、「この実行の消費」パネルの表示から
+  // 消えない。ただし再開時にその周をもう一度最初から呼び直す(全チャンク再送信)ため、
+  // 成功していたチャンクぶんが実際に二重課金されること自体は避けられない(既知の制約。
+  // docs/DESIGN.md 3.6)
   async function askAllClaude(puzzle, excludeByKey, signal) {
     var key = loadAnthropicKey();
     if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」でキーを保存してください)");
     var keys = selectionKeys();
     var chunks = chunkArray(keys, CLAUDE_ALL_CHUNK_SIZE);
-    var results = await Promise.all(chunks.map(function (chunkKeys) {
+    var settled = await Promise.allSettled(chunks.map(function (chunkKeys) {
       return askAllClaudeChunk(puzzle, chunkKeys, excludeByKey, key, signal);
     }));
     var cells = {};
     var usage;
-    for (var i = 0; i < results.length; i++) {
-      var cellKeys = Object.keys(results[i].cells);
-      for (var j = 0; j < cellKeys.length; j++) cells[cellKeys[j]] = results[i].cells[cellKeys[j]];
-      usage = combineClaudeUsage(usage, results[i].usage);
+    var request = null;
+    var failure = null;
+    for (var i = 0; i < settled.length; i++) {
+      var entry = settled[i];
+      if (entry.status === "fulfilled") {
+        var cellKeys = Object.keys(entry.value.cells);
+        for (var j = 0; j < cellKeys.length; j++) cells[cellKeys[j]] = entry.value.cells[cellKeys[j]];
+        usage = combineClaudeUsage(usage, entry.value.usage);
+        if (request === null) request = entry.value.request;
+      } else if (!failure) {
+        failure = entry.reason;
+      }
     }
-    return { cells: cells, request: results[0].request, usage: usage, chunkCount: chunks.length };
+    if (failure) {
+      failure.chunkCount = chunks.length;
+      failure.partialUsage = usage;
+      throw failure;
+    }
+    return { cells: cells, request: request, usage: usage, chunkCount: chunks.length };
   }
 
   // -------------------------------------------------------------------
@@ -3666,7 +3686,20 @@ var PAGE_HTML = `<!doctype html>
       if (!isCurrent(token)) return;
       if (err && err.name === "AbortError") return;
       if (err && err.request && typeof err.request === "object") {
-        state.lastAllRequest = { request: err.request, failed: true, count: requestedCount };
+        state.lastAllRequest = { request: err.request, failed: true, count: requestedCount, chunkCount: err.chunkCount || 1 };
+      }
+      // Claude 経路のチャンク分割(Issue #74)で、失敗したチャンクより先に成功していた
+      // チャンクぶんの usage(実際に課金された分)を捨てずに carryUsage(4.1)へ積む。
+      // 再開時にその周をもう一度最初から呼び直す(全チャンク再送信)ため、成功していた
+      // チャンクぶんが実際に二重課金されること自体は避けられない(PR #75 レビュー S1)。
+      if (err && err.partialUsage) {
+        var partialRecordUsage = toRecordUsage(err.partialUsage);
+        if (partialRecordUsage) {
+          carryUsage = {
+            usage: combineRecordUsage(carryUsage && carryUsage.usage, partialRecordUsage),
+            latencyMs: carryUsage ? carryUsage.latencyMs : 0
+          };
+        }
       }
       state.allFetching = false;
       // 一時的な失敗(Issue #43)は停止扱い(queue は変えていないので、再開は
@@ -4900,11 +4933,15 @@ var PAGE_HTML = `<!doctype html>
   // 一括モード(Issue #48)の「モデルに送ったプロンプト」1件ぶん。1周ぶんの request は
   // 空マスの数だけ質問を含み大きいので、「質問 N 問」の要約行 + 折りたたみ(<details>)で出す
   // (allReq = { request, failed, count, chunkCount })。chunkCount > 1 のとき(Claude 経路が
-  // スキーマサイズの都合でチャンク分割した。Issue #74)は、表示しているのが先頭チャンクの
-  // 1件だけであることを注記する(全チャンクぶんを並べると却って読みにくいため)。
+  // スキーマサイズの都合でチャンク分割した。Issue #74)は、表示しているのが全チャンクの
+  // うち1件だけであることを注記する(全チャンクぶんを並べると却って読みにくいため)。
+  // 成功時は先頭チャンク、失敗時は実際に失敗したチャンク(PR #75 レビュー S2。
+  // err.request がそのチャンク自身のボディなので、chunkCount > 1 でも「先頭」とは限らない)。
   function renderAllRequestBlock(allReq) {
     var failedNote = allReq.failed ? "(このプロンプトで失敗)" : "";
-    var chunkNote = allReq.chunkCount > 1 ? "(" + allReq.chunkCount + "回に分割。先頭の1回だけ表示)" : "";
+    var chunkNote = allReq.chunkCount > 1
+      ? (allReq.failed ? "(" + allReq.chunkCount + "回に分割。失敗した1回を表示)" : "(" + allReq.chunkCount + "回に分割。先頭の1回だけ表示)")
+      : "";
     var summary = "<p class=\\"muted\\">一括: 質問 " + allReq.count + " 問" + chunkNote + failedNote + "</p>";
     return summary + "<details class=\\"prompt-details\\"><summary>プロンプトを表示</summary>" +
       "<pre class=\\"prompt-json\\">" + escapeHtml(JSON.stringify(allReq.request, null, 2)) + "</pre></details>";

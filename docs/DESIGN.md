@@ -372,21 +372,41 @@ Cloudflare 側の都合で変わる。形が違っていたらこの節と `hand
     構造化出力が「The compiled grammar is too large, which would cause performance issues.
     Simplify your tool schemas or reduce the number of strict tools.」という 400 を返すことが
     実機で確認された。`askAllClaude(puzzle, excludeByKey, signal)` は `selectionKeys()` の結果を
-    `chunkArray(keys, CLAUDE_ALL_CHUNK_SIZE)`(既定 10)でチャンクに区切り、チャンクごとに
-    `askAllClaudeChunk(puzzle, chunkKeys, excludeByKey, key, signal)`(旧 `askAllClaude` の
-    fetch/検証本体をそのまま切り出したもの。1チャンクぶんの `buildClaudeAllRequest` /
-    `parseClaudeAllAnswer` を呼ぶ)を `Promise.all` で**並列に**呼ぶ。全チャンクが同じ
-    `AbortController`(`signal`)を共有するので、停止すれば全部まとめて中断される。いずれかの
-    チャンクが失敗すれば `Promise.all` がその場でエラーになり(他チャンクの結果は捨てる)、
-    従来どおり周全体が失敗扱いになる(部分成功は扱わない)。戻り値の `cells` は各チャンクの
-    結果をマージしたもの、`usage` は `combineClaudeUsage(a, b)`(`extractClaudeUsage()` と同じ
-    形 `{ input_tokens, output_tokens, cache_read_input_tokens? }` を2つ合算する純粋関数。
-    `combineRecordUsage`(4.2)の記録形版と同じ考え方だが、`toRecordUsage()` に通す前の生の
-    usage を合算する必要があるので別に持つ)で全チャンクぶんを合算したもの、`chunkCount` は
-    チャンク数。`request` は先頭チャンクの `body` だけを返す(プロンプト枠は
-    `renderAllRequestBlock()` が `allReq.chunkCount > 1` のとき「(N回に分割。先頭の1回だけ
-    表示)」を添えて、表示しているのが全部ではないことを明示する)。Jev 経路(Worker、
-    `ask:"all"`)はこの制約と無縁なので変更していない
+    `chunkArray(keys, CLAUDE_ALL_CHUNK_SIZE)`(既定 10。実キーで確かめた値ではなく、保守的に
+    選んだ推測値。**この値で「むずかしい」+ 消去法の両トグルなし + 思考ありの最悪ケースでも
+    400 を避けられるかは未検証**、`docs/HANDOFF.md` 6章の要オーナー判断に追記した)でチャンクに
+    区切り、チャンクごとに `askAllClaudeChunk(puzzle, chunkKeys, excludeByKey, key, signal)`
+    (旧 `askAllClaude` の fetch/検証本体をそのまま切り出したもの。1チャンクぶんの
+    `buildClaudeAllRequest` / `parseClaudeAllAnswer` を、そのチャンクのキーだけを
+    `expectedKeys` にして呼ぶ)を `Promise.allSettled` で**並列に**呼ぶ。全チャンクが同じ
+    `AbortController`(`signal`)を共有するので、停止すれば全部まとめて中断される。
+    - **部分失敗の扱い(PR #75 レビュー S1)**: `Promise.all` ではなく `Promise.allSettled` を使う。
+      いずれかのチャンクが失敗しても、成功していたチャンクの `cells` / `usage` を先に集計してから
+      エラーを投げる(`err.partialUsage` に成功ぶんの合算 usage、`err.chunkCount` にチャンク数を
+      載せる)。`askAllRound()` の失敗ハンドラがこれを `toRecordUsage()` に通してから
+      `carryUsage`(4.1。停止中に持ち越す usage の置き場)へ積むので、「この実行の消費」パネルの
+      累計から消えない。**ただし停止/再開ではその周をもう一度最初から呼び直す(全チャンク再送信)
+      ため、成功していたチャンクぶんが実際に二重に課金されること自体は避けられない**(既知の
+      制約。成功済みチャンクをキャッシュして失敗したチャンクだけ再送信する設計にすれば防げるが、
+      実装コストに対して見合わないと判断し見送った)。エラー停止(`showError()`。429/529/5xx・
+      ネットワーク失敗以外の非 transient な失敗)の場合は復帰がリセットのみなので、
+      `carryUsage` に積んでも次の commit で消費される前に `reset()` が空にする(実害は無いが、
+      一貫性のため transient/非 transient を問わず同じ経路で積む)
+    - 戻り値の `cells` は成功したチャンクの結果をマージしたもの、`usage` は
+      `combineClaudeUsage(a, b)`(`extractClaudeUsage()` と同じ形
+      `{ input_tokens, output_tokens, cache_read_input_tokens? }` を2つ合算する純粋関数。
+      `combineRecordUsage`(4.2)の記録形版と同じ考え方だが、`toRecordUsage()` に通す前の生の
+      usage を合算する必要があるので別に持つ)で成功したチャンクぶんを合算したもの、
+      `chunkCount` はチャンク数。`request` は成功した先頭チャンクの `body`(失敗時は実際に
+      失敗したチャンクの `body`)を返す(プロンプト枠は `renderAllRequestBlock()` が
+      `allReq.chunkCount > 1` のとき、成功時は「(N回に分割。先頭の1回だけ表示)」、失敗時は
+      「(N回に分割。失敗した1回を表示)」を添えて、表示しているのが全部ではないことを明示する)
+    - **コスト・レート制限への影響**: チャンクごとに `CLAUDE_ALL_SYSTEM` と盤面全体(9行)を
+      毎回送り直すため、51マスの固定問題(既定6チャンク)では一括の入力トークンがチャンク分割前
+      よりおおむね6倍になる(`docs/SPEC.md` 5章)。また6リクエストが同時に飛ぶため、Anthropic
+      側のレート制限に近いキーではバーストで 429 を踏みやすくなる可能性がある(その場合も上記の
+      部分失敗の扱いにより、429 が来る前に成功していたチャンクぶんの usage は失われない)
+    - Jev 経路(Worker、`ask:"all"`)はこの制約と無縁なので変更していない
 - **消去法(履歴 Issue #61・ルール候補 Issue #63)の Claude 経路**: digit 判定は
   `buildClaudeRequest(puzzle, r, c, exclude)`(`exclude` は `excludeFor(r,c)` の結果、「外す数字」の
   配列)、一括は `buildClaudeAllRequest(puzzle, keys, excludeByKey)`(`excludeByKey` は
@@ -592,13 +612,13 @@ var compareGenerating = false;  // 「新しい問題」(比較シェル版)で�
 | `buildClaudeCellRequest(puzzle,keys)` / `buildClaudeCellSchema(keys)` | 確信度順のマス選び(Claude 経路)のリクエスト組み立て(3.6)。`buildClaudeRequest` と同じ `thinking` / `max_tokens` の規則を共有する |
 | `askAll(signal)` | 一括モード(Issue #48)の1周ぶん。`buildSelectionSnapshot()` と `excludeMapForQueue()`(消去法。Issue #61・#63)を **ここで1回だけ** 作り、`state.modelMode` に応じて `askAllJev` / `askAllClaude` に渡す。戻り値はどちらも `{ cells, request, usage? }`(`cells` はマスのキー → `{ choice, probabilities, confidence }`)+ `_t`(Issue #55) |
 | `askAllJev(puzzle,excludeByKey,signal)` | `/api/judge` に `{ puzzle, ask: "all" }` を `fetch`(`target` も `digit` も付けない)。`excludeByKey` にキーが1つでもあれば `body.exclude` に付ける(空なら付けない。Issue #61・#63)。`judgeCellJev` / `askCellJev` と同じ形でエラーを投げる(429 / 503 の `transient` / `retryAfter` も同じ `markJevTransientError()` で付く) |
-| `askAllClaude(puzzle,excludeByKey,signal)` | `selectionKeys()` で候補キーを作り、`chunkArray(keys, CLAUDE_ALL_CHUNK_SIZE)` でチャンクに区切って `askAllClaudeChunk` を `Promise.all` で並列に呼ぶ(3.6、Issue #74)。結果をマージし、戻り値は `askAllJev` と同じ形 `{ cells, request, usage } ` + `chunkCount`(`request` は先頭チャンクのボディだけ、`usage` は `combineClaudeUsage` で全チャンク合算) |
-| `askAllClaudeChunk(puzzle,chunkKeys,excludeByKey,key,signal)` | 一括モード(Claude 経路)の1チャンクぶんの `fetch`。`buildClaudeAllRequest(puzzle,chunkKeys,excludeByKey)` のボディで `api.anthropic.com` を呼び、`validateClaudeAllAnswer(...,chunkKeys,excludeByKey)` / `parseClaudeAllAnswer(...,chunkKeys,excludeByKey)` で検証する(429 / 529 / 5xx・ネットワーク失敗の `transient` は `judgeCellClaude` と同じ)。`askAllClaude` がチャンクの数だけ呼ぶ |
+| `askAllClaude(puzzle,excludeByKey,signal)` | `selectionKeys()` で候補キーを作り、`chunkArray(keys, CLAUDE_ALL_CHUNK_SIZE)` でチャンクに区切って `askAllClaudeChunk` を `Promise.allSettled` で並列に呼ぶ(3.6、Issue #74)。成功したチャンクの結果をマージし、戻り値は `askAllJev` と同じ形 `{ cells, request, usage }` + `chunkCount`(`request` は成功した先頭チャンクのボディだけ、`usage` は `combineClaudeUsage` で成功したチャンクぶんを合算)。1つでも失敗したチャンクがあれば、成功していたチャンクぶんの `usage` を `partialUsage`、`chunkCount` をそのエラーに載せて投げる(`Promise.all` ではなく `allSettled` を使うのは、失敗チャンクのせいで成功済みチャンクぶんの usage(実際に課金された分)を握りつぶさないため。PR #75 レビュー S1) |
+| `askAllClaudeChunk(puzzle,chunkKeys,excludeByKey,key,signal)` | 一括モード(Claude 経路)の1チャンクぶんの `fetch`。`buildClaudeAllRequest(puzzle,chunkKeys,excludeByKey)` のボディで `api.anthropic.com` を呼び、`validateClaudeAllAnswer(...,chunkKeys,excludeByKey)` / `parseClaudeAllAnswer(...,chunkKeys,excludeByKey)`(`expectedKeys` はそのチャンクのキーだけ)で検証する(429 / 529 / 5xx・ネットワーク失敗の `transient` は `judgeCellClaude` と同じ)。`askAllClaude` がチャンクの数だけ呼ぶ |
 | `chunkArray(list,size)` | `list` を `size` 件ずつの配列に区切る純粋関数。一括モード(Claude 経路)のチャンク分割(Issue #74)に使う |
 | `combineClaudeUsage(a,b)` | `extractClaudeUsage()` と同じ形( `input_tokens`/`output_tokens`/`cache_read_input_tokens?`)の usage を2つ合算する純粋関数。`combineRecordUsage`(4.2、`i`/`o`/`ci` の record 形)と同じ考え方だが、`askAllClaude` が `toRecordUsage()` より前の生の usage を合算するのに使う(Issue #74) |
 | `buildClaudeAllRequest(puzzle,keys)` / `buildClaudeAllSchema(keys)` | 一括モード(Claude 経路)の1チャンクぶんのリクエスト組み立て(3.6)。`max_tokens` は既存の規則と一括専用の最低値の `Math.max`。`keys` はそのチャンクのキーだけ(呼び出し全体の `queue` ではない) |
 | `extractClaudeText(data)` | Messages API の応答から `stop_reason` のチェックとテキストブロックの取り出しだけを行う共通部分。`parseClaudeAnswer` / `parseClaudeAllAnswer` が共有する(重複していた抽出ロジックを一本化。Issue #48) |
-| `validateClaudeAllAnswer(answer,expectedKeys)` / `parseClaudeAllAnswer(data,expectedKeys)` | 一括モードの応答検証(3.6)。`answer` は `expectedKeys`(= その周の `queue` のキー)をちょうど持つオブジェクトで、各値が `validateClaudeAnswer(answer[key], DIGITS)` と同じ基準を満たすこと。どのマスで落ちたかが文言に出る |
+| `validateClaudeAllAnswer(answer,expectedKeys)` / `parseClaudeAllAnswer(data,expectedKeys)` | 一括モードの応答検証(3.6)。`answer` は `expectedKeys` をちょうど持つオブジェクトで、各値が `validateClaudeAnswer(answer[key], DIGITS)` と同じ基準を満たすこと。どのマスで落ちたかが文言に出る。Claude 経路はチャンク分割(Issue #74)されるので `expectedKeys` はそのチャンクのキーだけ(その周の `queue` 全体ではない)。Jev 経路(Worker、`ask:"all"`)はチャンク分割が無いので従来どおり `queue` 全体 |
 | `loadAnthropicKey()` / `saveAnthropicKey(key)` / `saveAnthropicKeyFromInput()` / `clearAnthropicKey()` / `anthropicKeyHint()` | キーの読み書き(`scc.anthropic_key.v1`)。画面には末尾 4 文字だけ |
 | `loadClaudeSettings()` / `saveClaudeSettings()` / `setModelMode(mode)` / `setClaudeModel(model)` / `setClaudeThinking(on)` / `modelSettingsLocked()` / `currentModelId()` | モデル設定(`scc.claude_settings.v1`)。実行中・停止中(`isPaused()`)はロックして切り替えない。`currentModelId()` は記録の `m` に入れる識別子 |
 | `setOrderMode(mode)` | 順番トグル(Issue #38・#48)。`"scan"` / `"confidence"` / `"all"` のいずれか。`modelSettingsLocked()` と同じ条件でロックする(周の途中でマスの選び方が混ざらないように)。`localStorage` には保存しない |
@@ -1028,6 +1048,7 @@ new_sqlite_classes = ["RateLimitCounter"]
     - Z7: URL `order=all` で `state.orderMode` が `"all"` になること、`setOrderMode("all")` が効き順番トグルに「一括」ボタン(`onclick="setOrderMode('all')"`)が出ること。比較シェル(`/compare`)の順番トグルにも「一括」があり、`compareSetOrderMode("all")` で `state.orderMode` が変わり `compareIframeSrc()` の組み立てに `order=all` が反映されること
     - Z8: Claude 経路の一括で全マスが確定し(固定問題の51マスなのでチャンク分割される)、記録の `m` が `claude-opus-5+think/all`・`o` が `"all"` になること、キーが DOM に出ないこと。Jev 経路で `cells` に対象マスが欠けた応答は、1 マスも確定・記録せず `queue` も減らさずにエラー停止すること(`askAllRound` がキャッシュに入れる前に queue の全キーを確かめる)
     - Z9(Issue #74): `chunkArray()` の境界(割り切れる・余りが出る・空・要素1個)、`combineClaudeUsage()` の合算(片方 `undefined`・`cache_read_input_tokens` の合算)。固定問題(51マス)なら `CLAUDE_ALL_CHUNK_SIZE`(既定10)で6チャンクになること。`run()` 経由でチャンクごとに異なる `usage` を返し、合算された値が周の先頭1件の記録にだけ付き(二重計上しない)、プロンプト枠に「(6回に分割。先頭の1回だけ表示)」の注記が出ること
+    - Z10(PR #75 レビュー S1): 6チャンク中1つだけ429にし、残り5チャンクは成功させる。成功していた5チャンクぶんの usage が `carryUsage` に積まれること、プロンプト枠に「(6回に分割。失敗した1回を表示)」の注記が出ること(`git stash` で `Promise.allSettled` 化前のコードに戻すと落ちることを確認済み)。再開(全チャンク再送信)後、`carryUsage` の分と再送信ぶんの usage が両方とも周の先頭1件の記録に合算されること
   - **計時・コスト**(`test/page.test.js` AA1〜AA13、Issue #55・#56)。S/T/W/Y/Z 系と同じ `runScript` / `makeAbortAwareFetch` / `waitFor` を使う。`ctx.nowMs = function(){...}` で `Date.now()` を差し替え(`RECORDS_MAX` の上書きと同じパターン)、実時間を待たずに確定値で検証する。`blankCells(solved, cells)` を新設(`ANSWER_KEY` の指定セルだけを `"."` にした81文字の盤面を作り、`applyPuzzleFromString()` で空マス数の少ない盤面に差し替えて周を短く終わらせる)
     - AA1: 空マス2つの盤面で `run()` → 1マス目確定 → 2マス目 in-flight のまま `nowMs` を進めて `stop()`(この時点で `totalElapsedMs` / `roundElapsedMs` が期待どおりの値になること、`runningSince` が `null` になること)→ 停止中にさらに `nowMs` を進める(3600ms 相当)→ `run()` で再開(`runningSince` が再開時刻に付け替わること)→ 2マス目を確定して完了。`state.roundLog[0].ms` と `totalElapsedMs` が、停止中の分を除いた合計(400ms + 200ms = 600ms)になること、`roundElapsedMs` が完了後に0へ戻っていること
     - AA2: `formatMs` / `formatUsd` の書式(3桁区切り、`$0.01` 未満は有効数字2桁程度、負値・0の扱い)。`formatRoundLogLine(entry)` が「N周目: M中K正解 (P%) — 3,214 ms / $0.0004」、`formatTotalSummary()` が `state.roundLog.length` を使って「合計 12,345 ms / $0.0012(3周)」になること

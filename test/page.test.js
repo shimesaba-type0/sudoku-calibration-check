@@ -4236,6 +4236,125 @@ test("Z9: 一括モード(Claude 経路)は CLAUDE_ALL_CHUNK_SIZE 件ずつチ�
   );
 });
 
+test("Z10: 一括モード(Claude 経路)でチャンクの一部だけ失敗しても、成功していたチャンクぶんの usage を失わない(PR #75 レビュー S1)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  assert.equal(ctx.saveAnthropicKey(TEST_KEY), true);
+  ctx.setModelMode("claude");
+  ctx.setOrderMode("all");
+  ctx.setSpeed("fast");
+  ctx.run();
+  var expectedChunks = Math.ceil(ctx.TOTAL_EMPTY / ctx.CLAUDE_ALL_CHUNK_SIZE);
+  await waitFor(function () { return af.pending.length === expectedChunks; }, "Z10: fetch 待ち(チャンク分割ぶん)");
+  var entries = af.pending.splice(0, af.pending.length);
+
+  // 先頭以外の全チャンクは成功させ、先頭チャンクだけ 429(一時的な失敗)にする。
+  var expectedPartialInput = 0;
+  var expectedPartialOutput = 0;
+  entries.forEach(function (entry, i) {
+    if (i === 0) {
+      entry.resolve({
+        ok: false,
+        status: 429,
+        headers: { get: function () { return null; } },
+        json: function () { return Promise.resolve({ error: { message: "rate limited" } }); },
+      });
+      return;
+    }
+    var body = JSON.parse(entry.init.body);
+    var schemaProps = body.output_config.format.schema.properties;
+    var chunkKeys = Object.keys(schemaProps);
+    var answer = {};
+    chunkKeys.forEach(function (k) {
+      var m = /^r(\d)c(\d)$/.exec(k);
+      var digit = ctx.SOLUTION[Number(m[1])][Number(m[2])];
+      var list = Array.prototype.slice.call(schemaProps[k].properties.choice.enum).map(String);
+      var probabilities = {};
+      var rest = list.length > 1 ? 0.4 / (list.length - 1) : 0;
+      list.forEach(function (d) { probabilities[d] = d === digit ? 0.6 : rest; });
+      answer[k] = { choice: digit, probabilities: probabilities, confidence: 0.4 };
+    });
+    var inputTokens = 100 + i;
+    var outputTokens = 50 + i;
+    expectedPartialInput += inputTokens;
+    expectedPartialOutput += outputTokens;
+    entry.resolve({
+      ok: true,
+      status: 200,
+      json: function () {
+        return Promise.resolve({
+          id: "msg_z10_" + i,
+          type: "message",
+          role: "assistant",
+          model: "claude-opus-5",
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: JSON.stringify(answer) }],
+          usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+        });
+      },
+    });
+  });
+
+  await waitFor(function () { return ctx.isPaused() && ctx.state.pauseReason !== null; }, "Z10: 一時的な失敗での停止待ち");
+  assert.ok(ctx.carryUsage, "成功していたチャンクぶんの usage が carryUsage に積まれていない");
+  assert.equal(ctx.carryUsage.usage.i, expectedPartialInput, "carryUsage の入力トークンが成功したチャンクの合計と一致しない");
+  assert.equal(ctx.carryUsage.usage.o, expectedPartialOutput, "carryUsage の出力トークンが成功したチャンクの合計と一致しない");
+
+  // プロンプト枠には「失敗した1回を表示」の注記が出る(先頭チャンクではなく実際に失敗したチャンク)
+  ctx.render();
+  assert.ok(
+    ctx.appElement.innerHTML.indexOf("(" + expectedChunks + "回に分割。失敗した1回を表示)") !== -1,
+    "プロンプト枠に失敗チャンクの注記が出ていない"
+  );
+
+  // 再開すると、その周をもう一度最初から呼び直す(全チャンク再送信)。今度は全部成功させる。
+  ctx.run();
+  await waitFor(function () { return af.pending.length === expectedChunks; }, "Z10: 再開後の fetch 待ち(チャンク分割ぶん)");
+  var retryEntries = af.pending.splice(0, af.pending.length);
+  var expectedRetryInput = 0;
+  var expectedRetryOutput = 0;
+  retryEntries.forEach(function (entry, i) {
+    var body = JSON.parse(entry.init.body);
+    var schemaProps = body.output_config.format.schema.properties;
+    var chunkKeys = Object.keys(schemaProps);
+    var answer = {};
+    chunkKeys.forEach(function (k) {
+      var m = /^r(\d)c(\d)$/.exec(k);
+      var digit = ctx.SOLUTION[Number(m[1])][Number(m[2])];
+      var list = Array.prototype.slice.call(schemaProps[k].properties.choice.enum).map(String);
+      var probabilities = {};
+      var rest = list.length > 1 ? 0.4 / (list.length - 1) : 0;
+      list.forEach(function (d) { probabilities[d] = d === digit ? 0.6 : rest; });
+      answer[k] = { choice: digit, probabilities: probabilities, confidence: 0.4 };
+    });
+    var inputTokens = 10 + i;
+    var outputTokens = 5 + i;
+    expectedRetryInput += inputTokens;
+    expectedRetryOutput += outputTokens;
+    entry.resolve({
+      ok: true,
+      status: 200,
+      json: function () {
+        return Promise.resolve({
+          id: "msg_z10r_" + i,
+          type: "message",
+          role: "assistant",
+          model: "claude-opus-5",
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: JSON.stringify(answer) }],
+          usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+        });
+      },
+    });
+  });
+  await waitFor(function () { return ctx.state.done === true; }, "Z10: 完了待ち");
+  var records = ctx.getRecords();
+  assert.equal(records.length, ctx.TOTAL_EMPTY, "記録の件数が空マス数と一致しない");
+  // 先頭の記録には、失敗した周の成功ぶん(carryUsage)+ 再開後の周ぶんが両方乗る
+  assert.equal(records[0].u.i, expectedPartialInput + expectedRetryInput, "先頭の記録の入力トークンに carryUsage が合算されていない");
+  assert.equal(records[0].u.o, expectedPartialOutput + expectedRetryOutput, "先頭の記録の出力トークンに carryUsage が合算されていない");
+});
+
 // ---------------------------------------------------------------------------
 // 計時・コスト(Issue #55・#56、SPEC 3章 F1・F1'・5章)。S/T/W/Y/Z 系と同じ
 // runScript / makeAbortAwareFetch / waitFor を使う。nowMs() を差し替えて
