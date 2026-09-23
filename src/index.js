@@ -1973,10 +1973,11 @@ var PAGE_HTML = `<!doctype html>
 
   /**
    * generatePuzzle() をランダム順を変えて最大 GENERATE_RETRIES 回試し、目標ヒント数
-   * (targetGivens)にちょうど届いた結果があればそこで打ち切って返す。「むずかしい」
-   * (25)は目標ちょうどには届かず 26〜28 で止まることがある(既知。PR #15 の補足)ため、
-   * 3回とも届かなければ、そのうち最もヒント数が少ない(= 最も難しい)結果を返す
-   * (無限ループにはしない。docs/DESIGN.md 5章)。
+   * (targetGivens)にちょうど届いた結果があればそこで打ち切って返す。目標が低いほど
+   * (「むずかしい」25、「上級」22)1回のランダム順では届かないことが多い(既知。
+   * PR #15 の補足、Issue #87 のベンチマーク)ため、GENERATE_RETRIES 回とも届かなければ、
+   * そのうち最もヒント数が少ない(= 最も難しい)結果を返す(無限ループにはしない。
+   * docs/DESIGN.md 5章)。
    */
   function generatePuzzleWithRetry(targetGivens) {
     var best = null;
@@ -2165,17 +2166,25 @@ var PAGE_HTML = `<!doctype html>
     };
   }
 
-  // ジェネレーターが目指す「与えられた数字」の数。下限を割り込むほどは削らない
-  // (削るほど生成に時間がかかり、実験としても手がかりが減りすぎる)。
+  // ジェネレーターが目指す「与えられた数字」の数。下限は数独の一意解として知られる
+  // 理論上の最小値(17)。下げたからといって即座に17まで届くわけではなく、この
+  // アルゴリズム(1回のランダム順で局所的に詰まったら打ち切り、best-of-N)では
+  // 22前後が実質的な限界(Issue #87 のベンチマーク参照)。
   var DEFAULT_TARGET_GIVENS = 30;
-  var MIN_TARGET_GIVENS = 24;
+  var MIN_TARGET_GIVENS = 17;
 
   // 難易度(SPEC F1/F4)ごとの目標ヒント数。「新しい問題」を押した時点の
   // state.difficulty に応じて newPuzzle() が generatePuzzleWithRetry() に渡す。
-  var DIFFICULTY_GIVENS = { easy: 36, normal: 30, hard: 25 };
+  // expert(上級、Issue #87、オーナー要望 2026-09-23。にこりさんの数独でいう上級相当)は
+  // 目標22だが、実際に安定して収束するのは22〜23(下記 GENERATE_RETRIES とセット)。
+  var DIFFICULTY_GIVENS = { easy: 36, normal: 30, hard: 25, expert: 22 };
   var DEFAULT_DIFFICULTY = "normal";
   // generatePuzzleWithRetry() が目標ヒント数に届かないとき再試行する回数の上限。
-  var GENERATE_RETRIES = 3;
+  // 3→20(Issue #87)。expert(目標22)を数百ms以内で22〜23ヒントに収束させるために
+  // 増やした。副次効果として、既存の hard(目標25)も以前は26〜28で止まることが
+  // 多かったのが、20回の再試行でほぼ毎回25ちょうどに届くようになった(easy/normal は
+  // 初回で目標にちょうど届くので生成時間への影響はほぼ無い)。
+  var GENERATE_RETRIES = 20;
 
   // 初期表示は Wikipedia の固定問題(docs/DESIGN.md 5章)。
   // 「新しい問題」を押すと generatePuzzle() の結果で丸ごと差し替える。
@@ -2212,7 +2221,7 @@ var PAGE_HTML = `<!doctype html>
     done: false,
     roundsToSolve: null,
     speedMode: "slow",
-    difficulty: DEFAULT_DIFFICULTY, // "easy" | "normal" | "hard"(SPEC F1)。次の newPuzzle() から効く
+    difficulty: DEFAULT_DIFFICULTY, // "easy" | "normal" | "hard" | "expert"(SPEC F1、Issue #87)。次の newPuzzle() から効く
     errorMessage: null,
     stoppedAtLimit: false,
     lastJudgment: null, // 直前に確定した1件(最速モードでも結果が見えるように残す)
@@ -4198,8 +4207,10 @@ var PAGE_HTML = `<!doctype html>
    * state.difficulty(reset() で維持される)に応じたヒント数で生成した盤面で
    * GIVEN / SOLUTION と派生値(TOTAL_EMPTY / roundSize)を差し替える。難易度を
    * 変えただけでは盤面は変わらず、この「新しい問題」の生成から効く。
-   * 生成は同期処理(「むずかしい」で3回試行しても概ね数十ms以下)なので、いったん
-   * 「生成中…」を描いてから setTimeout(0) で走らせ、画面が固まったように見えないようにする。
+   * 生成は同期処理(「やさしい」「ふつう」は初回で目標に届くので数ms、「むずかしい」
+   * 「上級」は GENERATE_RETRIES(20)回試すことがあり最大でも数百ms程度。Issue #87)
+   * なので、いったん「生成中…」を描いてから setTimeout(0) で走らせ、画面が固まった
+   * ように見えないようにする。
    */
   function newPuzzle() {
     if (generating) return;
@@ -4436,6 +4447,7 @@ var PAGE_HTML = `<!doctype html>
     var easyActive = state.difficulty === "easy" ? " active" : "";
     var normalActive = state.difficulty === "normal" ? " active" : "";
     var hardActive = state.difficulty === "hard" ? " active" : "";
+    var expertActive = state.difficulty === "expert" ? " active" : "";
     var newDisabled = compareGenerating ? "disabled" : "";
     var newLabel = compareGenerating ? "生成中…" : "新しい問題";
     return "<div class=\\"controls\\">" +
@@ -4463,6 +4475,7 @@ var PAGE_HTML = `<!doctype html>
       "<button class=\\"difficulty-btn" + easyActive + "\\" onclick=\\"compareSetDifficulty('easy')\\">やさしい</button>" +
       "<button class=\\"difficulty-btn" + normalActive + "\\" onclick=\\"compareSetDifficulty('normal')\\">ふつう</button>" +
       "<button class=\\"difficulty-btn" + hardActive + "\\" onclick=\\"compareSetDifficulty('hard')\\">むずかしい</button>" +
+      "<button class=\\"difficulty-btn" + expertActive + "\\" onclick=\\"compareSetDifficulty('expert')\\">上級</button>" +
       "</div>" +
       "</div>";
   }
@@ -4585,7 +4598,7 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function compareSetDifficulty(mode) {
-    if (mode !== "easy" && mode !== "normal" && mode !== "hard") return;
+    if (mode !== "easy" && mode !== "normal" && mode !== "hard" && mode !== "expert") return;
     state.difficulty = mode;
     renderCompareTopbarInPlace();
   }
@@ -4803,6 +4816,7 @@ var PAGE_HTML = `<!doctype html>
       "<option value=\\"easy\\"" + (state.difficulty === "easy" ? " selected" : "") + ">やさしい</option>" +
       "<option value=\\"normal\\"" + (state.difficulty === "normal" ? " selected" : "") + ">ふつう</option>" +
       "<option value=\\"hard\\"" + (state.difficulty === "hard" ? " selected" : "") + ">むずかしい</option>" +
+      "<option value=\\"expert\\"" + (state.difficulty === "expert" ? " selected" : "") + ">上級</option>" +
       "</select>" +
       "<select id=\\"model-toggle\\" aria-label=\\"モデル\\" onchange=\\"setModelMode(this.value)\\" " + modelDisabled + ">" +
       "<option value=\\"jev\\"" + (state.modelMode === "jev" ? " selected" : "") + ">Jev</option>" +
