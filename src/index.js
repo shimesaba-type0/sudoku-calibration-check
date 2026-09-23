@@ -2007,6 +2007,11 @@ var PAGE_HTML = `<!doctype html>
   var CLAUDE_ALL_ANSWER_MAX_TOKENS = 16000;   // 思考なしの一括の最低値
   var CLAUDE_ALL_ADAPTIVE_MAX_TOKENS = 24000; // adaptive thinking の一括の最低値
   var CLAUDE_ALL_HAIKU_MAX_TOKENS = 12000;    // Haiku(budget_tokens 方式)の一括の最低値
+  // 一括モード(Claude 経路)のスキーマ(buildClaudeAllSchema)は、その周のマス数ぶん
+  // 独立した入れ子オブジェクトを properties に持つため、マス数が多いと Anthropic の
+  // 構造化出力が「compiled grammar is too large」で 400 を返す(実機確認、Issue #74)。
+  // 1回のリクエストで聞くマス数をここで区切り、askAllClaude() が複数回に分けて呼ぶ。
+  var CLAUDE_ALL_CHUNK_SIZE = 10;
   var JEV_MODEL_ID = "typesafe/jev";
   // Worker が Jev に渡すのと同じルール説明・質問文(比較条件を揃える)。Worker 側の
   // 定数をテンプレートに埋め込んでいるので、二重管理にならない。
@@ -2534,6 +2539,20 @@ var PAGE_HTML = `<!doctype html>
       result.cache_read_input_tokens = cacheRead;
     }
     return result;
+  }
+
+  // extractClaudeUsage() と同じ形(input_tokens/output_tokens/cache_read_input_tokens)の
+  // usage を2つ足し合わせる。combineRecordUsage() の record 形( i/o/ci)版と同じ考え方だが、
+  // 一括モードのチャンク分割(Issue #74)は askAllClaude() が toRecordUsage() より前の
+  // 生の usage を合算する必要があるので別に持つ。
+  function combineClaudeUsage(a, b) {
+    if (!a && !b) return undefined;
+    var ra = a || { input_tokens: 0, output_tokens: 0 };
+    var rb = b || { input_tokens: 0, output_tokens: 0 };
+    var out = { input_tokens: (ra.input_tokens || 0) + (rb.input_tokens || 0), output_tokens: (ra.output_tokens || 0) + (rb.output_tokens || 0) };
+    var cacheRead = (ra.cache_read_input_tokens || 0) + (rb.cache_read_input_tokens || 0);
+    if (cacheRead > 0) out.cache_read_input_tokens = cacheRead;
+    return out;
   }
 
   // -------------------------------------------------------------------
@@ -3177,15 +3196,19 @@ var PAGE_HTML = `<!doctype html>
     };
   }
 
-  // 一括モード(Issue #48)の1周ぶん(Claude 経路)。judgeCellClaude / askCellClaude と
-  // 同じ組み立て。excludeByKey(消去法。Issue #61・#63)は excludeMapForQueue() の結果を
-  // そのまま渡す。戻り値は askAllJev と同じ形 { cells, request }(cells は
-  // マスのキー → { choice, probabilities, confidence })。
-  async function askAllClaude(puzzle, excludeByKey, signal) {
-    var key = loadAnthropicKey();
-    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」でキーを保存してください)");
-    var keys = selectionKeys();
-    var body = buildClaudeAllRequest(puzzle, keys, excludeByKey);
+  // list を size 件ずつの配列に区切る純粋関数(一括モードのチャンク分割、Issue #74)。
+  function chunkArray(list, size) {
+    var chunks = [];
+    for (var i = 0; i < list.length; i += size) chunks.push(list.slice(i, i + size));
+    return chunks;
+  }
+
+  // 一括モード(Claude 経路)の1チャンクぶんの呼び出し。judgeCellClaude / askCellClaude と
+  // 同じ fetch の組み立て。chunkKeys だけをスキーマの対象にする(CLAUDE_ALL_INSTRUCTIONS が
+  // 「スキーマが要求するキーぶんだけ答える」文言なので、puzzle 側に他の未確定マスの "." が
+  // 残っていても混同しない)。戻り値は askAllJev と同じ形 { cells, request, usage }。
+  async function askAllClaudeChunk(puzzle, chunkKeys, excludeByKey, key, signal) {
+    var body = buildClaudeAllRequest(puzzle, chunkKeys, excludeByKey);
     var res;
     try {
       res = await fetch(ANTHROPIC_MESSAGES_URL, {
@@ -3221,13 +3244,38 @@ var PAGE_HTML = `<!doctype html>
       if (isTransientClaudeStatus(res.status)) httpErr.transient = true;
       throw httpErr;
     }
-    var parsed = parseClaudeAllAnswer(data, keys, excludeByKey);
+    var parsed = parseClaudeAllAnswer(data, chunkKeys, excludeByKey);
     if (parsed.error) {
       var formatErr = new Error(parsed.error);
       formatErr.request = body;
       throw formatErr;
     }
     return { cells: parsed.answer, request: body, usage: extractClaudeUsage(data) };
+  }
+
+  // 一括モード(Issue #48)の1周ぶん(Claude 経路)。excludeByKey(消去法。Issue #61・#63)は
+  // excludeMapForQueue() の結果をそのまま渡す。マス数が多いとスキーマが大きくなりすぎて
+  // Anthropic の構造化出力が 400(compiled grammar is too large)を返すため(Issue #74)、
+  // CLAUDE_ALL_CHUNK_SIZE 件ずつのチャンクに分けて並列に呼び、結果をマージする
+  // (どのチャンクも同じ AbortController を共有するので、停止すればまとめて中断される)。
+  // 戻り値は askAllJev と同じ形 { cells, request, usage } + chunkCount(先頭チャンクの
+  // request だけを返す。プロンプト枠は renderAllRequestBlock() 参照)。
+  async function askAllClaude(puzzle, excludeByKey, signal) {
+    var key = loadAnthropicKey();
+    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」でキーを保存してください)");
+    var keys = selectionKeys();
+    var chunks = chunkArray(keys, CLAUDE_ALL_CHUNK_SIZE);
+    var results = await Promise.all(chunks.map(function (chunkKeys) {
+      return askAllClaudeChunk(puzzle, chunkKeys, excludeByKey, key, signal);
+    }));
+    var cells = {};
+    var usage;
+    for (var i = 0; i < results.length; i++) {
+      var cellKeys = Object.keys(results[i].cells);
+      for (var j = 0; j < cellKeys.length; j++) cells[cellKeys[j]] = results[i].cells[cellKeys[j]];
+      usage = combineClaudeUsage(usage, results[i].usage);
+    }
+    return { cells: cells, request: results[0].request, usage: usage, chunkCount: chunks.length };
   }
 
   // -------------------------------------------------------------------
@@ -3585,7 +3633,7 @@ var PAGE_HTML = `<!doctype html>
     askAll(inflightController.signal).then(function (result) {
       if (!isCurrent(token)) return;
       if (result.request && typeof result.request === "object") {
-        state.lastAllRequest = { request: result.request, failed: false, count: requestedCount };
+        state.lastAllRequest = { request: result.request, failed: false, count: requestedCount, chunkCount: result.chunkCount || 1 };
       }
       // 一括の usage/レイテンシ(Issue #55・#56)は周の先頭1件の記録にだけ付ける
       // (focusCellFromCache() が最初の commitFocused() で消費して null に戻す)。
@@ -4851,10 +4899,13 @@ var PAGE_HTML = `<!doctype html>
 
   // 一括モード(Issue #48)の「モデルに送ったプロンプト」1件ぶん。1周ぶんの request は
   // 空マスの数だけ質問を含み大きいので、「質問 N 問」の要約行 + 折りたたみ(<details>)で出す
-  // (allReq = { request, failed, count })。
+  // (allReq = { request, failed, count, chunkCount })。chunkCount > 1 のとき(Claude 経路が
+  // スキーマサイズの都合でチャンク分割した。Issue #74)は、表示しているのが先頭チャンクの
+  // 1件だけであることを注記する(全チャンクぶんを並べると却って読みにくいため)。
   function renderAllRequestBlock(allReq) {
     var failedNote = allReq.failed ? "(このプロンプトで失敗)" : "";
-    var summary = "<p class=\\"muted\\">一括: 質問 " + allReq.count + " 問" + failedNote + "</p>";
+    var chunkNote = allReq.chunkCount > 1 ? "(" + allReq.chunkCount + "回に分割。先頭の1回だけ表示)" : "";
+    var summary = "<p class=\\"muted\\">一括: 質問 " + allReq.count + " 問" + chunkNote + failedNote + "</p>";
     return summary + "<details class=\\"prompt-details\\"><summary>プロンプトを表示</summary>" +
       "<pre class=\\"prompt-json\\">" + escapeHtml(JSON.stringify(allReq.request, null, 2)) + "</pre></details>";
   }

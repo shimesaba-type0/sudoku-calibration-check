@@ -3915,48 +3915,61 @@ test(
     });
     assert.equal(ctx.validateClaudeAllAnswer(goodAnswer, keys), null, "揃っている応答が検証で弾かれた");
 
-    // run() 経由でも同じ検証が効く(キー欠けの応答はエラーで停止する)
+    // run() 経由でも同じ検証が効く(キー欠けの応答はエラーで停止する)。マス数が多いと
+    // スキーマサイズの都合でチャンク分割される(CLAUDE_ALL_CHUNK_SIZE 件ずつ、Issue #74)ので、
+    // チャンクの数だけ届くのを待ってから全部さばく。
     var af = makeAbortAwareFetch();
     var ctx2 = runScript(await getPageHtml(), { fetch: af.fetch });
     assert.equal(ctx2.saveAnthropicKey(TEST_KEY), true);
     ctx2.setModelMode("claude");
     ctx2.setOrderMode("all");
     ctx2.run();
-    await waitFor(function () {
-      return af.pending.length === 1;
-    }, "Z5: run() 経由の fetch 待ち");
-    var entry = af.pending.shift();
-    assert.equal(entry.url, ANTHROPIC_URL, "呼び先が api.anthropic.com でない");
-    var liveBody = JSON.parse(entry.init.body);
     var liveKeys = Array.prototype.slice.call(ctx2.selectionKeys()).map(String);
-    assert.deepStrictEqual(Object.keys(liveBody.output_config.format.schema.properties).sort(), liveKeys.slice().sort(), "スキーマの properties が queue のキーと一致しない(live)");
-    var liveSent = JSON.parse(liveBody.messages[0].content.slice(liveBody.messages[0].content.indexOf("\n") + 1));
+    var expectedChunks = Math.ceil(liveKeys.length / ctx2.CLAUDE_ALL_CHUNK_SIZE);
+    await waitFor(function () {
+      return af.pending.length === expectedChunks;
+    }, "Z5: run() 経由の fetch 待ち(チャンク分割ぶん)");
+    var entries = af.pending.splice(0, af.pending.length);
+    var allSchemaKeys = [];
+    entries.forEach(function (entry) {
+      assert.equal(entry.url, ANTHROPIC_URL, "呼び先が api.anthropic.com でない");
+      var body = JSON.parse(entry.init.body);
+      allSchemaKeys = allSchemaKeys.concat(Object.keys(body.output_config.format.schema.properties));
+      // Claude 経路の送信ボディにも SOLUTION の行が含まれない(不変条件1。チャンク全部を確認)
+      hostRows(ctx2.SOLUTION).forEach(function (row) {
+        assert.ok(entry.init.body.indexOf(row) === -1, "SOLUTION の行が Claude への送信ボディに含まれている: " + row);
+      });
+      assert.ok(entry.init.body.indexOf(TEST_KEY) === -1, "API キーがボディに混ざっている");
+    });
+    assert.deepStrictEqual(allSchemaKeys.sort(), liveKeys.slice().sort(), "チャンク全部のスキーマ properties を合わせても queue のキーと一致しない(live)");
+    var firstBody = JSON.parse(entries[0].init.body);
+    var liveSent = JSON.parse(firstBody.messages[0].content.slice(firstBody.messages[0].content.indexOf("\n") + 1));
     assert.deepStrictEqual(hostRows(liveSent.puzzle), hostRows(ctx2.buildSelectionSnapshot()), "盤面が buildSelectionSnapshot() と一致しない(live)");
-    // Claude 経路の送信ボディにも SOLUTION の行が含まれない(不変条件1)
-    hostRows(ctx2.SOLUTION).forEach(function (row) {
-      assert.ok(entry.init.body.indexOf(row) === -1, "SOLUTION の行が Claude への送信ボディに含まれている: " + row);
-    });
-    assert.ok(entry.init.body.indexOf(TEST_KEY) === -1, "API キーがボディに混ざっている");
 
-    var missingKeyAnswer = {};
-    liveKeys.forEach(function (k, i) {
-      if (i === 0) return; // 先頭のキーを欠かす
-      missingKeyAnswer[k] = { choice: "1", probabilities: { "1": 1, "2": 0, "3": 0, "4": 0, "5": 0, "6": 0, "7": 0, "8": 0, "9": 0 }, confidence: 0.5 };
-    });
-    entry.resolve({
-      ok: true,
-      status: 200,
-      json: function () {
-        return Promise.resolve({
-          id: "msg_z5",
-          type: "message",
-          role: "assistant",
-          model: "claude-opus-5",
-          stop_reason: "end_turn",
-          content: [{ type: "text", text: JSON.stringify(missingKeyAnswer) }],
-          usage: { input_tokens: 9000, output_tokens: 4000 },
-        });
-      },
+    // 先頭チャンクの先頭キーだけ欠かした応答を返し、Promise.all がまとめてエラーになることを確認する
+    entries.forEach(function (entry, i) {
+      var chunkBody = JSON.parse(entry.init.body);
+      var chunkKeys = Object.keys(chunkBody.output_config.format.schema.properties);
+      var answer = {};
+      chunkKeys.forEach(function (k, ki) {
+        if (i === 0 && ki === 0) return; // 先頭チャンクの先頭キーだけ欠かす
+        answer[k] = { choice: "1", probabilities: { "1": 1, "2": 0, "3": 0, "4": 0, "5": 0, "6": 0, "7": 0, "8": 0, "9": 0 }, confidence: 0.5 };
+      });
+      entry.resolve({
+        ok: true,
+        status: 200,
+        json: function () {
+          return Promise.resolve({
+            id: "msg_z5",
+            type: "message",
+            role: "assistant",
+            model: "claude-opus-5",
+            stop_reason: "end_turn",
+            content: [{ type: "text", text: JSON.stringify(answer) }],
+            usage: { input_tokens: 900, output_tokens: 400 },
+          });
+        },
+      });
     });
     await waitFor(function () {
       return ctx2.state.errorMessage !== null;
@@ -4072,6 +4085,8 @@ test("Z8: 一括モードの Claude 経路で全マスが確定し、記録の m
     };
   }
 
+  // マス数が多いとスキーマサイズの都合でチャンク分割される(CLAUDE_ALL_CHUNK_SIZE 件ずつ、
+  // Issue #74)ので、チャンクの数だけ届くのを待ってから、チャンクごとの応答をまとめて返す。
   var af = makeAbortAwareFetch();
   var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
   assert.equal(ctx.saveAnthropicKey(TEST_KEY), true);
@@ -4079,13 +4094,17 @@ test("Z8: 一括モードの Claude 経路で全マスが確定し、記録の m
   ctx.setOrderMode("all");
   ctx.setSpeed("fast");
   ctx.run();
-  await waitFor(function () {
-    return af.pending.length === 1;
-  }, "Z8: fetch 待ち");
-  var entry = af.pending.shift();
-  var entryBody = JSON.parse(entry.init.body);
   var keys = Array.prototype.slice.call(ctx.selectionKeys()).map(String);
-  entry.resolve(claudeAllResponse(ctx, keys, false, entryBody.output_config.format.schema.properties));
+  var expectedChunks = Math.ceil(keys.length / ctx.CLAUDE_ALL_CHUNK_SIZE);
+  await waitFor(function () {
+    return af.pending.length === expectedChunks;
+  }, "Z8: fetch 待ち(チャンク分割ぶん)");
+  var entries = af.pending.splice(0, af.pending.length);
+  entries.forEach(function (entry) {
+    var entryBody = JSON.parse(entry.init.body);
+    var chunkKeys = Object.keys(entryBody.output_config.format.schema.properties);
+    entry.resolve(claudeAllResponse(ctx, chunkKeys, false, entryBody.output_config.format.schema.properties));
+  });
   await waitFor(function () {
     return ctx.state.done === true;
   }, "Z8: 完了待ち");
@@ -4095,7 +4114,7 @@ test("Z8: 一括モードの Claude 経路で全マスが確定し、記録の m
     assert.equal(rec.m, "claude-opus-5+think/all", "記録の m が claude-opus-5+think/all でない: " + rec.m);
     assert.equal(rec.o, "all", "記録の o が all でない: " + rec.o);
   });
-  assert.equal(af.pending.length, 0, "一括なのに複数回 fetch している");
+  assert.equal(af.pending.length, 0, "1周ぶんのチャンク以外に余計に fetch している");
   ctx.render();
   assert.ok(!ctx.appElement.innerHTML.includes(TEST_KEY), "innerHTML にキーが出ている");
 
@@ -4121,6 +4140,100 @@ test("Z8: 一括モードの Claude 経路で全マスが確定し、記録の m
   assert.equal(Object.keys(ctx2.state.values).length, 0, "欠けた応答なのにマスが確定した");
   assert.equal(ctx2.getRecords().length, 0, "欠けた応答なのに記録が増えた");
   assert.equal(ctx2.queue.length, ctx2.TOTAL_EMPTY, "欠けた応答なのに queue が減った");
+});
+
+test("Z9: 一括モード(Claude 経路)は CLAUDE_ALL_CHUNK_SIZE 件ずつチャンク分割し、usage を合算する(Issue #74)", { timeout: 10000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+
+  // chunkArray(): 境界(割り切れる・余りが出る・空・要素1個)
+  function toHostChunks(chunks) {
+    return Array.prototype.slice.call(chunks).map(function (c) { return Array.prototype.slice.call(c); });
+  }
+  assert.deepStrictEqual(toHostChunks(ctx.chunkArray([1, 2, 3, 4, 5], 2)), [[1, 2], [3, 4], [5]]);
+  assert.deepStrictEqual(toHostChunks(ctx.chunkArray([1, 2, 3, 4], 2)), [[1, 2], [3, 4]]);
+  assert.deepStrictEqual(toHostChunks(ctx.chunkArray([], 2)), []);
+  assert.deepStrictEqual(toHostChunks(ctx.chunkArray([1], 5)), [[1]]);
+
+  // combineClaudeUsage(): 片方 undefined・両方あり・cache_read の合算
+  // (戻り値は vm レルムのオブジェクトなので、プロトタイプ違いで deepStrictEqual が
+  // 落ちないよう Object.assign で host 側にコピーしてから比べる。hostRows と同じ理由)
+  function hostObj(o) { return o ? Object.assign({}, o) : o; }
+  assert.equal(ctx.combineClaudeUsage(undefined, undefined), undefined);
+  assert.deepStrictEqual(hostObj(ctx.combineClaudeUsage({ input_tokens: 10, output_tokens: 5 }, undefined)), { input_tokens: 10, output_tokens: 5 });
+  assert.deepStrictEqual(
+    hostObj(ctx.combineClaudeUsage({ input_tokens: 10, output_tokens: 5, cache_read_input_tokens: 2 }, { input_tokens: 3, output_tokens: 1, cache_read_input_tokens: 1 })),
+    { input_tokens: 13, output_tokens: 6, cache_read_input_tokens: 3 }
+  );
+
+  // 固定問題(51マス、ctx.TOTAL_EMPTY)なら CLAUDE_ALL_CHUNK_SIZE=10 で6チャンクになる
+  // (queue は run() 前は空なので selectionKeys() ではなく TOTAL_EMPTY を使う。この定数を
+  // 変えたらここも要更新)
+  var expectedChunks = Math.ceil(ctx.TOTAL_EMPTY / ctx.CLAUDE_ALL_CHUNK_SIZE);
+  assert.equal(expectedChunks, 6, "既定の固定問題(51マス)で6チャンクにならない(CLAUDE_ALL_CHUNK_SIZE が変わっていないか確認)");
+
+  // 実際の実行フロー: チャンクごとに違う usage を返し、合算されて周の先頭1件の記録にだけ
+  // 付くこと(二重計上しない)。プロンプト枠にも分割の注記が出ること。
+  var af = makeAbortAwareFetch();
+  var ctx2 = runScript(await getPageHtml(), { fetch: af.fetch });
+  assert.equal(ctx2.saveAnthropicKey(TEST_KEY), true);
+  ctx2.setModelMode("claude");
+  ctx2.setOrderMode("all");
+  ctx2.setSpeed("fast");
+  ctx2.run();
+  await waitFor(function () { return af.pending.length === expectedChunks; }, "Z9: fetch 待ち(チャンク分割ぶん)");
+  var entries = af.pending.splice(0, af.pending.length);
+  var expectedInput = 0;
+  var expectedOutput = 0;
+  entries.forEach(function (entry, i) {
+    var body = JSON.parse(entry.init.body);
+    var schemaProps = body.output_config.format.schema.properties;
+    var chunkKeys = Object.keys(schemaProps);
+    var answer = {};
+    chunkKeys.forEach(function (k) {
+      var m = /^r(\d)c(\d)$/.exec(k);
+      var digit = ctx2.SOLUTION[Number(m[1])][Number(m[2])];
+      // 消去法(既定あり)でスキーマの候補が絞られていることがあるので、そのマスの
+      // choice.enum(= 残りの数字)だけを probabilities に使う(Z8 と同じやり方)。
+      var list = Array.prototype.slice.call(schemaProps[k].properties.choice.enum).map(String);
+      var probabilities = {};
+      var rest = list.length > 1 ? 0.4 / (list.length - 1) : 0;
+      list.forEach(function (d) { probabilities[d] = d === digit ? 0.6 : rest; });
+      answer[k] = { choice: digit, probabilities: probabilities, confidence: 0.4 };
+    });
+    var inputTokens = 100 + i; // チャンクごとに違う値にして合算を検証する
+    var outputTokens = 50 + i;
+    expectedInput += inputTokens;
+    expectedOutput += outputTokens;
+    entry.resolve({
+      ok: true,
+      status: 200,
+      json: function () {
+        return Promise.resolve({
+          id: "msg_z9_" + i,
+          type: "message",
+          role: "assistant",
+          model: "claude-opus-5",
+          stop_reason: "end_turn",
+          content: [{ type: "text", text: JSON.stringify(answer) }],
+          usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+        });
+      },
+    });
+  });
+  await waitFor(function () { return ctx2.state.done === true; }, "Z9: 完了待ち");
+  var records = ctx2.getRecords();
+  assert.equal(records.length, ctx2.TOTAL_EMPTY, "記録の件数が空マス数と一致しない");
+  assert.equal(records[0].u.i, expectedInput, "先頭の記録の入力トークンがチャンク合算になっていない");
+  assert.equal(records[0].u.o, expectedOutput, "先頭の記録の出力トークンがチャンク合算になっていない");
+  for (var ri = 1; ri < records.length; ri++) {
+    assert.ok(!records[ri].u, "2件目以降の記録に usage が付いている(二重計上): " + JSON.stringify(records[ri]));
+  }
+
+  ctx2.render();
+  assert.ok(
+    ctx2.appElement.innerHTML.indexOf("(" + expectedChunks + "回に分割。先頭の1回だけ表示)") !== -1,
+    "プロンプト枠にチャンク分割の注記が出ていない"
+  );
 });
 
 // ---------------------------------------------------------------------------
