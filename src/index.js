@@ -1294,7 +1294,8 @@ var PAGE_HTML = `<!doctype html>
   .compare-link { margin: 0 0 20px; font-size: 12px; }
   .compare-link a, .subtitle a { color: var(--accent); }
   /* 実行系ボタン+各トグルの横並びバー(Issue #76)。完了バナーの下・盤面の上に置く。 */
-  .top-controls { margin: 0 0 20px; }
+  /* Claude 設定パネルが続くとき、設定バーとの間にも隙間を空ける(レビュー nit N3、PR #78) */
+  .top-controls { display: flex; flex-direction: column; gap: 12px; margin: 0 0 20px; }
   .layout { display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start; }
   /* 「この実行の消費」を盤面の直下に置くため、grid-panel も side-panel と同じ縦並び(Issue #76)。 */
   .grid-panel { flex: 0 0 auto; display: flex; flex-direction: column; gap: 16px; }
@@ -1365,10 +1366,6 @@ var PAGE_HTML = `<!doctype html>
 
   .usage-row { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
   .usage-row:last-child { margin-bottom: 0; }
-  .price-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 6px; font-size: 13px; }
-  .price-row .price-model { flex: 0 0 170px; color: var(--muted); font-family: "IBM Plex Mono", monospace; font-size: 12px; }
-  .price-row label { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
-  .price-row input[type="number"] { width: 90px; padding: 5px 8px; }
 
   #error-box.error {
     background: var(--error-bg);
@@ -4623,6 +4620,16 @@ var PAGE_HTML = `<!doctype html>
     return "<div id=\\"legend\\" class=\\"legend\\">" + items + "</div>";
   }
 
+  // render() のたびに <select> を作り直すと、開いているプルダウンやフォーカスが失われる
+  // (Opus レビュー S1、PR #78)。実行中でも切り替えられるのは速度・難易度だけ(他の4つは
+  // modelSettingsLocked() でロックされ、無効化された <select> はそもそもフォーカスできない)
+  // ので、この6つの id だけを見れば足りる。
+  var TOP_CONTROLS_SELECT_IDS = ["speed-toggle", "difficulty-toggle", "model-toggle", "order-toggle", "history-toggle", "rules-toggle"];
+  function isControlSelectFocused() {
+    var el = document.activeElement;
+    return !!(el && el.tagName === "SELECT" && TOP_CONTROLS_SELECT_IDS.indexOf(el.id) !== -1);
+  }
+
   // 実行系ボタン + 6つのトグル(速度・難易度・モデル・順番・履歴・ルール候補)を横並びの
   // 1本のバーにする(オーナー要望 2026-09-23、Issue #76)。選択肢が複数あるトグルは
   // 「選択中のものだけ見えればいい」ので、ボタン群の代わりに <select> にした
@@ -4715,7 +4722,8 @@ var PAGE_HTML = `<!doctype html>
 
   // 「この実行の消費」パネル(Issue #55・#56。オーナー追加要望 2026-09-23: 単価パネルは
   // レートの「定義」であって、いま実際にどれだけ消費したかが見えないという指摘への対応)。
-  // 単価パネルのすぐ上に置き、同じ場所を見れば「単価の定義」と「実消費」が両方わかるようにする。
+  // 盤面(グリッド+凡例)の直下に置く(Issue #76。単価パネルは画面から削除したので、
+  // 単価パネルとの位置関係を説明する必要はもう無い)。
   // 速度(tok/s)は「最速」モードのときだけ出す(オーナー追加要望 2026-09-23。「じっくり確認」は
   // 意図的に待ち時間を挟むモードなので、速度の実測値を見る意味が薄い)。
   function renderUsagePanel() {
@@ -5161,6 +5169,11 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function render() {
+    // 速度/難易度の <select> を操作しようとしている間は再描画を止める(Opus レビュー S1、
+    // PR #78)。innerHTML を丸ごと作り直す方式だと、実行中に高頻度で render() が走る
+    // (一括モードの確定ごとなど)せいで、開いたプルダウンやキーボードフォーカスが
+    // 一瞬で失われて選べなくなる。フォーカスが外れた次の render() でまとめて反映される。
+    if (!embedMode && isControlSelectFocused()) return;
     var app = document.getElementById("app");
     // 周回ログのスクロール位置を引き継ぐ(innerHTML を作り直すと先頭に戻るため)。
     // 末尾に居たときは末尾のままにする。

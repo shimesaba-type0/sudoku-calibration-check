@@ -5362,3 +5362,68 @@ test("AB14: 実際の実行フロー(run())でも、同じ周内の不正解が�
     await waitFor(function () { return ctx.state.done === true || af.pending.length === 1; }, "AB14: 完走ループ");
   }
 });
+
+// ---------------------------------------------------------------------------
+// UI レイアウト刷新(Issue #76、オーナー要望 2026-09-23)。
+// ---------------------------------------------------------------------------
+
+test("AC1: 完了/強制終了バナーに開始から終了までの所要時間(totalElapsedMs)が出る", async () => {
+  var ctx = runScript(await getPageHtml());
+
+  ctx.totalElapsedMs = 12345;
+  ctx.state.done = true;
+  ctx.state.roundsToSolve = 3;
+  var completionHtml = ctx.renderBanner();
+  assert.ok(completionHtml.indexOf("3周ですべて正解しました") !== -1, "完了バナーの本文が無い: " + completionHtml);
+  assert.ok(completionHtml.indexOf("(所要 " + ctx.formatMs(12345) + ")") !== -1, "完了バナーに所要時間が出ていない: " + completionHtml);
+
+  ctx.state.roundsToSolve = null;
+  ctx.state.stoppedAtLimit = true;
+  ctx.roundWrong = [{ r: 0, c: 0 }, { r: 0, c: 1 }];
+  var limitHtml = ctx.renderBanner();
+  assert.ok(limitHtml.indexOf("強制終了しました") !== -1, "強制終了バナーの本文が無い: " + limitHtml);
+  assert.ok(limitHtml.indexOf("所要 " + ctx.formatMs(12345)) !== -1, "強制終了バナーに所要時間が出ていない: " + limitHtml);
+
+  // 未完了のときは所要時間を出さない(バナー自体が空になる)
+  ctx.state.done = false;
+  ctx.state.stoppedAtLimit = false;
+  assert.equal(ctx.renderBanner(), '<div id="completion-banner"></div>');
+});
+
+test("AC2: 速度/難易度の <select> にフォーカスがあるあいだ render() は再描画を止め、フォーカスが外れると反映する(Opus レビュー S1、PR #78)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var app = { innerHTML: "" };
+  var fakeDoc = {
+    activeElement: null,
+    getElementById: function (id) { return id === "app" ? app : null; },
+    querySelector: function () { return null; },
+    querySelectorAll: function () { return []; },
+    createElement: function (tag) { return { tagName: tag, href: "", download: "", click: function () {} }; },
+    body: { appendChild: function () {}, removeChild: function () {} },
+  };
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch, document: fakeDoc });
+  ctx.setSpeed("fast");
+  ctx.run();
+  await waitFor(function () { return af.pending.length === 1; }, "AC2: fetch 待ち");
+
+  var beforeFocusHtml = app.innerHTML;
+  assert.ok(beforeFocusHtml.length > 0, "テストの前提(直前の render() で描画されている)が崩れている");
+
+  // 速度セレクトにフォーカスがある間は、他の状態が変わっていても再描画されない
+  fakeDoc.activeElement = { tagName: "SELECT", id: "speed-toggle" };
+  ctx.setDifficulty("hard"); // render() を呼ぶがフォーカス中なので innerHTML は変わらないはず
+  assert.equal(app.innerHTML, beforeFocusHtml, "select にフォーカスがある間に render() が innerHTML を書き換えてしまった");
+  assert.equal(ctx.state.difficulty, "hard", "state 自体は render() を止めても更新されているはず");
+
+  // select 以外の要素にフォーカスがあるとき(例: グリッドの外側をクリックした状態)は対象外
+  fakeDoc.activeElement = { tagName: "BUTTON", id: "run-btn" };
+  ctx.render();
+  assert.notEqual(app.innerHTML, beforeFocusHtml, "select 以外にフォーカスがあるのに再描画がガードされている");
+
+  // フォーカスが外れれば、次の render() で通常どおり反映される
+  var beforeBlurHtml = app.innerHTML;
+  fakeDoc.activeElement = null;
+  ctx.setDifficulty("easy");
+  assert.notEqual(app.innerHTML, beforeBlurHtml, "フォーカスが外れたのに再描画されない");
+  assert.ok(app.innerHTML.indexOf('<option value="easy" selected>') !== -1, "最新の state が反映されていない: " + app.innerHTML);
+});

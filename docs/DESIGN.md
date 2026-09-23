@@ -838,7 +838,15 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
   読み取り専用のコスト計算としてそのまま残す)。`side-panel` は「一番見たいのが現在の判定、
   次が周回ログ」という優先度に合わせて並べ替え、技術的な補足情報である `renderPromptPanel()`
   を `renderRoundLog()` の後ろに回した。`renderBanner()` の完了/強制終了メッセージには
-  `formatMs(totalElapsedMs)` で開始から終了までの所要時間を添える
+  `formatMs(totalElapsedMs)` で開始から終了までの所要時間を添える。**`render()` は `innerHTML`
+  を丸ごと作り直すため、実行中に高頻度で呼ばれる(一括モードの確定ごとなど)と、開いている
+  `<select>` のプルダウンやキーボードフォーカスが一瞬で失われて選べなくなる**(PR #78 の
+  Opus レビュー S1)。`isControlSelectFocused()` が `document.activeElement` を見て、
+  `.top-controls` 内の6つの `<select>` のいずれかにフォーカスがあるあいだは `render()` を
+  丸ごとスキップする(state 自体は更新されるので、フォーカスが外れた次の `render()` でまとめて
+  反映される)。実行中でも切り替えられるのは速度・難易度の2つだけ(他の4つはロックされ、
+  無効化された `<select>` はそもそもフォーカスできない)だが、ガードは6つの id 全部を見る
+  (ロック中の4つは実質到達しない安全側の実装)
 - 状態が変わるたびに `render()` で該当領域を丸ごと再生成する。81マス+9本のバー程度なので差分更新は不要
 - 色や枠線は `buildCellStyle` が返すインラインstyleで指定(クラス切り替えではなく、状態から毎回組み立てる)
 - 「現在の判定」パネルは、結果が届いているマスについては座標とバーを出し、結果待ち・確定直後は
@@ -1097,5 +1105,8 @@ new_sqlite_classes = ["RateLimitCounter"]
       - AB12: 前の周に正解して確定したマス(`settledKeys` に追加)は、次の周の `ruleExclusions()` に正しく反映されること(`settledKeys` の伝播が壊れていないことを確認)
       - AB13: `excludeFor()` の防御(履歴とルールの和集合が9個になったら履歴側を捨ててルール側だけにする)が、`ruleExclusions` 側の結果はそのまま保つこと
       - AB14: `run()` を実際に走らせ、`r0c2` を(意図的に)不正解で確定させたあと、同じ周内に聞く `r0c3` への `fetch` ボディの `exclude` に `r0c3` の正解が混ざらないことを、モックした `fetch` 越しに確認する統合テスト(そのまま完了まで走らせて全体のループも壊れていないことも確認)
+  - **UI レイアウト刷新(Issue #76)**(`test/page.test.js` AC1・AC2)
+    - AC1: `renderBanner()` の完了バナーに `formatMs(totalElapsedMs)` の所要時間が「(所要 X ms)」として添えられること、強制終了バナーにも同様に出ること、未完了(`state.done===false`)のときはバナー自体が空(`<div id="completion-banner"></div>`)のままなこと
+    - AC2(PR #78 の Opus レビュー S1): `document.activeElement` が `.top-controls` 内の `<select>`(`isControlSelectFocused()` が見る6つの id のいずれか)のとき `render()` が `app.innerHTML` を書き換えずに早期リターンすること(state 自体は更新される)。`<select>` 以外の要素にフォーカスがあるときはガードされないこと。フォーカスが外れたあとの次の `render()` で最新の state が反映されること(`git stash` でガード導入前のコードに戻すと落ちることを確認済み)
 - E2E モック(`scripts/e2e/smoke.mjs`)の `/api/judge` 応答(`digit` / `cell` / `all` すべて)に固定の `usage`(`{ input_tokens, output_tokens }`)を足し、周回ログの1行目(`[2]` `[7]` `[9]` `[8]`)に `— <N,NNN> ms / $<...>` の形が出ることをチェックに追加した(Issue #55・#56)。`digit` / `all` は `body.exclude`(消去法。Issue #61・#63)を読み、残りの数字だけを `probabilities` / `choice` の候補にする(`remainingDigitsMock()`)。統計カードが5枚になった(Issue #60)ため `[1]` の `statValues` の件数・添字を更新した
 - CI(`.github/workflows/ci.yml`)は push と PR で `npm ci` → `npm test` → `npm run check` を実行する。`check` は `wrangler deploy --dry-run` で、認証なしで動く
