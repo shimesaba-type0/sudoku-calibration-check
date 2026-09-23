@@ -1359,8 +1359,6 @@ var PAGE_HTML = `<!doctype html>
   .claude-notice { font-size: 12px; color: var(--incorrect); }
   #calib-model-filter { font-size: 12px; padding: 3px 6px; }
 
-  /* 単価パネル(Issue #56) */
-  #usage-panel { border-color: var(--accent); }
   .usage-row { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
   .usage-row:last-child { margin-bottom: 0; }
   .price-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 6px; font-size: 13px; }
@@ -2102,6 +2100,9 @@ var PAGE_HTML = `<!doctype html>
   var totalTokensIn = 0;    // この実行の累計入力トークン数(オーナー要望 2026-09-23。
                              // 単価パネルが「定義」に見えて分かりにくかったので、実消費を別に出す)
   var totalTokensOut = 0;   // この実行の累計出力トークン数
+  var totalLatencyMs = 0;   // この実行の累計 API 待ち時間(record.t の合計、演出待ちは含まない。
+                             // formatTps() の分母。レビュー S1: 経過時間だと速度モード/順番モードの
+                             // 演出待ちで数倍変わってしまうため、API 呼び出しの待ち時間だけを使う)
   // 一括モード(Issue #48)の周の先頭1件にだけ usage/レイテンシを付けるための一時置き場
   // (askAllRound() の応答で立て、focusCellFromCache() の最初の確定で消費して null に戻す)。
   var pendingAllUsage = null;
@@ -2212,7 +2213,7 @@ var PAGE_HTML = `<!doctype html>
   // 平均スループット(トークン/秒)。走り始め直後(elapsedMs が小さい)やトークンがまだ
   // 無いときは値が暴れるので "—" にする(Issue #55・#56 のオーナー追加要望 2026-09-23)。
   function formatTps(tokens, elapsedMs) {
-    if (!(tokens > 0) || !(elapsedMs >= 200)) return "—";
+    if (!(tokens > 0) || !isFinite(tokens) || !(elapsedMs >= 200) || !isFinite(elapsedMs)) return "—";
     return formatThousands(Math.round(tokens / (elapsedMs / 1000))) + " tok/s";
   }
 
@@ -3130,6 +3131,7 @@ var PAGE_HTML = `<!doctype html>
       roundCostUsd = 0;
       totalTokensIn = 0;
       totalTokensOut = 0;
+      totalLatencyMs = 0;
     }
     // running=false → true になった区間の開始(停止中は数えない。DESIGN 4.1)
     runningSince = nowMs();
@@ -3515,6 +3517,7 @@ var PAGE_HTML = `<!doctype html>
     if (record.u) {
       totalTokensIn += record.u.i;
       totalTokensOut += record.u.o;
+      if (typeof record.t === "number" && isFinite(record.t)) totalLatencyMs += record.t;
     }
     // 次の結果が来るまで表示に残す(最速モードでも判定が見えるように)
     state.lastJudgment = {
@@ -3781,6 +3784,7 @@ var PAGE_HTML = `<!doctype html>
     roundCostUsd = 0;
     totalTokensIn = 0;
     totalTokensOut = 0;
+    totalLatencyMs = 0;
     render();
   }
 
@@ -4358,24 +4362,23 @@ var PAGE_HTML = `<!doctype html>
       "</div>";
   }
 
-  // 単価パネル(Issue #56)。モデルごとの入力/出力単価(100万トークンあたり USD)の
-  // 入力欄と「既定値に戻す」ボタン。常時表示(Jev の単価も編集できるように、Claude
-  // モードに限定しない)。localStorage(scc.prices.v1)に保存。
   // 「この実行の消費」パネル(Issue #55・#56。オーナー追加要望 2026-09-23: 単価パネルは
   // レートの「定義」であって、いま実際にどれだけ消費したかが見えないという指摘への対応)。
   // 単価パネルのすぐ上に置き、同じ場所を見れば「単価の定義」と「実消費」が両方わかるようにする。
   function renderUsagePanel() {
     var tokensIn = totalTokensIn;
     var tokensOut = totalTokensOut;
-    var elapsedMs = currentTotalElapsedMs();
     return "<div id=\\"usage-panel\\" class=\\"panel\\">" +
       "<p class=\\"panel-title\\">この実行の消費</p>" +
       "<p class=\\"usage-row\\">トークン: 入力 " + formatThousands(tokensIn) + " / 出力 " + formatThousands(tokensOut) + "</p>" +
       "<p class=\\"usage-row\\">コスト: " + formatUsdForModel(totalCostUsd, activeModelIdForPricing()) + "</p>" +
-      "<p class=\\"usage-row\\">速度: " + formatTps(tokensIn + tokensOut, elapsedMs) + "(平均)</p>" +
+      "<p class=\\"usage-row\\">速度: " + formatTps(tokensIn + tokensOut, totalLatencyMs) + "(API待ち時間ぶんの平均。演出の待ちは含まない)</p>" +
       "</div>";
   }
 
+  // 単価パネル(Issue #56)。モデルごとの入力/出力単価(100万トークンあたり USD)の
+  // 入力欄と「既定値に戻す」ボタン。常時表示(Jev の単価も編集できるように、Claude
+  // モードに限定しない)。localStorage(scc.prices.v1)に保存。
   function renderPricesPanel() {
     var current = getPrices();
     var order = [JEV_MODEL_ID, "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
@@ -4805,8 +4808,8 @@ var PAGE_HTML = `<!doctype html>
     var detailsWasOpen = oldDetails ? oldDetails.open === true : false;
     if (embedMode) {
       // 埋め込みモード(比較シェルの iframe、Issue #46)。コントロール・Claude設定・
-      // 較正図・プロンプト枠・見出しは描かず、グリッド・凡例・統計・現在の判定・
-      // 周回ログ・エラーボックス・完了バナーだけを描く(SPEC F1)。
+      // 単価パネル・較正図・プロンプト枠・見出しは描かず、グリッド・凡例・この実行の消費・
+      // 統計・現在の判定・周回ログ・エラーボックス・完了バナーだけを描く(SPEC F1)。
       // 完了/強制終了のバナーは見逃されないよう一番上に出す(オーナー要望 2026-09-22)
       app.innerHTML =
         renderBanner() +
