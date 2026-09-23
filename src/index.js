@@ -1293,8 +1293,12 @@ var PAGE_HTML = `<!doctype html>
   .subtitle { margin: 0 0 8px; color: var(--muted); font-size: 13px; }
   .compare-link { margin: 0 0 20px; font-size: 12px; }
   .compare-link a, .subtitle a { color: var(--accent); }
+  /* 実行系ボタン+各トグルの横並びバー(Issue #76)。完了バナーの下・盤面の上に置く。 */
+  /* Claude 設定パネルが続くとき、設定バーとの間にも隙間を空ける(レビュー nit N3、PR #78) */
+  .top-controls { display: flex; flex-direction: column; gap: 12px; margin: 0 0 20px; }
   .layout { display: flex; flex-wrap: wrap; gap: 24px; align-items: flex-start; }
-  .grid-panel { flex: 0 0 auto; }
+  /* 「この実行の消費」を盤面の直下に置くため、grid-panel も side-panel と同じ縦並び(Issue #76)。 */
+  .grid-panel { flex: 0 0 auto; display: flex; flex-direction: column; gap: 16px; }
   .side-panel { flex: 1 1 320px; min-width: 280px; display: flex; flex-direction: column; gap: 16px; }
 
   .grid {
@@ -1311,7 +1315,8 @@ var PAGE_HTML = `<!doctype html>
     font-size: 18px;
   }
 
-  .legend { display: flex; flex-wrap: wrap; gap: 14px; margin-top: 12px; font-size: 12px; color: var(--muted); }
+  /* margin-top は無し。grid-panel の gap(16px、Issue #76)が盤面との間隔を作る。 */
+  .legend { display: flex; flex-wrap: wrap; gap: 14px; font-size: 12px; color: var(--muted); }
   .legend-item { display: inline-flex; align-items: center; gap: 6px; }
   .swatch { width: 12px; height: 12px; border-radius: 3px; display: inline-block; }
   .swatch-correct { background: var(--correct-bg); box-shadow: inset 0 0 0 2px var(--correct); }
@@ -1361,10 +1366,6 @@ var PAGE_HTML = `<!doctype html>
 
   .usage-row { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
   .usage-row:last-child { margin-bottom: 0; }
-  .price-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 6px; font-size: 13px; }
-  .price-row .price-model { flex: 0 0 170px; color: var(--muted); font-family: "IBM Plex Mono", monospace; font-size: 12px; }
-  .price-row label { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
-  .price-row input[type="number"] { width: 90px; padding: 5px 8px; }
 
   #error-box.error {
     background: var(--error-bg);
@@ -1386,12 +1387,21 @@ var PAGE_HTML = `<!doctype html>
     font-size: 12px;
   }
 
-  .stats { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; }
-  .stats .stat-card { grid-column: span 2; }
-  .stats .stat-card:nth-child(n+4) { grid-column: span 3; }
-  .stat-card { background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: 8px; padding: 10px 12px; }
-  .stat-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
-  .stat-value { font-size: 16px; font-weight: 600; font-family: "IBM Plex Mono", monospace; }
+  /* 5項目を1行で表現する(オーナー要望 2026-09-23、Issue #76)。折り返しはするが、
+     カードのグリッドではなく「ラベル: 値」をインラインで並べる。 */
+  .stats {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px 18px;
+    background: var(--panel-bg);
+    border: 1px solid var(--panel-border);
+    border-radius: 8px;
+    padding: 10px 14px;
+  }
+  .stat-card { display: inline-flex; align-items: baseline; gap: 6px; white-space: nowrap; }
+  .stat-label { font-size: 11px; color: var(--muted); }
+  .stat-value { font-size: 13px; font-weight: 600; font-family: "IBM Plex Mono", monospace; }
 
   .coords { font-size: 14px; margin-bottom: 10px; display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
   .confidence { font-size: 11px; color: var(--muted); }
@@ -2433,42 +2443,14 @@ var PAGE_HTML = `<!doctype html>
     return base;
   }
 
-  function savePrices(next) {
-    try {
-      localStorage.setItem(PRICES_STORAGE_KEY, JSON.stringify(next));
-    } catch (e) {
-      // 保存できなくても動作には影響しない(次回開いたときに既定値に戻るだけ)
-    }
-  }
-
   // render() / costOf() が読む窓口。初回だけ localStorage を読み、以後はキャッシュを使う
-  // (getRecords() と同じ考え方)。
+  // (getRecords() と同じ考え方)。単価を編集する UI は無い(Issue #76。消費量の表示だけ
+  // 必要という要望のため、単価パネルごと外した)。localStorage(scc.prices.v1)は、この
+  // 変更より前にパネルから保存された値があればそのまま尊重する(無ければ既定値)。
   var pricesCache = null;
   function getPrices() {
     if (!pricesCache) pricesCache = loadPrices();
     return pricesCache;
-  }
-
-  // 設定パネルの入力欄から1エントリだけ更新する。不正な値(数値でない・負)は無視する。
-  function setPrice(modelId, field, value) {
-    var base = getPrices();
-    if (!Object.prototype.hasOwnProperty.call(base, modelId)) return;
-    if (field !== "in" && field !== "out") return;
-    var num = Number(value);
-    if (!isFinite(num) || num < 0) return;
-    var next = {};
-    var keys = Object.keys(base);
-    for (var i = 0; i < keys.length; i++) next[keys[i]] = { in: base[keys[i]].in, out: base[keys[i]].out };
-    next[modelId][field] = num;
-    savePrices(next);
-    pricesCache = next;
-    render();
-  }
-
-  function resetPrices() {
-    pricesCache = defaultPrices();
-    savePrices(pricesCache);
-    render();
   }
 
   // 記録の m からモデルを引く。"typesafe/jev/all" のように "/all" が付いていれば外し、
@@ -4638,6 +4620,21 @@ var PAGE_HTML = `<!doctype html>
     return "<div id=\\"legend\\" class=\\"legend\\">" + items + "</div>";
   }
 
+  // render() のたびに <select> を作り直すと、開いているプルダウンやフォーカスが失われる
+  // (Opus レビュー S1、PR #78)。実行中でも切り替えられるのは速度・難易度だけ(他の4つは
+  // modelSettingsLocked() でロックされ、無効化された <select> はそもそもフォーカスできない)
+  // ので、この6つの id だけを見れば足りる。
+  var TOP_CONTROLS_SELECT_IDS = ["speed-toggle", "difficulty-toggle", "model-toggle", "order-toggle", "history-toggle", "rules-toggle"];
+  function isControlSelectFocused() {
+    var el = document.activeElement;
+    return !!(el && el.tagName === "SELECT" && TOP_CONTROLS_SELECT_IDS.indexOf(el.id) !== -1);
+  }
+
+  // 実行系ボタン + 6つのトグル(速度・難易度・モデル・順番・履歴・ルール候補)を横並びの
+  // 1本のバーにする(オーナー要望 2026-09-23、Issue #76)。選択肢が複数あるトグルは
+  // 「選択中のものだけ見えればいい」ので、ボタン群の代わりに <select> にした
+  // (見た目を保ったまま横幅を大きく取らない)。id はボタン群のときと同じものを流用する
+  // (aria-pressed は select の選択状態そのものがネイティブに伝わるので不要になった)。
   function renderControls() {
     // 実行中は「実行」ボタンを「停止」に切り替える(id は run-btn のまま。Issue #32)。
     // 停止中(isPaused())はラベルを「再開」にする。実行中は無効化しない(停止できる必要がある)。
@@ -4652,54 +4649,40 @@ var PAGE_HTML = `<!doctype html>
     // 停止中も押せる(Issue #32)。生成中だけは差し替え中の盤面と衝突するので無効化する。
     var resetDisabled = generating ? "disabled" : "";
     var newLabel = generating ? "生成中…" : "新しい問題";
-    var slowActive = state.speedMode === "slow" ? " active" : "";
-    var fastActive = state.speedMode === "fast" ? " active" : "";
-    var easyActive = state.difficulty === "easy" ? " active" : "";
-    var normalActive = state.difficulty === "normal" ? " active" : "";
-    var hardActive = state.difficulty === "hard" ? " active" : "";
-    var jevActive = state.modelMode === "jev" ? " active" : "";
-    var claudeActive = state.modelMode === "claude" ? " active" : "";
     var modelDisabled = modelSettingsLocked() ? "disabled" : "";
-    // 順番トグル(左上から / 確信度順 / 一括、Issue #38・#48)。モデルトグルと同じ条件でロックする。
-    var scanActive = state.orderMode === "scan" ? " active" : "";
-    var confidenceActive = state.orderMode === "confidence" ? " active" : "";
-    var allOrderActive = state.orderMode === "all" ? " active" : "";
+    // 順番トグル・消去法の2トグル(左上から / 確信度順 / 一括、履歴、ルール候補)は
+    // モデルトグルと同じ条件でロックする(周の途中で切り替えると意味が崩れるため)。
     var orderDisabled = modelSettingsLocked() ? "disabled" : "";
-    // 消去法の2トグル(履歴 Issue #61 / ルール候補 Issue #63)。順番トグルと同じ条件でロックする。
-    var historyOnActive = state.historyMode ? " active" : "";
-    var historyOffActive = state.historyMode ? "" : " active";
-    var ruleOnActive = state.ruleMode ? " active" : "";
-    var ruleOffActive = state.ruleMode ? "" : " active";
     return "<div class=\\"controls\\">" +
       "<button id=\\"run-btn\\" onclick=\\"" + runOnclick + "\\" " + runDisabled + ">" + runLabel + "</button>" +
       "<button id=\\"reset-btn\\" onclick=\\"reset()\\" " + resetDisabled + ">リセット</button>" +
       "<button id=\\"new-puzzle-btn\\" onclick=\\"newPuzzle()\\" " + newDisabled + ">" + newLabel + "</button>" +
-      "<div id=\\"speed-toggle\\">" +
-      "<button class=\\"speed-btn" + slowActive + "\\" onclick=\\"setSpeed('slow')\\">じっくり確認</button>" +
-      "<button class=\\"speed-btn" + fastActive + "\\" onclick=\\"setSpeed('fast')\\">最速</button>" +
-      "</div>" +
-      "<div id=\\"difficulty-toggle\\">" +
-      "<button class=\\"difficulty-btn" + easyActive + "\\" aria-pressed=\\"" + (state.difficulty === "easy") + "\\" onclick=\\"setDifficulty('easy')\\">やさしい</button>" +
-      "<button class=\\"difficulty-btn" + normalActive + "\\" aria-pressed=\\"" + (state.difficulty === "normal") + "\\" onclick=\\"setDifficulty('normal')\\">ふつう</button>" +
-      "<button class=\\"difficulty-btn" + hardActive + "\\" aria-pressed=\\"" + (state.difficulty === "hard") + "\\" onclick=\\"setDifficulty('hard')\\">むずかしい</button>" +
-      "</div>" +
-      "<div id=\\"model-toggle\\">" +
-      "<button class=\\"model-btn" + jevActive + "\\" aria-pressed=\\"" + (state.modelMode === "jev") + "\\" onclick=\\"setModelMode('jev')\\" " + modelDisabled + ">Jev</button>" +
-      "<button class=\\"model-btn" + claudeActive + "\\" aria-pressed=\\"" + (state.modelMode === "claude") + "\\" onclick=\\"setModelMode('claude')\\" " + modelDisabled + ">Claude</button>" +
-      "</div>" +
-      "<div id=\\"order-toggle\\">" +
-      "<button class=\\"order-btn" + scanActive + "\\" aria-pressed=\\"" + (state.orderMode === "scan") + "\\" onclick=\\"setOrderMode('scan')\\" " + orderDisabled + ">左上から</button>" +
-      "<button class=\\"order-btn" + confidenceActive + "\\" aria-pressed=\\"" + (state.orderMode === "confidence") + "\\" onclick=\\"setOrderMode('confidence')\\" " + orderDisabled + ">確信度順</button>" +
-      "<button class=\\"order-btn" + allOrderActive + "\\" aria-pressed=\\"" + (state.orderMode === "all") + "\\" onclick=\\"setOrderMode('all')\\" " + orderDisabled + ">一括</button>" +
-      "</div>" +
-      "<div id=\\"history-toggle\\">" +
-      "<button class=\\"history-btn" + historyOnActive + "\\" aria-pressed=\\"" + state.historyMode + "\\" onclick=\\"setHistoryMode(true)\\" " + orderDisabled + ">履歴あり</button>" +
-      "<button class=\\"history-btn" + historyOffActive + "\\" aria-pressed=\\"" + !state.historyMode + "\\" onclick=\\"setHistoryMode(false)\\" " + orderDisabled + ">履歴なし</button>" +
-      "</div>" +
-      "<div id=\\"rules-toggle\\">" +
-      "<button class=\\"rules-btn" + ruleOnActive + "\\" aria-pressed=\\"" + state.ruleMode + "\\" onclick=\\"setRuleMode(true)\\" " + orderDisabled + ">ルールあり</button>" +
-      "<button class=\\"rules-btn" + ruleOffActive + "\\" aria-pressed=\\"" + !state.ruleMode + "\\" onclick=\\"setRuleMode(false)\\" " + orderDisabled + ">ルールなし</button>" +
-      "</div>" +
+      "<select id=\\"speed-toggle\\" aria-label=\\"速度\\" onchange=\\"setSpeed(this.value)\\">" +
+      "<option value=\\"slow\\"" + (state.speedMode === "slow" ? " selected" : "") + ">じっくり確認</option>" +
+      "<option value=\\"fast\\"" + (state.speedMode === "fast" ? " selected" : "") + ">最速</option>" +
+      "</select>" +
+      "<select id=\\"difficulty-toggle\\" aria-label=\\"難易度\\" onchange=\\"setDifficulty(this.value)\\">" +
+      "<option value=\\"easy\\"" + (state.difficulty === "easy" ? " selected" : "") + ">やさしい</option>" +
+      "<option value=\\"normal\\"" + (state.difficulty === "normal" ? " selected" : "") + ">ふつう</option>" +
+      "<option value=\\"hard\\"" + (state.difficulty === "hard" ? " selected" : "") + ">むずかしい</option>" +
+      "</select>" +
+      "<select id=\\"model-toggle\\" aria-label=\\"モデル\\" onchange=\\"setModelMode(this.value)\\" " + modelDisabled + ">" +
+      "<option value=\\"jev\\"" + (state.modelMode === "jev" ? " selected" : "") + ">Jev</option>" +
+      "<option value=\\"claude\\"" + (state.modelMode === "claude" ? " selected" : "") + ">Claude</option>" +
+      "</select>" +
+      "<select id=\\"order-toggle\\" aria-label=\\"順番\\" onchange=\\"setOrderMode(this.value)\\" " + orderDisabled + ">" +
+      "<option value=\\"scan\\"" + (state.orderMode === "scan" ? " selected" : "") + ">左上から</option>" +
+      "<option value=\\"confidence\\"" + (state.orderMode === "confidence" ? " selected" : "") + ">確信度順</option>" +
+      "<option value=\\"all\\"" + (state.orderMode === "all" ? " selected" : "") + ">一括</option>" +
+      "</select>" +
+      "<select id=\\"history-toggle\\" aria-label=\\"消去法(履歴)\\" onchange=\\"setHistoryMode(this.value === '1')\\" " + orderDisabled + ">" +
+      "<option value=\\"1\\"" + (state.historyMode ? " selected" : "") + ">履歴あり</option>" +
+      "<option value=\\"0\\"" + (state.historyMode ? "" : " selected") + ">履歴なし</option>" +
+      "</select>" +
+      "<select id=\\"rules-toggle\\" aria-label=\\"ルール候補\\" onchange=\\"setRuleMode(this.value === '1')\\" " + orderDisabled + ">" +
+      "<option value=\\"1\\"" + (state.ruleMode ? " selected" : "") + ">ルールあり</option>" +
+      "<option value=\\"0\\"" + (state.ruleMode ? "" : " selected") + ">ルールなし</option>" +
+      "</select>" +
       "</div>";
   }
 
@@ -4739,7 +4722,8 @@ var PAGE_HTML = `<!doctype html>
 
   // 「この実行の消費」パネル(Issue #55・#56。オーナー追加要望 2026-09-23: 単価パネルは
   // レートの「定義」であって、いま実際にどれだけ消費したかが見えないという指摘への対応)。
-  // 単価パネルのすぐ上に置き、同じ場所を見れば「単価の定義」と「実消費」が両方わかるようにする。
+  // 盤面(グリッド+凡例)の直下に置く(Issue #76。単価パネルは画面から削除したので、
+  // 単価パネルとの位置関係を説明する必要はもう無い)。
   // 速度(tok/s)は「最速」モードのときだけ出す(オーナー追加要望 2026-09-23。「じっくり確認」は
   // 意図的に待ち時間を挟むモードなので、速度の実測値を見る意味が薄い)。
   function renderUsagePanel() {
@@ -4753,33 +4737,6 @@ var PAGE_HTML = `<!doctype html>
       "<p class=\\"usage-row\\">トークン: 入力 " + formatThousands(tokensIn) + " / 出力 " + formatThousands(tokensOut) + "</p>" +
       "<p class=\\"usage-row\\">コスト: " + formatUsdForModel(totalCostUsd, activeModelIdForPricing()) + "</p>" +
       speedLine +
-      "</div>";
-  }
-
-  // 単価パネル(Issue #56)。モデルごとの入力/出力単価(100万トークンあたり USD)の
-  // 入力欄と「既定値に戻す」ボタン。常時表示(Jev の単価も編集できるように、Claude
-  // モードに限定しない)。localStorage(scc.prices.v1)に保存。
-  function renderPricesPanel() {
-    var current = getPrices();
-    var order = [JEV_MODEL_ID, "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
-    // 実行中・停止中は render() のたびに入力欄が作り直されて編集が消えるので、ロック中は無効化する
-    var disabled = modelSettingsLocked() ? " disabled" : "";
-    var rows = "";
-    for (var i = 0; i < order.length; i++) {
-      var id = escapeHtml(order[i]);
-      var entry = current[order[i]] || { in: 0, out: 0 };
-      rows += "<div class=\\"price-row\\">" +
-        "<span class=\\"price-model\\">" + id + "</span>" +
-        "<label>入力 <input type=\\"number\\" min=\\"0\\" step=\\"any\\" value=\\"" + entry.in +
-        "\\" onchange=\\"setPrice('" + id + "','in',this.value)\\"" + disabled + "></label>" +
-        "<label>出力 <input type=\\"number\\" min=\\"0\\" step=\\"any\\" value=\\"" + entry.out +
-        "\\" onchange=\\"setPrice('" + id + "','out',this.value)\\"" + disabled + "></label>" +
-        "</div>";
-    }
-    return "<div id=\\"prices-panel\\" class=\\"panel\\">" +
-      "<p class=\\"panel-title\\">単価の設定(100万トークンあたり USD。実際の消費は上の「この実行の消費」欄)</p>" +
-      rows +
-      "<button id=\\"reset-prices-btn\\" onclick=\\"resetPrices()\\"" + disabled + ">既定値に戻す</button>" +
       "</div>";
   }
 
@@ -5031,11 +4988,13 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function renderBanner() {
+    // 開始から終了までの所要時間(オーナー要望 2026-09-23)。totalElapsedMs は停止中を
+    // 数えない実働時間(Issue #55)で、周回ログ末尾の合計行と同じ値をバナーにも出す。
     if (state.done && state.roundsToSolve) {
-      return "<div id=\\"completion-banner\\" class=\\"banner success\\">" + state.roundsToSolve + "周ですべて正解しました</div>";
+      return "<div id=\\"completion-banner\\" class=\\"banner success\\">" + state.roundsToSolve + "周ですべて正解しました(所要 " + formatMs(totalElapsedMs) + ")</div>";
     }
     if (state.done && state.stoppedAtLimit) {
-      return "<div id=\\"completion-banner\\" class=\\"banner warning\\">" + MAX_ROUNDS + "周で強制終了しました(最終周の不正解 " + roundWrong.length + " マス、全マス正解には至らず)</div>";
+      return "<div id=\\"completion-banner\\" class=\\"banner warning\\">" + MAX_ROUNDS + "周で強制終了しました(最終周の不正解 " + roundWrong.length + " マス、全マス正解には至らず。所要 " + formatMs(totalElapsedMs) + ")</div>";
     }
     return "<div id=\\"completion-banner\\"></div>";
   }
@@ -5210,6 +5169,11 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function render() {
+    // 速度/難易度の <select> を操作しようとしている間は再描画を止める(Opus レビュー S1、
+    // PR #78)。innerHTML を丸ごと作り直す方式だと、実行中に高頻度で render() が走る
+    // (一括モードの確定ごとなど)せいで、開いたプルダウンやキーボードフォーカスが
+    // 一瞬で失われて選べなくなる。フォーカスが外れた次の render() でまとめて反映される。
+    if (!embedMode && isControlSelectFocused()) return;
     var app = document.getElementById("app");
     // 周回ログのスクロール位置を引き継ぐ(innerHTML を作り直すと先頭に戻るため)。
     // 末尾に居たときは末尾のままにする。
@@ -5222,16 +5186,16 @@ var PAGE_HTML = `<!doctype html>
     var detailsWasOpen = oldDetails ? oldDetails.open === true : false;
     if (embedMode) {
       // 埋め込みモード(比較シェルの iframe、Issue #46)。コントロール・Claude設定・
-      // 単価パネル・較正図・プロンプト枠・見出しは描かず、グリッド・凡例・この実行の消費・
+      // 較正図・プロンプト枠・見出しは描かず、グリッド・凡例・この実行の消費・
       // 統計・現在の判定・周回ログ・エラーボックス・完了バナーだけを描く(SPEC F1)。
-      // 完了/強制終了のバナーは見逃されないよう一番上に出す(オーナー要望 2026-09-22)
+      // 完了/強制終了のバナーは見逃されないよう一番上に出す(オーナー要望 2026-09-22)。
+      // 「この実行の消費」は盤面の直下(オーナー要望 2026-09-23、Issue #76)。
       app.innerHTML =
         renderBanner() +
         renderErrorBox() +
         "<div class=\\"layout\\">" +
-        "<div class=\\"grid-panel\\">" + renderGrid() + renderLegend() + "</div>" +
+        "<div class=\\"grid-panel\\">" + renderGrid() + renderLegend() + renderUsagePanel() + "</div>" +
         "<div class=\\"side-panel\\">" +
-        renderUsagePanel() +
         renderStats() +
         renderCurrentPanel() +
         renderRoundLog() +
@@ -5245,17 +5209,22 @@ var PAGE_HTML = `<!doctype html>
         // 完了/強制終了のバナーは見逃されないよう見出しの直下(ページの一番上)に出す(オーナー要望 2026-09-22)
         renderBanner() +
         renderErrorBox() +
-        "<div class=\\"layout\\">" +
-        "<div class=\\"grid-panel\\">" + renderGrid() + renderLegend() + "</div>" +
-        "<div class=\\"side-panel\\">" +
+        // 実行系ボタン+各トグルは完了バナーの下・盤面の上の横並びバーにする(Issue #76)。
+        "<div class=\\"top-controls\\">" +
         renderControls() +
         renderClaudeSettings() +
-        renderUsagePanel() +
-        renderPricesPanel() +
+        "</div>" +
+        "<div class=\\"layout\\">" +
+        // 「この実行の消費」は盤面の直下(単価パネルは画面から外した。消費量だけ見えれば
+        // よく、コスト計算自体は costOf()/getPrices() のまま変えていない。Issue #76)。
+        "<div class=\\"grid-panel\\">" + renderGrid() + renderLegend() + renderUsagePanel() + "</div>" +
+        "<div class=\\"side-panel\\">" +
+        // 一番見たいのは「現在の判定」、次が「周回ログ」なので、その2つを先に置き、
+        // 技術的な補足であるプロンプト枠・較正図はその後ろに回す(Issue #76)。
         renderStats() +
         renderCurrentPanel() +
-        renderPromptPanel() +
         renderRoundLog() +
+        renderPromptPanel() +
         renderCalibration() +
         "</div>" +
         "</div>";
