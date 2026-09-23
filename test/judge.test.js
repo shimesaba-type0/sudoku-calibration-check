@@ -1596,3 +1596,237 @@ test("usage が無い・形がおかしいときは usage ごと省略する(200
   assert.equal(out2.res.status, 200);
   assert.equal("usage" in out2.body, false, "ラッパーの外の usage を読んでいる");
 });
+
+// --- exclude(消去法。Issue #61) ---------------------------------------------
+
+/** 指定した数字だけをキーに持つ digit の回答(ラッパー付き)。 */
+function digitResponseWith(keys, choice) {
+  var probabilities = {};
+  for (var i = 0; i < keys.length; i++) probabilities[keys[i]] = Number((1 / keys.length).toFixed(6));
+  var response = jevResponse();
+  response.result.answers.digit = {
+    type: "choice",
+    choice: choice,
+    probabilities: probabilities,
+    confidence: 0.27,
+  };
+  return response;
+}
+
+var DIGITS_WITHOUT_3_5 = ["1", "2", "4", "6", "7", "8", "9"];
+
+test("exclude(digit): criteria と expectedKeys が残りの数字だけになる", async () => {
+  var out = await judge(validBody({ exclude: ["5", "3"] }), {
+    aiResult: digitResponseWith(DIGITS_WITHOUT_3_5, "4"),
+  });
+  assert.equal(out.res.status, 200, JSON.stringify(out.body));
+  var criteria = out.env.aiCalls[0].payload.questions.digit.criteria;
+  // 昇順に並ぶ(exclude の順番によらない)
+  assert.deepStrictEqual(Object.keys(criteria), DIGITS_WITHOUT_3_5);
+  assert.equal(criteria["4"], "the digit 4");
+  assert.deepStrictEqual(Object.keys(out.body.probabilities), DIGITS_WITHOUT_3_5);
+  assert.equal(out.body.choice, "4");
+  assert.deepStrictEqual(out.body.request, out.env.aiCalls[0].payload);
+  assert.deepEqual(Object.keys(out.body).sort(), ["choice", "confidence", "probabilities", "request", "usage"]);
+});
+
+test("exclude(digit): 空配列は省略とまったく同じ payload", async () => {
+  var a = await judge(validBody());
+  var b = await judge(validBody({ exclude: [] }));
+  assert.equal(b.res.status, 200);
+  assert.deepStrictEqual(b.env.aiCalls[0].payload, a.env.aiCalls[0].payload);
+});
+
+test("exclude(digit): probabilities が残りのキーとちょうど一致しないと 502", async () => {
+  // 9キー全部を返してきた(外した数字まで答えた)
+  var all9 = await judge(validBody({ exclude: ["5", "3"] }));
+  assert.equal(all9.res.status, 502);
+  assert.equal(all9.body.error, "AIの応答のprobabilitiesが候補の数字(exclude後)とちょうど一致していません");
+  assert.deepStrictEqual(all9.body.request, all9.env.aiCalls[0].payload);
+
+  // 1キー欠け
+  var missing = await judge(validBody({ exclude: ["5", "3"] }), {
+    aiResult: digitResponseWith(["1", "2", "4", "6", "7", "8"], "4"),
+  });
+  assert.equal(missing.res.status, 502);
+
+  // 外した数字にすり替わっている(個数は同じ)
+  var swapped = await judge(validBody({ exclude: ["5", "3"] }), {
+    aiResult: digitResponseWith(["1", "2", "3", "6", "7", "8", "9"], "1"),
+  });
+  assert.equal(swapped.res.status, 502);
+});
+
+test("exclude(digit): choice が外した数字なら 502", async () => {
+  var response = digitResponseWith(DIGITS_WITHOUT_3_5, "4");
+  response.result.answers.digit.choice = "5";
+  var out = await judge(validBody({ exclude: ["5", "3"] }), { aiResult: response });
+  assert.equal(out.res.status, 502);
+  assert.equal(out.body.error, "AIの応答のchoiceが候補の数字(exclude後)のいずれかではありません");
+});
+
+test("exclude(digit): 400(配列でない・不正な要素・重複・9個全部)", async () => {
+  var formatError = 'excludeは"1"〜"9"の文字列の配列である必要があります';
+  var cases = [
+    ["文字列", "5", formatError],
+    ["null", null, formatError],
+    ["オブジェクト", { 5: true }, formatError],
+    ["数値の要素", [5], formatError],
+    ["範囲外 0", ["0"], formatError],
+    ["範囲外 10", ["10"], formatError],
+    ["空文字", [""], formatError],
+    ["null の要素", [null], formatError],
+    ["重複", ["5", "5"], "excludeに同じ数字が重複しています"],
+    ["9個全部", ["1", "2", "3", "4", "5", "6", "7", "8", "9"], "excludeで全部の数字を外すことはできません"],
+  ];
+  for (var i = 0; i < cases.length; i++) {
+    var out = await judge(validBody({ exclude: cases[i][1] }));
+    assert.equal(out.res.status, 400, cases[i][0]);
+    assert.equal(out.body.error, cases[i][2], cases[i][0]);
+    assert.equal(out.env.aiCalls.length, 0, cases[i][0]);
+    assert.equal("request" in out.body, false, cases[i][0]);
+  }
+});
+
+test("exclude(digit): exclude の不正と target の範囲外が同時にあれば exclude の 400 が先(検証順の固定)", async () => {
+  var out = await judge(validBody({ exclude: "x", target: { row: 9, col: 0 } }));
+  assert.equal(out.res.status, 400);
+  assert.ok(out.body.error.indexOf("exclude") !== -1, "exclude の文言でない: " + out.body.error);
+  assert.equal(out.env.aiCalls.length, 0);
+});
+
+test("exclude(all): __proto__ / constructor をキーにしても 400(空マスのキーではない)", async () => {
+  var protoBody = JSON.parse('{"puzzle":' + JSON.stringify(validAllBody().puzzle) + ',"ask":"all","exclude":{"__proto__":["4"]}}');
+  var out = await judge(protoBody);
+  assert.equal(out.res.status, 400);
+  assert.ok(out.body.error.indexOf("exclude") !== -1, out.body.error);
+  var out2 = await judge(validAllBody({ exclude: { constructor: ["4"] } }));
+  assert.equal(out2.res.status, 400);
+  assert.ok(out2.body.error.indexOf("exclude") !== -1, out2.body.error);
+  assert.equal(out.env.aiCalls.length + out2.env.aiCalls.length, 0);
+});
+
+test("exclude(digit): 8個外して1つだけ残すのは可(criteria 1件)", async () => {
+  var out = await judge(validBody({ exclude: ["1", "2", "3", "5", "6", "7", "8", "9"] }), {
+    aiResult: digitResponseWith(["4"], "4"),
+  });
+  assert.equal(out.res.status, 200, JSON.stringify(out.body));
+  assert.deepStrictEqual(out.env.aiCalls[0].payload.questions.digit.criteria, { 4: "the digit 4" });
+});
+
+/** GIVEN の空マスに all の回答を作り、指定したマスだけ残りのキーで答えさせる。 */
+function allResponseWithExclude(remainingByKey) {
+  var response = jevAllResponse(GIVEN_CELL_KEYS);
+  for (var key in remainingByKey) {
+    var digits = remainingByKey[key];
+    var probabilities = {};
+    for (var i = 0; i < digits.length; i++) probabilities[digits[i]] = 0.1;
+    response.result.answers[key] = {
+      type: "choice",
+      choice: digits[0],
+      probabilities: probabilities,
+      confidence: 0.5,
+    };
+  }
+  return response;
+}
+
+test("exclude(all): exclude のあるマスだけ criteria が残りの数字になり、他は 1〜9", async () => {
+  var remaining = { r0c2: ["1", "2", "3", "5", "6", "7", "8", "9"], r1c1: DIGITS_WITHOUT_3_5 };
+  var out = await postAll(
+    allResponseWithExclude(remaining),
+    validAllBody({ exclude: { r0c2: ["4"], r1c1: ["5", "3"], r0c3: [] } })
+  );
+  assert.equal(out.res.status, 200, JSON.stringify(out.body));
+  var questions = out.env.aiCalls[0].payload.questions;
+  assert.deepStrictEqual(Object.keys(questions), GIVEN_CELL_KEYS);
+  assert.deepStrictEqual(Object.keys(questions.r0c2.criteria), remaining.r0c2);
+  assert.deepStrictEqual(Object.keys(questions.r1c1.criteria), DIGITS_WITHOUT_3_5);
+  assert.equal(questions.r1c1.criteria["4"], "the digit 4");
+  // 空配列のマス・exclude に無いマスは 1〜9 のまま
+  assert.deepEqual(questions.r0c3.criteria, EXPECTED_DIGIT_CRITERIA);
+  assert.deepEqual(questions.r8c6.criteria, EXPECTED_DIGIT_CRITERIA);
+  // 応答はマスごとの残りキーのまま返る
+  assert.deepStrictEqual(Object.keys(out.body.cells.r0c2.probabilities), remaining.r0c2);
+  assert.deepStrictEqual(Object.keys(out.body.cells.r1c1.probabilities), DIGITS_WITHOUT_3_5);
+  assert.deepStrictEqual(Object.keys(out.body.cells.r0c3.probabilities), DIGIT_KEYS);
+  assert.deepStrictEqual(out.body.request, out.env.aiCalls[0].payload);
+});
+
+test("exclude(all): 応答の検証はマスごとの残りキーで行う", async () => {
+  var body = validAllBody({ exclude: { r1c1: ["5", "3"] } });
+
+  // exclude したマスが 9キー全部で答えてきた → 502(どのマスか分かる)
+  var all9 = await postAll(jevAllResponse(GIVEN_CELL_KEYS), body);
+  assert.equal(all9.res.status, 502);
+  assert.equal(all9.body.error, "r1c1 の応答のprobabilitiesが候補の数字(exclude後)とちょうど一致していません");
+
+  // 残りキーで答えたが choice が外した数字 → 502
+  var badChoice = allResponseWithExclude({ r1c1: DIGITS_WITHOUT_3_5 });
+  badChoice.result.answers.r1c1.choice = "3";
+  var choiceOut = await postAll(badChoice, body);
+  assert.equal(choiceOut.res.status, 502);
+  assert.equal(choiceOut.body.error, "r1c1 の応答のchoiceが候補の数字(exclude後)のいずれかではありません");
+
+  // exclude していないマスを7キーで答えてきた → 502(他のマスの基準は 1〜9 のまま)
+  var other = allResponseWithExclude({ r1c1: DIGITS_WITHOUT_3_5, r0c3: DIGITS_WITHOUT_3_5 });
+  var otherOut = await postAll(other, body);
+  assert.equal(otherOut.res.status, 502);
+  assert.equal(otherOut.body.error, "r0c3 の応答のprobabilitiesが1〜9の9キーになっていません");
+});
+
+test("exclude(all): 空オブジェクトは省略と同じ payload", async () => {
+  var a = await postAll(jevAllResponse(GIVEN_CELL_KEYS));
+  var b = await postAll(jevAllResponse(GIVEN_CELL_KEYS), validAllBody({ exclude: {} }));
+  assert.equal(b.res.status, 200);
+  assert.deepStrictEqual(b.env.aiCalls[0].payload, a.env.aiCalls[0].payload);
+});
+
+test("exclude(all): 400(オブジェクトでない・キーが空マスでない・値が不正)", async () => {
+  var mapError = 'ask:allのexcludeはマスのキー("r0c2")ごとの配列を持つオブジェクトである必要があります';
+  var keyError = 'ask:allのexcludeのキーは盤面の空マス("r0c2"形式)である必要があります';
+  var formatError = 'excludeは"1"〜"9"の文字列の配列である必要があります';
+  var cases = [
+    ["配列", ["4"], mapError],
+    ["null", null, mapError],
+    ["文字列", "r0c2", mapError],
+    ["埋まっているマス", { r0c0: ["4"] }, keyError],
+    ["形式違いのキー", { "0,2": ["4"] }, keyError],
+    ["範囲外のキー", { r9c9: ["4"] }, keyError],
+    ["値が配列でない", { r0c2: "4" }, formatError],
+    ["値に数値", { r0c2: [4] }, formatError],
+    ["値に重複", { r0c2: ["4", "4"] }, "excludeに同じ数字が重複しています"],
+    ["9個全部", { r0c2: ["1", "2", "3", "4", "5", "6", "7", "8", "9"] }, "excludeで全部の数字を外すことはできません"],
+  ];
+  for (var i = 0; i < cases.length; i++) {
+    var out = await postAll(jevAllResponse(GIVEN_CELL_KEYS), validAllBody({ exclude: cases[i][1] }));
+    assert.equal(out.res.status, 400, cases[i][0]);
+    assert.equal(out.body.error, cases[i][2], cases[i][0]);
+    assert.equal(out.env.aiCalls.length, 0, cases[i][0]);
+  }
+});
+
+test("exclude: ask:cell / ask:where に付いていたら 400(null も付いている扱い)", async () => {
+  var values = [["4"], [], null, {}];
+  for (var i = 0; i < values.length; i++) {
+    var cell = await judge(validCellBody({ exclude: values[i] }));
+    assert.equal(cell.res.status, 400, JSON.stringify(values[i]));
+    assert.equal(cell.body.error, "ask:cellではexcludeを指定できません");
+    assert.equal(cell.env.aiCalls.length, 0);
+
+    var where = await judge(validWhereBody({ exclude: values[i] }));
+    assert.equal(where.res.status, 400, JSON.stringify(values[i]));
+    assert.equal(where.body.error, "ask:whereではexcludeを指定できません");
+    assert.equal(where.env.aiCalls.length, 0);
+  }
+});
+
+test("exclude: 付けても1呼び出し=1カウント(レート制限は不変)", async () => {
+  var limiter = makeRateLimiter();
+  var env = makeEnv({ limiter: limiter, aiResult: digitResponseWith(DIGITS_WITHOUT_3_5, "4") });
+  var res = await worker.fetch(judgeRequest(validBody({ exclude: ["3", "5"] })), env);
+  assert.equal(res.status, 200);
+  var increments = limiter.calls.filter((c) => c.op === "increment");
+  assert.equal(increments.length, 2, "IP と全体を1回ずつ");
+  assert.equal(env.aiCalls.length, 1);
+});

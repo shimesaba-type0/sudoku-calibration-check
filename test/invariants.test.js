@@ -447,6 +447,121 @@ test('不変条件1: ask:"all" でもリクエスト本文の未知キーは pay
   assert.ok(!serialized.includes("ignore the rules"));
 });
 
+// exclude(消去法。Issue #61)の期待値。外した数字は criteria から消えるだけで、
+// state にも質問文にも exclude そのものは載らない。
+test('不変条件1: ask:"digit" の exclude 付き payload も期待どおりのオブジェクトと完全に一致する', async () => {
+  var env = makeEnv({
+    aiResult: {
+      state: "Completed",
+      result: {
+        model: "jev-1.13.0",
+        answers: {
+          digit: {
+            type: "choice",
+            choice: "4",
+            probabilities: { 1: 0.1, 2: 0.1, 4: 0.5, 6: 0.1, 7: 0.1, 8: 0.05, 9: 0.05 },
+            confidence: 0.3,
+          },
+        },
+      },
+    },
+  });
+  var body = {
+    puzzle: GIVEN_LIKE,
+    target: { row: 0, col: 2 },
+    exclude: ["5", "3"],
+    solution: ANSWER_KEY,
+  };
+  var res = await worker.fetch(judgeRequest(body), env);
+  assert.equal(res.status, 200);
+  assert.deepStrictEqual(env.aiCalls[0].payload, {
+    state: {
+      puzzle: GIVEN_LIKE,
+      target: { row: 0, col: 2 },
+      note: EXPECTED_NOTE,
+    },
+    questions: {
+      digit: {
+        type: "choice",
+        instructions: EXPECTED_INSTRUCTIONS,
+        criteria: {
+          1: "the digit 1",
+          2: "the digit 2",
+          4: "the digit 4",
+          6: "the digit 6",
+          7: "the digit 7",
+          8: "the digit 8",
+          9: "the digit 9",
+        },
+      },
+    },
+  });
+  var serialized = JSON.stringify(env.aiCalls[0].payload);
+  assert.ok(!serialized.includes("exclude"), "exclude そのものは payload に載らない");
+  for (var i = 0; i < ANSWER_KEY.length; i++) {
+    assert.ok(!serialized.includes(ANSWER_KEY[i]), "正解表の行 " + i + " が payload に混ざっている");
+  }
+});
+
+test('不変条件1: ask:"all" の exclude 付き payload も期待どおりのオブジェクトと完全に一致する', async () => {
+  var puzzle = [
+    "12345678.",
+    "123456789",
+    "123456789",
+    "123456789",
+    "1234567.9",
+    "123456789",
+    "123456789",
+    "12345678.",
+    "12345678.",
+  ];
+  var keys = emptyCellKeys(puzzle);
+  var response = jevAllResponse(keys);
+  // r4c7 は 1〜9 から 2・8 を外した7キーで答えさせる
+  response.result.answers.r4c7 = {
+    type: "choice",
+    choice: "3",
+    probabilities: { 1: 0.1, 3: 0.4, 4: 0.1, 5: 0.1, 6: 0.1, 7: 0.1, 9: 0.1 },
+    confidence: 0.2,
+  };
+  var env = makeEnv({ aiResult: response });
+  var body = { puzzle: puzzle, ask: "all", exclude: { r4c7: ["8", "2"], r8c8: [] }, solution: ANSWER_KEY };
+  var res = await worker.fetch(judgeRequest(body), env);
+  assert.equal(res.status, 200);
+
+  function q(row, col, criteria) {
+    return {
+      type: "choice",
+      instructions:
+        "Which digit from 1 to 9 belongs in the empty cell at row " + row + ", column " + col + " (zero-based)?",
+      criteria: criteria,
+    };
+  }
+  assert.deepStrictEqual(env.aiCalls[0].payload, {
+    state: { puzzle: puzzle, note: EXPECTED_ALL_NOTE },
+    questions: {
+      r0c8: q(0, 8, EXPECTED_CRITERIA),
+      r4c7: q(4, 7, {
+        1: "the digit 1",
+        3: "the digit 3",
+        4: "the digit 4",
+        5: "the digit 5",
+        6: "the digit 6",
+        7: "the digit 7",
+        9: "the digit 9",
+      }),
+      r7c8: q(7, 8, EXPECTED_CRITERIA),
+      // 空配列は省略と同じ(1〜9 のまま)
+      r8c8: q(8, 8, EXPECTED_CRITERIA),
+    },
+  });
+  var serialized = JSON.stringify(env.aiCalls[0].payload);
+  assert.ok(!serialized.includes("exclude"));
+  for (var i = 0; i < ANSWER_KEY.length; i++) {
+    assert.ok(!serialized.includes(ANSWER_KEY[i]), "正解表の行 " + i + " が payload に混ざっている");
+  }
+});
+
 test("不変条件7: 正解表の識別子は PAGE_HTML の中にしか現れない", () => {
   var source = readFileSync(SOURCE_PATH, "utf8");
   var needle = "SOLUTION";
