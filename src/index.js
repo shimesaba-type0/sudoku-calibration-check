@@ -1349,7 +1349,7 @@ var PAGE_HTML = `<!doctype html>
   button:hover:not(:disabled) { border-color: var(--accent); }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   #run-btn { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600; }
-  #speed-toggle, #difficulty-toggle, #model-toggle, #thinking-toggle, #order-toggle, #history-toggle, #rules-toggle { display: inline-flex; border: 1px solid var(--panel-border); border-radius: 6px; overflow: hidden; }
+  #speed-toggle, #difficulty-toggle, #model-toggle, #thinking-toggle, #order-toggle, #history-toggle, #rules-toggle, #claude-model-toggle { display: inline-flex; border: 1px solid var(--panel-border); border-radius: 6px; overflow: hidden; }
   .speed-btn, .difficulty-btn, .model-btn, .thinking-btn, .order-btn, .history-btn, .rules-btn { border: none; border-radius: 0; background: var(--panel-bg); }
   .speed-btn.active, .difficulty-btn.active, .model-btn.active, .thinking-btn.active, .order-btn.active, .history-btn.active, .rules-btn.active { background: var(--accent); color: #0b1220; }
   .claude-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 8px; }
@@ -2800,7 +2800,15 @@ var PAGE_HTML = `<!doctype html>
     }
   }
 
+  // 埋め込みモード(embed=1)では絶対に保存しない。applyUrlOptions() の URL パラメータは
+  // 元々 localStorage に書き戻さない設計(通常ページの設定を汚さない。SPEC F1)だが、
+  // 比較シェルからの postMessage(setClaudeModel、Issue #90)で embed 側の setClaudeModel()
+  // が呼ばれるようになった際、embed 側は modelMode が URL(model=jev/claude)で固定されて
+  // いるため、そのまま保存すると両 iframe が交互に modelMode を書き戻し合い、通常ページの
+  // 保存済み設定(Jev/Claude のどちらを使うか)を意図せず上書きしてしまう
+  // (PR #91 の Opus レビューで発見)。
   function saveClaudeSettings() {
+    if (embedMode) return;
     try {
       localStorage.setItem(CLAUDE_SETTINGS_STORAGE_KEY, JSON.stringify({
         modelMode: state.modelMode,

@@ -3768,6 +3768,65 @@ test("X5: /compare の上部バーで Claude のモデルを選べる。両 ifra
   assert.equal(ctx.compareFrames.claude.postMessageCalls.length, callsBefore, "実行中なのに setClaudeModel が飛んでしまった");
 });
 
+test("X6: 埋め込みモード(iframe 側)が setClaudeModel を受け取っても localStorage には保存しない(通常ページの設定を汚さない)。実行中はロックされ state も変わらない(Issue #90 レビュー)", async () => {
+  var html = await getPageHtml();
+  var storage = makeLocalStorage();
+  // 通常ページで既に保存済みの設定(modelMode:"jev")を模す
+  storage.setItem("scc.claude_settings.v1", JSON.stringify({ modelMode: "jev", model: "claude-opus-5", thinking: true }));
+  var fakeParent = { postMessage: function () {} };
+
+  function makeEmbedWindow() {
+    var handlers = [];
+    return {
+      window: {
+        parent: fakeParent,
+        addEventListener: function (type, handler) {
+          if (type === "message") handlers.push(handler);
+        },
+        postMessage: function () {},
+      },
+      handlers: handlers,
+    };
+  }
+
+  // model=jev の iframe(比較シェルの左カラム相当)。setClaudeModel は受け取れるが
+  // 自身では使わない値で、以前は saveClaudeSettings() が modelMode:"jev" を書き戻していた。
+  var jevWin = makeEmbedWindow();
+  var ctxJev = runScript(html, {
+    location: { pathname: "/", search: "?embed=1&model=jev", origin: "https://example.com" },
+    window: jevWin.window,
+    localStorage: storage,
+  });
+  assert.equal(ctxJev.state.modelMode, "jev");
+  jevWin.handlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "setClaudeModel", model: "claude-haiku-4-5" } });
+  assert.equal(ctxJev.state.claudeModel, "claude-haiku-4-5", "埋め込み側(jev)の state.claudeModel が更新されない");
+  var savedAfterJev = JSON.parse(storage.getItem("scc.claude_settings.v1"));
+  assert.equal(savedAfterJev.modelMode, "jev", "jev 側 iframe の setClaudeModel で通常ページの modelMode が書き変わってしまった");
+  assert.equal(savedAfterJev.model, "claude-opus-5", "jev 側 iframe の setClaudeModel で通常ページの保存済みモデルが書き変わってしまった");
+
+  // model=claude の iframe(右カラム相当)。実行中はロックされ state すら変わらない。
+  var claudeWin = makeEmbedWindow();
+  var ctxClaude = runScript(html, {
+    location: { pathname: "/", search: "?embed=1&model=claude", origin: "https://example.com" },
+    window: claudeWin.window,
+    localStorage: storage,
+  });
+  assert.equal(ctxClaude.state.claudeModel, "claude-opus-5", "保存済みの claudeModel が読み込まれていない");
+  ctxClaude.state.running = true;
+  claudeWin.handlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "setClaudeModel", model: "claude-sonnet-5" } });
+  assert.equal(ctxClaude.state.claudeModel, "claude-opus-5", "実行中なのに埋め込み側(claude)の setClaudeModel が効いてしまった");
+  var savedAfterClaudeLocked = JSON.parse(storage.getItem("scc.claude_settings.v1"));
+  assert.equal(savedAfterClaudeLocked.modelMode, "jev", "実行中の埋め込み側からの取りこぼしで通常ページの modelMode が変わってしまった");
+
+  // ロックが外れていれば state は更新されるが、それでも localStorage は変わらない
+  ctxClaude.state.running = false;
+  claudeWin.handlers[0]({ origin: "https://example.com", source: fakeParent, data: { type: "setClaudeModel", model: "claude-sonnet-5" } });
+  assert.equal(ctxClaude.state.claudeModel, "claude-sonnet-5", "非実行中の埋め込み側(claude)で state.claudeModel が更新されない");
+  var savedAfterClaude = JSON.parse(storage.getItem("scc.claude_settings.v1"));
+  assert.equal(savedAfterClaude.modelMode, "jev", "claude 側 iframe の setClaudeModel で通常ページの modelMode が書き変わってしまった");
+  assert.equal(savedAfterClaude.model, "claude-opus-5", "claude 側 iframe の setClaudeModel で通常ページの保存済みモデルが書き変わってしまった");
+});
+
 // ---------------------------------------------------------------------------
 // 一括モード(Issue #48、SPEC 3章 F1・F3)。S/T/W/Y 系と同じ runScript /
 // makeAbortAwareFetch / waitFor / makeManualTimers を使う。
