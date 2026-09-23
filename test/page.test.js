@@ -675,20 +675,25 @@ test("generatePuzzle を20回: 常に一意解・解が一致・与えられた�
   assert.ok(elapsed < 20000, "generatePuzzle 20回が遅すぎる: " + elapsed + "ms");
 });
 
-// 注意: generatePuzzle(24) は「ちょうど24個」を保証しない。実装はランダム順にマスを
+// 注意: generatePuzzle(n) は「ちょうど n 個」を保証しない。実装はランダム順にマスを
 // 消していき、消せなくなった時点で打ち切る(消しすぎて一意解が崩れる場合は戻す)ので、
-// 24(MIN_TARGET_GIVENS)は「これより減らさない」下限であって、常に到達できる目標ではない。
-// 実測(1000回)では 24 に到達するのは約6割で、25〜28個で止まることもある。
-// ここでは「下限を下回らない」という実際の契約だけを検証する(=== 24 は書くとflakyになる)。
-test("generatePuzzle(24): 下限(MIN_TARGET_GIVENS)を下回らない", { timeout: 10000 }, async () => {
+// MIN_TARGET_GIVENS(理論上の下限。Issue #87 で24→17に変更)は「これより減らさない」
+// 下限であって、常に到達できる目標ではない。ここでは MIN_TARGET_GIVENS を大きく下回る
+// 目標(10)を渡し、それでも実際のアルゴリズムの到達限界(概ね22前後)より下がらない、
+// 「下限を下回らない」という実際の契約だけを検証する(=== MIN_TARGET_GIVENS は書くと
+// flaky になる)。
+test("generatePuzzle(MIN_TARGET_GIVENSを大きく下回る目標): 下限(MIN_TARGET_GIVENS)を下回らない", { timeout: 10000 }, async () => {
   var ctx = runScript(await getPageHtml());
   for (var i = 0; i < 20; i++) {
-    var puzzle = ctx.generatePuzzle(24);
+    var puzzle = ctx.generatePuzzle(10);
     var label = "#" + i;
     assertSolvedGrid(puzzle.solution, label);
-    assert.equal(ctx.solveCount(puzzle.given, 2), 1, label + ": generatePuzzle(24) が一意解でない");
+    assert.equal(ctx.solveCount(puzzle.given, 2), 1, label + ": generatePuzzle(10) が一意解でない");
     var filled = countFilled(puzzle.given);
-    assert.ok(filled >= 24, label + ": 与えられた数字が下限24を下回った: " + filled);
+    assert.ok(
+      filled >= ctx.MIN_TARGET_GIVENS,
+      label + ": 与えられた数字が下限(MIN_TARGET_GIVENS=" + ctx.MIN_TARGET_GIVENS + ")を下回った: " + filled
+    );
   }
 });
 
@@ -702,23 +707,29 @@ test("generatePuzzle(NaN): DEFAULT_TARGET_GIVENS(30)にフォールバックす�
   );
 });
 
-// 難易度(SPEC F1/F4)ごとの目標ヒント数: やさしい36 / ふつう30 / むずかしい25。
-// 「むずかしい」は generatePuzzle 単体では 25 ちょうどに届かず 26〜28 で止まることが
-// ある(PR #15 の補足。下限は MIN_TARGET_GIVENS の24)。ここでは generatePuzzle(n) を
-// 直接呼ぶ場合の契約だけを見る(再試行は newPuzzle() 側の generatePuzzleWithRetry。
-// 別テストで検証する)。
-test("難易度ごとの generatePuzzle: 常に一意解・解が一致し、ヒント数がやさしい36/ふつう30ちょうど、むずかしいは25〜28(下限24以上)", { timeout: 10000 }, async () => {
+// 難易度(SPEC F1/F4)ごとの目標ヒント数: やさしい36 / ふつう30 / むずかしい25 / 上級22
+// (Issue #87)。「むずかしい」「上級」は generatePuzzle 単体(再試行なしの1回勝負)では
+// 目標ちょうどには届かず、それより多いヒント数で止まることがある(PR #15 の補足、
+// Issue #87 のベンチマーク。下限は MIN_TARGET_GIVENS の17)。ここでは generatePuzzle(n)
+// を直接呼ぶ場合の契約だけを見る(再試行は newPuzzle() 側の generatePuzzleWithRetry。
+// 別テストで検証する)。上級の上限は緩め(35)に取っている: 5000回のベンチマークで
+// 目標22に対し最大29まで観測されており、27を上限にすると10回中で約5%の確率で
+// flaky になる(PR #88 の Opus レビューで指摘)。
+test("難易度ごとの generatePuzzle: 常に一意解・解が一致し、ヒント数がやさしい36/ふつう30ちょうど、むずかしいは25〜28、上級は22以上(概ね22〜29)", { timeout: 10000 }, async () => {
   var ctx = runScript(await getPageHtml());
   // ctx.DIFFICULTY_GIVENS は vm の別レルムのオブジェクトなので、deepStrictEqual は
   // プロトタイプ違いで落ちる(hostRows と同じ事情)。値だけを個別に比較する。
   assert.equal(ctx.DIFFICULTY_GIVENS.easy, 36, "DIFFICULTY_GIVENS.easy が仕様(36)と違う");
   assert.equal(ctx.DIFFICULTY_GIVENS.normal, 30, "DIFFICULTY_GIVENS.normal が仕様(30)と違う");
   assert.equal(ctx.DIFFICULTY_GIVENS.hard, 25, "DIFFICULTY_GIVENS.hard が仕様(25)と違う");
+  assert.equal(ctx.DIFFICULTY_GIVENS.expert, 22, "DIFFICULTY_GIVENS.expert が仕様(22)と違う(Issue #87)");
+  assert.equal(ctx.MIN_TARGET_GIVENS, 17, "MIN_TARGET_GIVENS が仕様(17、一意解の理論上の最小値)と違う");
 
   var cases = [
-    { difficulty: "easy", target: ctx.DIFFICULTY_GIVENS.easy, exact: true },
-    { difficulty: "normal", target: ctx.DIFFICULTY_GIVENS.normal, exact: true },
-    { difficulty: "hard", target: ctx.DIFFICULTY_GIVENS.hard, exact: false },
+    { difficulty: "easy", target: ctx.DIFFICULTY_GIVENS.easy, exact: true, min: 24, max: Infinity },
+    { difficulty: "normal", target: ctx.DIFFICULTY_GIVENS.normal, exact: true, min: 24, max: Infinity },
+    { difficulty: "hard", target: ctx.DIFFICULTY_GIVENS.hard, exact: false, min: 25, max: 28 },
+    { difficulty: "expert", target: ctx.DIFFICULTY_GIVENS.expert, exact: false, min: 22, max: 35 },
   ];
 
   cases.forEach(function (c) {
@@ -732,11 +743,11 @@ test("難易度ごとの generatePuzzle: 常に一意解・解が一致し、ヒ
       assert.deepEqual(hostRows(found[0]), hostRows(puzzle.solution), label + ": solveCount の解と solution が違う");
 
       var filled = countFilled(puzzle.given);
-      assert.ok(filled >= 24, label + ": 与えられた数字が下限24を下回った: " + filled);
+      assert.ok(filled >= ctx.MIN_TARGET_GIVENS, label + ": 与えられた数字が下限を下回った: " + filled);
       if (c.exact) {
         assert.equal(filled, c.target, label + ": ヒント数が" + c.target + "ちょうどでない: " + filled);
       } else {
-        assert.ok(filled >= 25 && filled <= 28, label + ": ヒント数が25〜28の範囲外: " + filled);
+        assert.ok(filled >= c.min && filled <= c.max, label + ": ヒント数が" + c.min + "〜" + c.max + "の範囲外: " + filled);
       }
     }
   });
@@ -886,7 +897,7 @@ test("難易度トグルの描画: 選択中の <option> だけに selected が�
   assert.equal(ctx.state.difficulty, "hard", "reset() 後に難易度が維持されていない");
 });
 
-test("newPuzzle() は state.difficulty に応じたヒント数で生成する(hard: 25〜28 / easy: 36)", { timeout: 10000 }, async () => {
+test("newPuzzle() は state.difficulty に応じたヒント数で生成する(hard: 25〜28 / expert: 22〜27 / easy: 36)", { timeout: 10000 }, async () => {
   var ctx = runScript(await getPageHtml());
 
   ctx.setDifficulty("hard");
@@ -897,6 +908,15 @@ test("newPuzzle() は state.difficulty に応じたヒント数で生成する(h
   var hardFilled = countFilled(ctx.GIVEN);
   assert.ok(hardFilled >= 25 && hardFilled <= 28, "hard で生成したヒント数が25〜28の範囲外: " + hardFilled);
   assert.equal(ctx.solveCount(ctx.GIVEN, 2), 1, "hard で生成した問題が一意解でない");
+
+  ctx.setDifficulty("expert");
+  ctx.newPuzzle();
+  await waitFor(function () {
+    return ctx.generating === false;
+  }, "expert 生成の完了");
+  var expertFilled = countFilled(ctx.GIVEN);
+  assert.ok(expertFilled >= 22 && expertFilled <= 27, "expert で生成したヒント数が22〜27の範囲外: " + expertFilled);
+  assert.equal(ctx.solveCount(ctx.GIVEN, 2), 1, "expert で生成した問題が一意解でない");
 
   ctx.setDifficulty("easy");
   ctx.newPuzzle();
@@ -929,6 +949,21 @@ test("newPuzzle() の生成時間: むずかしいを10回で2秒以内", { time
   }
   var elapsed = Date.now() - started;
   assert.ok(elapsed < 2000, "hard を10回生成するのに2秒を超えた: " + elapsed + "ms");
+});
+
+test("newPuzzle() の生成時間: 上級を10回で12秒以内(Issue #87。この node:vm ハーネス経由の実測は2.5〜3.6秒程度だが、CI ランナーが遅い場合や他テストとの並行実行を見込んで余裕を持たせた上限。ブラウザ実機では1回あたり平均60ms・最悪150ms程度、docs/DESIGN.md 5章)", { timeout: 20000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+  ctx.setDifficulty("expert");
+
+  var started = Date.now();
+  for (var i = 0; i < 10; i++) {
+    ctx.newPuzzle();
+    await waitFor(function () {
+      return ctx.generating === false;
+    }, "expert 生成 #" + i + " の完了");
+  }
+  var elapsed = Date.now() - started;
+  assert.ok(elapsed < 12000, "expert を10回生成するのに12秒を超えた: " + elapsed + "ms");
 });
 
 test("「新しい問題」の後に run() すると、新しい GIVEN の空マス数だけ /api/judge を呼ぶ", { timeout: 10000 }, async () => {
