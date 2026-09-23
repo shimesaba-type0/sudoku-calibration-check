@@ -38,6 +38,14 @@ var SOLUTION = ["534678912", "672195348", "198342567", "859761423", "426853791",
 var TOTAL_EMPTY = GIVEN.join("").split("").filter(function (ch) { return ch === "."; }).length; // 51
 var GIVEN_COUNT = 81 - TOTAL_EMPTY; // 30
 
+// exclude(消去法。Issue #61・#63)を引いた残りの数字。フロントが送ってくる exclude
+// (digit は配列、all はマスのキーごとの配列)をそのまま尊重し、本番の Worker と同じく
+// 残りの数字だけを probabilities / choice の候補にする(exclude が無ければ 1〜9 のまま)。
+function remainingDigitsMock(exclude) {
+  if (!Array.isArray(exclude) || exclude.length === 0) return DIGITS.slice();
+  return DIGITS.filter(function (d) { return exclude.indexOf(d) === -1; });
+}
+
 // ---------------------------------------------------------------------------
 // 引数
 // ---------------------------------------------------------------------------
@@ -186,24 +194,31 @@ async function startMockServer(mode) {
             res.end(JSON.stringify({ error: "空マスがありません(モック)" }));
             return;
           }
+          // exclude(消去法。Issue #61・#63)はマスのキーごとの配列(readExcludeMap と同じ形)
+          var allExcludeByKey = (body.exclude && typeof body.exclude === "object" && !Array.isArray(body.exclude)) ? body.exclude : {};
           var allCriteria = {};
           DIGITS.forEach(function (d) { allCriteria[d] = "the digit " + d; });
           var allCells = {};
           var allQuestions = {};
           allEmptyCells.forEach(function (cell) {
             var correctDigit = SOLUTION[cell.row][cell.col];
-            var choice = correctDigit;
+            var cellDigits = remainingDigitsMock(allExcludeByKey[cell.key]);
+            var choice = correctDigit; // ルール候補で必ず残っているはずの正解(#63 の性質)
             if (mode === "mixed" && Math.random() >= 0.7) {
-              var others = DIGITS.filter(function (d) { return d !== correctDigit; });
-              choice = others[Math.floor(Math.random() * others.length)];
+              var others = cellDigits.filter(function (d) { return d !== correctDigit; });
+              if (others.length > 0) choice = others[Math.floor(Math.random() * others.length)];
             }
             var probabilities = {};
-            DIGITS.forEach(function (d) { probabilities[d] = d === choice ? 0.9 : 0.0125; });
+            cellDigits.forEach(function (d) { probabilities[d] = d === choice ? 0.9 : 0.0125 * 9 / cellDigits.length; });
             allCells[cell.key] = { choice: choice, probabilities: probabilities, confidence: 0.5 };
             allQuestions[cell.key] = {
               type: "choice",
               instructions: "Which digit from 1 to 9 belongs in the empty cell at row " + cell.row + ", column " + cell.col + " (zero-based)?",
-              criteria: allCriteria,
+              criteria: cellDigits.length < DIGITS.length ? (function () {
+                var c = {};
+                cellDigits.forEach(function (d) { c[d] = "the digit " + d; });
+                return c;
+              })() : allCriteria,
             };
           });
           var allRequest = {
@@ -225,22 +240,24 @@ async function startMockServer(mode) {
         var row = body.target.row;
         var col = body.target.col;
         var correctDigit = SOLUTION[row][col];
-        var choice = correctDigit;
+        // exclude(消去法。Issue #61・#63)は "1"〜"9" の配列。残りの数字だけを候補にする。
+        var digits = remainingDigitsMock(body.exclude);
+        var choice = correctDigit; // ルール候補で必ず残っているはずの正解(#63 の性質)
         if (mode === "mixed" && Math.random() >= 0.7) {
-          var others = DIGITS.filter(function (d) { return d !== correctDigit; });
-          choice = others[Math.floor(Math.random() * others.length)];
+          var others = digits.filter(function (d) { return d !== correctDigit; });
+          if (others.length > 0) choice = others[Math.floor(Math.random() * others.length)];
         }
 
         var probabilities = {};
-        DIGITS.forEach(function (d) {
-          probabilities[d] = d === choice ? 0.9 : 0.0125;
+        digits.forEach(function (d) {
+          probabilities[d] = d === choice ? 0.9 : 0.0125 * 9 / digits.length;
         });
 
         res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
         // Worker の契約(SPEC 4章)に合わせて request(Jev に渡したペイロード)も返す(Issue #34)。
         // note / instructions の文言は本番の Worker と同じである必要はなく、形だけ揃える。
         var criteria = {};
-        DIGITS.forEach(function (d) { criteria[d] = "the digit " + d; });
+        digits.forEach(function (d) { criteria[d] = "the digit " + d; });
         var request = {
           state: { puzzle: body.puzzle, target: body.target, note: "puzzle is a 9x9 Sudoku grid (mock)" },
           questions: { digit: { type: "choice", instructions: "Which digit from 1 to 9 belongs in the target cell of this Sudoku grid?", criteria: criteria } },
@@ -346,12 +363,14 @@ async function runMockMode(chromium, executablePath, mode) {
 
     // [1] 初期表示: 統計カードと与えられた数字
     await runCheck(1, "初期表示の統計カード / 与えられた数字30マス", async function () {
+      // 統計カードは5枚(Issue #60): 現在の周 / 残りマス / 累計正解 / この周の判定済み / この周の正解
       var statValues = await page.locator("#stats .stat-value").allTextContents();
-      assert.equal(statValues.length, 4, "統計カードが4つない");
+      assert.equal(statValues.length, 5, "統計カードが5つない");
       assert.equal(statValues[0], "1周目", "現在の周が1周目でない: " + statValues[0]);
       assert.equal(statValues[1], TOTAL_EMPTY + " / " + TOTAL_EMPTY, "残りマスが51/51でない: " + statValues[1]);
       assert.equal(statValues[2], "0問", "累計正解が0問でない: " + statValues[2]);
-      assert.equal(statValues[3], "0 / " + TOTAL_EMPTY + " (0%)", "この周の進捗が0/51(0%)でない: " + statValues[3]);
+      assert.equal(statValues[3], "0 / " + TOTAL_EMPTY, "この周の判定済みが0/51でない: " + statValues[3]);
+      assert.equal(statValues[4], "0 / " + TOTAL_EMPTY + " (0%)", "この周の正解が0/51(0%)でない: " + statValues[4]);
 
       var cellTexts = await page.locator("#grid .cell").allTextContents();
       assert.equal(cellTexts.length, 81, "マス数が81でない");
