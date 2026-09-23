@@ -1386,7 +1386,9 @@ var PAGE_HTML = `<!doctype html>
     font-size: 12px;
   }
 
-  .stats { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .stats { display: grid; grid-template-columns: repeat(6, 1fr); gap: 10px; }
+  .stats .stat-card { grid-column: span 2; }
+  .stats .stat-card:nth-child(n+4) { grid-column: span 3; }
   .stat-card { background: var(--panel-bg); border: 1px solid var(--panel-border); border-radius: 8px; padding: 10px 12px; }
   .stat-label { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
   .stat-value { font-size: 16px; font-weight: 600; font-family: "IBM Plex Mono", monospace; }
@@ -1455,7 +1457,6 @@ var PAGE_HTML = `<!doctype html>
   @media (max-width: 640px) {
     .grid { grid-template-columns: repeat(9, 32px); grid-template-rows: repeat(9, 32px); }
     .cell { font-size: 15px; }
-    .stats { grid-template-columns: 1fr 1fr; }
   }
 </style>
 </head>
@@ -1545,11 +1546,30 @@ var PAGE_HTML = `<!doctype html>
   // 実盤面(buildSnapshot() / buildSelectionSnapshot() が送る盤面より前の状態)を使う。
   // 昇順・重複なしの配列を返す(9個の自由変数は GIVEN と state だけ。buildSnapshot() と
   // 同じ形でテストからも直接評価できる)。
+  // 周の開始時点で「前の周までに正解して確定していた」マスの集合("r-c" → true)。
+  // ruleExclusions() はこれと GIVEN だけを見る(この周の推測・queue に残った前の周の
+  // 誤った値は含めない。Issue #63「未確定マスの推測は含めない」を文字どおり守るため)。
+  // snapshotSettledKeys() が run() の初回開始時と finalizeRound() の次の周の queue を
+  // 作った直後にだけ更新する(周の途中では変わらない。レビュー M1 の修正)。
+  var settledKeys = {};
+
+  function snapshotSettledKeys() {
+    var inQueue = {};
+    for (var i = 0; i < queue.length; i++) inQueue[queue[i].r + "-" + queue[i].c] = true;
+    var next = {};
+    var keys = Object.keys(state.values);
+    for (var k = 0; k < keys.length; k++) {
+      if (!inQueue[keys[k]]) next[keys[k]] = true;
+    }
+    settledKeys = next;
+  }
+
   function ruleExclusions(r, c) {
     function valueAt(rr, cc) {
       var given = GIVEN[rr][cc];
       if (given !== ".") return given;
-      var cell = state.values[rr + "-" + cc];
+      var key = rr + "-" + cc;
+      var cell = settledKeys[key] ? state.values[key] : null;
       return cell ? cell.value : ".";
     }
     var set = {};
@@ -3333,6 +3353,7 @@ var PAGE_HTML = `<!doctype html>
       }
       roundSize = queue.length;
       roundTally = { correct: 0, total: 0 };
+      snapshotSettledKeys(); // 1周目は GIVEN だけ(state.values がまだ空なので)
       // 計時・コスト(Issue #55・#56)。初回の「実行」でだけ累計を0に戻す
       // (停止からの再開では積算を保つ)。
       totalElapsedMs = 0;
@@ -3666,7 +3687,7 @@ var PAGE_HTML = `<!doctype html>
     } else {
       roundWrong.push({ r: r, c: c });
       // 消去法(履歴。Issue #61): 次にこのマスを聞くときの exclude に積む
-      // (履歴トグルが「なし」でも記録はしておき、あとで「あり」に戻したときに効くようにする)。
+      // (トグルの状態に関わらず記録する。単純化のため。excludeFor() 側でトグルを見て使うか決める)。
       addWrongDigit(key, pendingCommit.choice);
     }
     // 集計ビュー用の記録(SPEC F1 拡張2)。正誤が確定したこの時点で1件追記する。
@@ -3791,6 +3812,7 @@ var PAGE_HTML = `<!doctype html>
     roundWrong = [];
     roundSize = queue.length;
     roundTally = { correct: 0, total: 0 };
+    snapshotSettledKeys(); // この周の queue から外れた(= 前の周までに正解した)マスだけを次の判定材料にする
     render();
     var betweenRoundsMs = state.speedMode === "slow" ? SLOW_BETWEEN_ROUNDS_MS : FAST_BETWEEN_ROUNDS_MS;
     setTimeout(function () {
@@ -3991,6 +4013,7 @@ var PAGE_HTML = `<!doctype html>
     started = false;
     pendingCommit = null;
     wrongDigits = {}; // 消去法(履歴。Issue #61)もリセット/新しい問題で消す
+    settledKeys = {}; // ルール候補(Issue #63)の判定材料もリセット/新しい問題で消す
     allResults = null; // 一括モード(Issue #48)のキャッシュもリセット/新しい問題で捨てる
     pendingAllUsage = null;
     carryUsage = null;

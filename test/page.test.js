@@ -5021,3 +5021,121 @@ test("AB10: 現在の判定のバーは除外した数字を0%でなく「×」(
   assert.ok(html.indexOf("×") !== -1, "除外したバーに × が出ていない");
   assert.ok(html.indexOf("80%") !== -1, "choice(4)のバーが80%になっていない");
 });
+
+
+
+// ---------------------------------------------------------------------------
+// M1(PR #72 レビュー、Opus): ruleExclusions() が state.values を正誤問わず参照すると、
+// 誤った推測が先に確定しただけで、後から聞く別マスの「正解」まで候補から消えてしまう
+// (ルール上「もう埋まっている数字」として扱われるため)。実測(固定問題): r0c2 の正解は
+// 4、r0c3 の正解は 6(ruleExclusions(0,3) の素の候補は {2,6})。修正: settledKeys(前の周
+// までに正解して確定したマスだけ)を周の開始時点で1回だけスナップショットし、
+// ruleExclusions() はそれだけを見る。この周の推測(正誤問わず、確定していても)は
+// 次の周まで反映されない。
+// ---------------------------------------------------------------------------
+
+test("AB11: 同じ周内で先に不正解が確定しても、別マスのルール候補に混ざらない(M1、純粋関数で直接確認)", async () => {
+  var ctx = runScript(await getPageHtml());
+  var baseline = hostRows(ctx.ruleExclusions(0, 3));
+  assert.deepEqual(baseline, ["1", "3", "4", "5", "7", "8", "9"], "素の候補が前提と違う(テストの前提が崩れている)");
+  assert.equal(ctx.SOLUTION[0][3], "6", "r0c3 の正解が前提と違う");
+
+  // r0c2(正解 4)にたまたま r0c3 の正解と同じ "6" を「不正解」として確定させる
+  // (settledKeys を更新せず、まだこの周の途中であることをシミュレートする)。
+  ctx.state.values["0-2"] = { value: "6", status: "incorrect" };
+  var afterMidRoundGuess = hostRows(ctx.ruleExclusions(0, 3));
+  assert.equal(
+    afterMidRoundGuess.indexOf("6"),
+    -1,
+    "同じ周内の(不正解だった)推測により r0c3 の正解(6)がルール候補から消えている: " + JSON.stringify(afterMidRoundGuess)
+  );
+  assert.deepEqual(afterMidRoundGuess, baseline, "settledKeys を更新していないのに結果が変わっている");
+});
+
+test("AB12: 前の周に正解して確定したマスは、次の周のルール候補に正しく反映される(settledKeys の伝播)", async () => {
+  var ctx = runScript(await getPageHtml());
+  var baseline = hostRows(ctx.ruleExclusions(0, 3));
+  assert.equal(baseline.indexOf("2"), -1, "テストの前提(2 がまだ除外されていない)が崩れている: " + JSON.stringify(baseline));
+  assert.equal(ctx.GIVEN[0][8], ".", "r0c8 が空マスであるという前提が崩れている");
+  assert.equal(ctx.SOLUTION[0][8], "2", "r0c8 の正解が前提と違う");
+
+  // r0c8(行0の仲間)が前の周までに正解して確定した状態をシミュレートする。
+  ctx.state.values["0-8"] = { value: ctx.SOLUTION[0][8], status: "correct" };
+  ctx.settledKeys = { "0-8": true };
+  var afterSettled = hostRows(ctx.ruleExclusions(0, 3));
+  assert.ok(
+    afterSettled.indexOf("2") !== -1,
+    "前の周に確定した r0c8(正解 2)がルール候補に反映されていない: " + JSON.stringify(afterSettled)
+  );
+  // 元の {2,6} の2択から naked single(6だけ)に絞り込まれる
+  assert.deepEqual(afterSettled.sort(), baseline.concat(["2"]).sort());
+});
+
+test("AB13: excludeFor() の防御(和集合が9個になったら履歴を捨ててルール側だけにする)", async () => {
+  var ctx = runScript(await getPageHtml());
+  var key = "0-2";
+  var rule = ctx.ruleExclusions(0, 2); // ["3","5","6","7","8","9"](固定問題での実測値)
+  var ruleHost = hostRows(rule);
+  var digits = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+  var missing = digits.filter(function (d) { return ruleHost.indexOf(d) === -1; }); // ["1","2","4"]
+  missing.forEach(function (d) { ctx.addWrongDigit(key, d); });
+  ctx.state.historyMode = true;
+  ctx.state.ruleMode = true;
+  var combined = hostRows(ctx.excludeFor(0, 2));
+  assert.ok(combined.length < 9, "9個全部を exclude してしまっている(Worker の400を踏む): " + JSON.stringify(combined));
+  assert.deepEqual(combined.sort(), ruleHost.slice().sort(), "9個になったときにルール側だけへ倒れていない: " + JSON.stringify(combined));
+});
+
+test("AB14: 実際の実行フロー(run())でも、同じ周内の不正解が別マスへの exclude に漏れない(M1、統合テスト)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.setOrderMode("scan"); // 左上から(既定)
+
+  ctx.run();
+  await waitFor(function () { return af.pending.length === 1; }, "AB14: r0c2 の fetch 待ち");
+  var e1 = af.pending.shift();
+  var b1 = JSON.parse(e1.init.body);
+  assert.deepEqual(b1.target, { row: 0, col: 2 });
+  // r0c2 に、r0c3 の正解(6)を「不正解」として答えさせる
+  var wrongDigit = ctx.SOLUTION[0][3];
+  assert.notEqual(wrongDigit, ctx.SOLUTION[0][2], "テストの前提(r0c2とr0c3の正解が違う)が崩れている");
+  var probabilities1 = {};
+  for (var d = 1; d <= 9; d++) probabilities1[String(d)] = String(d) === wrongDigit ? 0.9 : 0.0125;
+  e1.resolve({
+    ok: true,
+    json: async function () {
+      return { probabilities: probabilities1, choice: wrongDigit, confidence: 0.5, request: b1 };
+    },
+  });
+  await waitFor(function () { return Object.keys(ctx.state.values).length === 1; }, "AB14: r0c2 の確定待ち");
+  assert.equal(ctx.state.values["0-2"].status, "incorrect");
+
+  await waitFor(function () { return af.pending.length === 1; }, "AB14: r0c3 の fetch 待ち");
+  var e2 = af.pending.shift();
+  var b2 = JSON.parse(e2.init.body);
+  assert.deepEqual(b2.target, { row: 0, col: 3 });
+  var exclude2 = hostRows(b2.exclude || []);
+  assert.equal(
+    exclude2.indexOf(ctx.SOLUTION[0][3]),
+    -1,
+    "実際の実行フローで r0c3 の正解が exclude に混ざっている: " + JSON.stringify(exclude2)
+  );
+
+  // 完了まで進める(r0c2 は2周目に回るはず)
+  var probabilities2 = {};
+  for (var d2 = 1; d2 <= 9; d2++) probabilities2[String(d2)] = String(d2) === ctx.SOLUTION[0][3] ? 0.9 : 0.0125;
+  e2.resolve({
+    ok: true,
+    json: async function () {
+      return { probabilities: probabilities2, choice: ctx.SOLUTION[0][3], confidence: 0.5, request: b2 };
+    },
+  });
+  await waitFor(function () { return af.pending.length === 1; }, "AB14: 残りマスの fetch 待ち");
+  // 残りの空マス(r0c2 の再挑戦を含む)を正解で埋めて完走する
+  while (!ctx.state.done) {
+    var e = af.pending.shift();
+    var b = JSON.parse(e.init.body);
+    e.resolve(makeCorrectResponse(ctx, b.target.row, b.target.col, b.puzzle));
+    await waitFor(function () { return ctx.state.done === true || af.pending.length === 1; }, "AB14: 完走ループ");
+  }
+});
