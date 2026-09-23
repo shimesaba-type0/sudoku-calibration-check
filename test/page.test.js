@@ -3712,6 +3712,62 @@ test("X4: /compare は2つの iframe(jev/claude)と上部バーを描き、「�
   assert.equal(ctx.compareEls.statusJev.innerHTML, "__untouched__", "他オリジンの status で更新されてしまった");
 });
 
+test("X5: /compare の上部バーで Claude のモデルを選べる。両 iframe に postMessage・localStorage にも保存され、実行中・停止中はロックされる(Issue #90)", async () => {
+  var html = await getPageHtml();
+  var fakeDoc = makeCompareDocument();
+  var messageHandlers = [];
+  var fakeWindow = {
+    parent: null,
+    addEventListener: function (type, handler) {
+      if (type === "message") messageHandlers.push(handler);
+    },
+    postMessage: function () {},
+  };
+  fakeWindow.parent = fakeWindow;
+  var storage = makeLocalStorage();
+
+  var ctx = runScript(html, {
+    location: { pathname: "/compare", search: "", origin: "https://example.com" },
+    document: fakeDoc,
+    window: fakeWindow,
+    localStorage: storage,
+  });
+
+  var initialTopbar = ctx.appElement.innerHTML;
+  ctx.CLAUDE_MODELS.forEach(function (m) {
+    assert.ok(initialTopbar.indexOf(m) !== -1, "Claude モデルの選択肢が無い: " + m);
+  });
+  assert.equal(ctx.state.claudeModel, ctx.DEFAULT_CLAUDE_MODEL, "初期状態の claudeModel が既定値でない");
+
+  // 選ぶと state・localStorage が更新され、両 iframe に setClaudeModel が飛ぶ
+  var otherModel = ctx.CLAUDE_MODELS[1];
+  ctx.compareSetClaudeModel(otherModel);
+  assert.equal(ctx.state.claudeModel, otherModel, "compareSetClaudeModel で state.claudeModel が変わらない");
+  assert.equal(ctx.compareFrames.jev.postMessageCalls.length, 1, "Jev 側 iframe に setClaudeModel が飛んでいない");
+  assert.equal(ctx.compareFrames.jev.postMessageCalls[0].msg.type, "setClaudeModel");
+  assert.equal(ctx.compareFrames.jev.postMessageCalls[0].msg.model, otherModel);
+  assert.equal(ctx.compareFrames.claude.postMessageCalls.length, 1, "Claude 側 iframe に setClaudeModel が飛んでいない");
+  assert.equal(ctx.compareFrames.claude.postMessageCalls[0].msg.model, otherModel);
+  var saved = JSON.parse(storage.getItem("scc.claude_settings.v1"));
+  assert.equal(saved.model, otherModel, "localStorage に選んだモデルが保存されていない");
+  assert.ok(ctx.compareEls.topbar.innerHTML.indexOf(otherModel) !== -1, "上部バーの再描画に選んだモデルが出ていない");
+
+  // 不正なモデル名は無視される
+  ctx.compareSetClaudeModel("not-a-real-model");
+  assert.equal(ctx.state.claudeModel, otherModel, "不正なモデル名で state が変わってしまった");
+
+  // 実行中は両 iframe から status(running:true)が届いた状態を模す。ロックされて無視される
+  messageHandlers[0]({
+    origin: "https://example.com",
+    source: ctx.compareFrames.jev.contentWindow,
+    data: { type: "status", model: "typesafe/jev", round: 1, correct: 0, total: 51, remaining: 51, running: true, paused: false, done: false },
+  });
+  var callsBefore = ctx.compareFrames.claude.postMessageCalls.length;
+  ctx.compareSetClaudeModel(ctx.CLAUDE_MODELS[2]);
+  assert.equal(ctx.state.claudeModel, otherModel, "実行中なのに compareSetClaudeModel が効いてしまった");
+  assert.equal(ctx.compareFrames.claude.postMessageCalls.length, callsBefore, "実行中なのに setClaudeModel が飛んでしまった");
+});
+
 // ---------------------------------------------------------------------------
 // 一括モード(Issue #48、SPEC 3章 F1・F3)。S/T/W/Y 系と同じ runScript /
 // makeAbortAwareFetch / waitFor / makeManualTimers を使う。

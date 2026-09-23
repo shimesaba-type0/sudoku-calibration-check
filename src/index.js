@@ -4378,6 +4378,7 @@ var PAGE_HTML = `<!doctype html>
       if (data.type === "setOrderMode" && typeof data.mode === "string") { setOrderMode(data.mode); return; }
       if (data.type === "setHistoryMode" && typeof data.on === "boolean") { setHistoryMode(data.on); return; }
       if (data.type === "setRuleMode" && typeof data.on === "boolean") { setRuleMode(data.on); return; }
+      if (data.type === "setClaudeModel" && typeof data.model === "string") { setClaudeModel(data.model); return; }
     });
   }
 
@@ -4449,6 +4450,15 @@ var PAGE_HTML = `<!doctype html>
     var expertActive = state.difficulty === "expert" ? " active" : "";
     var newDisabled = compareGenerating ? "disabled" : "";
     var newLabel = compareGenerating ? "生成中…" : "新しい問題";
+    // Claude 側(右カラム)のモデル選択(Issue #90)。通常ページの renderClaudeSettings() は
+    // embedMode では描かれないため(SPEC F1')、比較シェル自身にモデル選択を持たせる。
+    // 子(Claude iframe)と同じロック条件(orderDisabled = 実行中・停止中)で、
+    // setClaudeModel() 自体もこのロックを持つ(2章)。
+    var claudeModelButtons = "";
+    for (var mi = 0; mi < CLAUDE_MODELS.length; mi++) {
+      var claudeModelActive = state.claudeModel === CLAUDE_MODELS[mi] ? " active" : "";
+      claudeModelButtons += "<button class=\\"model-btn" + claudeModelActive + "\\" onclick=\\"compareSetClaudeModel('" + CLAUDE_MODELS[mi] + "')\\" " + orderDisabled + ">" + escapeHtml(CLAUDE_MODELS[mi]) + "</button>";
+    }
     return "<div class=\\"controls\\">" +
       "<button id=\\"compare-run-btn\\" onclick=\\"" + runOnclick + "\\" " + runDisabled + ">" + runLabel + "</button>" +
       "<button id=\\"compare-reset-btn\\" onclick=\\"compareReset()\\">リセット</button>" +
@@ -4470,6 +4480,7 @@ var PAGE_HTML = `<!doctype html>
       "<button class=\\"rules-btn" + ruleOnActive + "\\" onclick=\\"compareSetRuleMode(true)\\" " + orderDisabled + ">ルールあり</button>" +
       "<button class=\\"rules-btn" + ruleOffActive + "\\" onclick=\\"compareSetRuleMode(false)\\" " + orderDisabled + ">ルールなし</button>" +
       "</div>" +
+      "<div id=\\"claude-model-toggle\\">" + claudeModelButtons + "</div>" +
       "<div id=\\"difficulty-toggle\\">" +
       "<button class=\\"difficulty-btn" + easyActive + "\\" onclick=\\"compareSetDifficulty('easy')\\">やさしい</button>" +
       "<button class=\\"difficulty-btn" + normalActive + "\\" onclick=\\"compareSetDifficulty('normal')\\">ふつう</button>" +
@@ -4599,6 +4610,18 @@ var PAGE_HTML = `<!doctype html>
   function compareSetDifficulty(mode) {
     if (mode !== "easy" && mode !== "normal" && mode !== "hard" && mode !== "expert") return;
     state.difficulty = mode;
+    renderCompareTopbarInPlace();
+  }
+
+  // Claude 側(右カラム)のモデル選択(Issue #90)。子と同じロック条件(setClaudeModel()
+  // 自身が持つ modelSettingsLocked() と揃える)。両 iframe に送るのは他のトグルと同じで、
+  // Jev 側では使われないが無害(state.modelMode が "jev" 固定のため参照されない)。
+  function compareSetClaudeModel(model) {
+    if (CLAUDE_MODELS.indexOf(model) === -1) return;
+    if (compareEitherRunning() || compareEitherPaused()) return;
+    state.claudeModel = model;
+    saveClaudeSettings();
+    comparePostToFrames({ type: "setClaudeModel", model: model });
     renderCompareTopbarInPlace();
   }
 
