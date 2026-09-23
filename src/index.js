@@ -3973,7 +3973,7 @@ var PAGE_HTML = `<!doctype html>
       return "<div id=\\"completion-banner\\" class=\\"banner success\\">" + state.roundsToSolve + "周ですべて正解しました</div>";
     }
     if (state.done && state.stoppedAtLimit) {
-      return "<div id=\\"completion-banner\\" class=\\"banner warning\\">" + MAX_ROUNDS + "周で強制終了しました(不正解 " + roundWrong.length + " マス。全マス正解には至りませんでした)</div>";
+      return "<div id=\\"completion-banner\\" class=\\"banner warning\\">" + MAX_ROUNDS + "周で強制終了しました(最終周の不正解 " + roundWrong.length + " マス、全マス正解には至らず)</div>";
     }
     return "<div id=\\"completion-banner\\"></div>";
   }
