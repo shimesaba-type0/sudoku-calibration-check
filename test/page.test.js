@@ -135,6 +135,11 @@ function runScript(html, options) {
   // 振る舞いテスト(#32 T3)がタイマーの発火タイミングそのものを制御したいときに使う)。
   // opts.setTimeout が無ければ従来どおり setImmediate で即座に(delay を無視して)実行する。
   var setTimeoutCalls = [];
+  // startElapsedTicker()(Issue #80 追加要望)の setInterval/clearInterval。テストは自動で
+  // 定期実行させず(vm を無限に回さない)、intervalRegistry から手動で1回ぶんの fn を
+  // 呼んでティックをシミュレートする。id は setInterval の戻り値をそのまま使う。
+  var intervalRegistry = {};
+  var nextIntervalId = 1;
   var defaultDocument = {
     getElementById: function (id) {
       return id === "app" ? app : null;
@@ -168,6 +173,14 @@ function runScript(html, options) {
       if (opts.setTimeout) return opts.setTimeout(fn, delay);
       return setImmediate(fn);
     },
+    setInterval: function (fn, delay) {
+      var id = nextIntervalId++;
+      intervalRegistry[id] = { fn: fn, delay: delay };
+      return id;
+    },
+    clearInterval: function (id) {
+      delete intervalRegistry[id];
+    },
     // focusNext() がリクエストごとに new AbortController() する(Issue #19)。
     // vm のコンテキストには Node のグローバルが自動では見えないので明示的に渡す。
     AbortController: AbortController,
@@ -200,6 +213,7 @@ function runScript(html, options) {
   context.bodyChildren = bodyChildren;
   context.createdBlobs = createdBlobs;
   context.setTimeoutCalls = setTimeoutCalls;
+  context.intervalRegistry = intervalRegistry;
   return context;
 }
 
@@ -2148,12 +2162,14 @@ test("V2: Claude 経路はブラウザから api.anthropic.com を直接呼び�
   assert.deepStrictEqual(JSON.parse(JSON.stringify(ctx.state.lastRequest)), body, "lastRequest がリクエストボディと一致しない");
   assert.equal(ctx.state.lastRequestFailed, false);
 
-  // キーは DOM・エクスポートのどこにも出ない(末尾 4 文字のヒントだけ)
+  // キーは DOM・エクスポートのどこにも出ない(末尾4文字のヒントも出さない。
+  // オーナー要望 2026-09-23 でヒント表示自体を削除した)
   ctx.render();
   var html = ctx.appElement.innerHTML;
   assert.ok(!html.includes(TEST_KEY), "innerHTML にキーが出ている");
-  assert.ok(html.includes("…" + TEST_KEY.slice(-4)), "キーの末尾ヒントが出ていない");
+  assert.ok(!html.includes("…" + TEST_KEY.slice(-4)), "削除したはずのキー末尾ヒントがまだ出ている");
   assert.ok(html.includes('id="claude-settings"'), "Claude の設定パネルが出ていない");
+  assert.ok(html.includes("API キー(設定済み)"), "折りたたみの見出しに設定済みの状態が出ていない");
   assert.ok(html.includes("claude-opus-5+think") || html.includes("claude-opus-5"), "較正図のモデルフィルタにモデルが出ていない");
   ctx.exportRecords();
   var exported = ctx.createdBlobs[0].parts.join("");
@@ -5655,4 +5671,116 @@ test("AD6: 実行前に select を渡り歩くだけでも instant-toggle の有
   ctx.setSpeed("fast");
   assert.ok(!/<select id="instant-toggle"[^>]*disabled/.test(app.innerHTML),
     "実行中でもないのに select にフォーカスがあるという理由だけで render() が止まり、instant-toggle が無効のままになっている(M1)");
+});
+
+test("AD7: 「現在の判定」の経過時間は render() を待たずに setInterval でリアルタイム更新され、停止/完了で止まる(オーナー追加要望)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var app = { innerHTML: "" };
+  var elapsedEl = { textContent: "" };
+  var fakeDoc = {
+    activeElement: null,
+    getElementById: function (id) {
+      if (id === "app") return app;
+      if (id === "current-elapsed") return elapsedEl;
+      return null;
+    },
+    querySelector: function () { return null; },
+    querySelectorAll: function () { return []; },
+    createElement: function (tag) { return { tagName: tag, href: "", download: "", click: function () {} }; },
+    body: { appendChild: function () {}, removeChild: function () {} },
+  };
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch, document: fakeDoc });
+  assert.ok(ctx.applyPuzzleFromString(blankCells(ANSWER_KEY, [[0, 0]])), "テスト用の1マスだけの盤面の適用に失敗した");
+
+  var fakeNow = 1000;
+  ctx.nowMs = function () { return fakeNow; };
+  ctx.run();
+  await waitFor(function () { return af.pending.length === 1; }, "AD7: fetch 待ち");
+
+  // run() が startElapsedTicker() で setInterval を1つ登録しているはず(100ms間隔)
+  var ids = Object.keys(ctx.intervalRegistry);
+  assert.equal(ids.length, 1, "run() が setInterval を1つ登録していない");
+  var entry = ctx.intervalRegistry[ids[0]];
+  assert.equal(entry.delay, 100, "ティック間隔(ELAPSED_TICK_MS)が想定と違う: " + entry.delay);
+
+  // fetch が in-flight のまま(render() は挟まらない)時間を進めて、手動でティックを1回発火する
+  fakeNow = 4234;
+  entry.fn();
+  assert.equal(elapsedEl.textContent, ctx.formatMs(3234),
+    "render() を挟まない手動ティックで #current-elapsed の textContent が更新されていない: " + elapsedEl.textContent);
+
+  // そのまま応答を返して完了させると、setInterval がクリアされ、以後は動かなくなる
+  var entryReq = af.pending.shift();
+  var body = JSON.parse(entryReq.init.body);
+  entryReq.resolve(makeCorrectResponse(ctx, body.target.row, body.target.col, body.puzzle));
+  await waitFor(function () { return ctx.state.done === true; }, "AD7: 完了待ち");
+  assert.equal(Object.keys(ctx.intervalRegistry).length, 0, "完了後も setInterval が残っている(止まって見えるはずが動き続ける)");
+});
+
+test("AD8: Claude 設定はモデル選択と API キー入力を分け、キー入力は既定で折りたたむ。末尾ヒント表示は削除した(オーナー要望 2026-09-23)", async () => {
+  var ctx = runScript(await getPageHtml(), {});
+  ctx.setModelMode("claude");
+  ctx.saveAnthropicKey(TEST_KEY);
+
+  var html = ctx.appElement.innerHTML;
+  var detailsStart = html.indexOf('<details class="claude-key-details">');
+  assert.ok(detailsStart !== -1, "API キーの折りたたみ(<details>)が無い: " + html);
+
+  // モデル選択・思考トグルは折りたたみの外(常に見える位置)にある
+  var modelSelectIdx = html.indexOf('id="claude-model"');
+  assert.ok(modelSelectIdx !== -1 && modelSelectIdx < detailsStart, "モデル選択が折りたたみの外にない(常に見えるはず)");
+  var thinkingIdx = html.indexOf('id="thinking-toggle"');
+  assert.ok(thinkingIdx !== -1 && thinkingIdx < detailsStart, "思考トグルが折りたたみの外にない(常に見えるはず)");
+
+  // API キーの入力欄・保存/削除ボタンは折りたたみの中
+  var keyInputIdx = html.indexOf('id="anthropic-key-input"');
+  assert.ok(keyInputIdx > detailsStart, "API キー入力欄が折りたたみの中にない");
+
+  // <details> に open は付かない(既定で閉じている)
+  assert.ok(!/<details class="claude-key-details"\s+open/.test(html), "API キー設定が既定で開いている");
+
+  // 末尾4文字のヒント表示は削除済み。折りたたみの見出しには状態(設定済み/未設定)だけ残す
+  assert.ok(!html.includes("保存済み(末尾"), "削除したはずの「保存済み(末尾…)」表示がまだ出ている");
+  assert.ok(!html.includes("…" + TEST_KEY.slice(-4)), "削除したはずのキー末尾ヒントがまだ出ている");
+  assert.ok(html.includes("API キー(設定済み)"), "折りたたみの見出しに設定済みの状態が出ていない: " + html);
+
+  ctx.clearAnthropicKey();
+  assert.ok(ctx.appElement.innerHTML.includes("API キー(未設定)"), "キーを消したのに見出しが未設定にならない");
+});
+
+test("AD9: API キー設定の折りたたみは render() をまたいで開閉状態を引き継ぐ(保存/削除のボタンが render() を呼んでも閉じない、オーナー要望 2026-09-23)", async () => {
+  var htmlValue = "";
+  var keyDetailsEl = { open: false };
+  var app = {
+    get innerHTML() { return htmlValue; },
+    set innerHTML(v) {
+      htmlValue = v;
+      // 実ブラウザでは innerHTML の丸ごと差し替えでノードが作り直され、open は既定の
+      // false に戻る(render() 側が明示的に true を書き戻さない限り閉じたままになる)。
+      keyDetailsEl.open = false;
+    },
+  };
+  var fakeDoc = {
+    activeElement: null,
+    getElementById: function (id) { return id === "app" ? app : null; },
+    querySelector: function (sel) {
+      if (sel === "details.claude-key-details") return keyDetailsEl;
+      return null;
+    },
+    querySelectorAll: function () { return []; },
+    createElement: function (tag) { return { tagName: tag, href: "", download: "", click: function () {} }; },
+    body: { appendChild: function () {}, removeChild: function () {} },
+  };
+  var ctx = runScript(await getPageHtml(), { document: fakeDoc });
+  ctx.setModelMode("claude");
+  ctx.saveAnthropicKey(TEST_KEY);
+
+  // ユーザーが開いた状態を模してから、保存/削除ボタンと同じ経路(render() を呼ぶ関数)を通す
+  keyDetailsEl.open = true;
+  ctx.render();
+  assert.equal(keyDetailsEl.open, true, "開いていた API キー設定が render() で閉じてしまった(保存直後の注意書きが見えなくなる)");
+
+  keyDetailsEl.open = false;
+  ctx.render();
+  assert.equal(keyDetailsEl.open, false, "閉じていたのに render() で勝手に開いた");
 });
