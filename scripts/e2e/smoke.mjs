@@ -388,7 +388,7 @@ async function runMockMode(chromium, executablePath, mode) {
         // このモードでは意味を持たない([4] で別途検証する)。
         throw new Skip("ratelimit モードは3件目で429になり周を完走できない");
       }
-      await page.locator("#speed-toggle button", { hasText: "最速" }).click();
+      await page.locator("#speed-toggle").selectOption("fast");
       await page.click("#run-btn");
       var logItem = page.locator("#round-log li").first();
       await logItem.waitFor({ state: "visible", timeout: 30000 });
@@ -407,7 +407,8 @@ async function runMockMode(chromium, executablePath, mode) {
       var banner = page.locator("#completion-banner.banner.success");
       await banner.waitFor({ state: "visible", timeout: 30000 });
       var text = await banner.textContent();
-      assert.match(text, /周ですべて正解しました$/, "完了バナーの文言が違う: " + text);
+      // 開始から終了までの所要時間が添えられる(オーナー要望 2026-09-23、Issue #76)
+      assert.match(text, /周ですべて正解しました\(所要 [\d,]+ ms\)$/, "完了バナーの文言が違う: " + text);
       await page.screenshot({ path: path.join(outDir, mode + "-03-completion.png") });
       return text;
     });
@@ -422,7 +423,7 @@ async function runMockMode(chromium, executablePath, mode) {
     //    共有(サーバー起動からの累計)なので、[4] で上限を使い切ってしまう前に
     //    ここで1件だけ成功レスポンスを消費しておく必要がある
     await runCheck(5, "「じっくり確認」実行で枠線とバーが出る", async function () {
-      await page.locator("#speed-toggle button", { hasText: "じっくり確認" }).click();
+      await page.locator("#speed-toggle").selectOption("slow");
       await page.click("#run-btn");
 
       var focusedCell = page.locator('#grid .cell[style*="box-shadow"]');
@@ -487,13 +488,13 @@ async function runMockMode(chromium, executablePath, mode) {
       await page.goto(mockServer.baseUrl + "/", { waitUntil: "load" });
       page.on("request", counter);
       try {
-        var orderToggle = page.locator("#order-toggle button", { hasText: "確信度順" });
+        var orderToggle = page.locator("#order-toggle");
         var orderCount = await orderToggle.count();
         if (orderCount === 0) {
           throw new Skip("順番トグルが無い(Issue #38 のフロントマージ前)");
         }
-        await orderToggle.click();
-        await page.locator("#speed-toggle button", { hasText: "最速" }).click();
+        await orderToggle.selectOption("confidence");
+        await page.locator("#speed-toggle").selectOption("fast");
         await page.click("#run-btn");
         var logItem = page.locator("#round-log li").first();
         await logItem.waitFor({ state: "visible", timeout: 30000 });
@@ -514,8 +515,8 @@ async function runMockMode(chromium, executablePath, mode) {
         page.off("request", counter);
         await page.click("#reset-btn");
         // 順番トグルは reset() をまたいで保持されるので、後続のチェックのために「左上から」に戻す
-        var scanToggle = page.locator("#order-toggle button", { hasText: "左上から" });
-        if ((await scanToggle.count()) > 0) await scanToggle.click();
+        var scanToggle = page.locator("#order-toggle");
+        if ((await scanToggle.count()) > 0) await scanToggle.selectOption("scan");
       }
     });
 
@@ -537,13 +538,13 @@ async function runMockMode(chromium, executablePath, mode) {
       await page.goto(mockServer.baseUrl + "/", { waitUntil: "load" });
       page.on("request", allCounter);
       try {
-        var allToggle = page.locator("#order-toggle button", { hasText: "一括" });
+        var allToggle = page.locator("#order-toggle");
         var allCount = await allToggle.count();
         if (allCount === 0) {
           throw new Skip("順番トグルに「一括」が無い(Issue #48 のフロントマージ前)");
         }
-        await allToggle.click();
-        await page.locator("#speed-toggle button", { hasText: "最速" }).click();
+        await allToggle.selectOption("all");
+        await page.locator("#speed-toggle").selectOption("fast");
         await page.click("#run-btn");
         var logItem = page.locator("#round-log li").first();
         await logItem.waitFor({ state: "visible", timeout: 30000 });
@@ -563,8 +564,8 @@ async function runMockMode(chromium, executablePath, mode) {
         page.off("request", allCounter);
         await page.click("#reset-btn");
         // 順番トグルは reset() をまたいで保持されるので、後続のチェックのために「左上から」に戻す
-        var scanToggleBack = page.locator("#order-toggle button", { hasText: "左上から" });
-        if ((await scanToggleBack.count()) > 0) await scanToggleBack.click();
+        var scanToggleBack = page.locator("#order-toggle");
+        if ((await scanToggleBack.count()) > 0) await scanToggleBack.selectOption("scan");
       }
     });
 
@@ -572,7 +573,7 @@ async function runMockMode(chromium, executablePath, mode) {
     // (Issue #43: Jev の 429/503 は一時的な失敗として停止扱いになり、エラーボックスは出ない)
     await runCheck(4, "ratelimitモードで停止扱い(理由が出て実行ボタンが「再開」)→リセットで復帰", async function () {
       if (mode !== "ratelimit") throw new Skip("--mode ratelimit 専用");
-      await page.locator("#speed-toggle button", { hasText: "最速" }).click();
+      await page.locator("#speed-toggle").selectOption("fast");
       await page.click("#run-btn");
       var pauseReasonBox = page.locator(".pause-reason");
       await pauseReasonBox.waitFor({ state: "visible", timeout: 30000 });
@@ -663,7 +664,7 @@ async function runProductionMode(chromium, executablePath, targetUrl) {
     await page.screenshot({ path: path.join(outDir, "prod-01-initial.png") });
 
     await runCheck("R", "最速で実行→3マス目の色付けでリセット(最大3判定)", async function () {
-      await page.locator("#speed-toggle button", { hasText: "最速" }).click();
+      await page.locator("#speed-toggle").selectOption("fast");
       await page.click("#run-btn");
 
       await page.waitForFunction(

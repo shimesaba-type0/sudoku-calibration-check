@@ -640,7 +640,7 @@ var compareGenerating = false;  // 「新しい問題」(比較シェル版)で�
 | `setSpeed(mode)` | `state.speedMode` を切り替えて再描画。実行中でも切り替えられる(4.4) |
 | `setDifficulty(mode)` | `state.difficulty`(`"easy"` / `"normal"` / `"hard"`)を切り替えて再描画。変えただけでは盤面は変わらず、次の `newPuzzle()` の目標ヒント数に効く(Issue #21) |
 | `render()` | `state` から DOM(グリッド・統計・バー・ログ・集計パネル・バナー・ボタン)を **全部 innerHTML で再生成**。周回ログのスクロール位置だけは引き継ぐ |
-| `render*()` | `renderGrid` / `renderLegend`(確信度順のときだけヒートマップの凡例を1項目足す。Issue #38)/ `renderControls`(モデルトグル・順番トグル・消去法の2トグル(履歴・ルール候補。Issue #61・#63)含む)/ `renderClaudeSettings`(Claude のときだけ)/ `renderErrorBox` / `renderStats`(+`statCard`。「この周の判定済み」「この周の正解」の2枚に分かれる。Issue #60)/ `renderCurrentPanel`(+`coordLabel` / `renderBars` / `renderSelectionLine`)/ `renderPromptPanel`(+`renderRequestBlock` / `renderAllRequestBlock`)/ `renderRoundLog`(+`formatLimitLogLine`。強制終了の行。Issue #60)/ `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`。それぞれHTML文字列を返すだけで、DOMには触らない |
+| `render*()` | `renderGrid` / `renderLegend`(確信度順のときだけヒートマップの凡例を1項目足す。Issue #38)/ `renderControls`(速度・難易度・モデル・順番・消去法の2トグル(履歴・ルール候補。Issue #61・#63)を含む6つの `<select>`。Issue #76 でボタン群からプルダウンに変更)/ `renderClaudeSettings`(Claude のときだけ)/ `renderErrorBox` / `renderStats`(+`statCard`。「この周の判定済み」「この周の正解」の2項目を含む5項目を1行で表示。Issue #60・#76)/ `renderCurrentPanel`(+`coordLabel` / `renderBars` / `renderSelectionLine`)/ `renderPromptPanel`(+`renderRequestBlock` / `renderAllRequestBlock`)/ `renderRoundLog`(+`formatLimitLogLine`。強制終了の行。Issue #60)/ `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`(完了/強制終了時に所要時間を添える。Issue #76)。それぞれHTML文字列を返すだけで、DOMには触らない |
 | `renderSelectionLine()` | 確信度順モード(Issue #38)の「マス選び: N 候補中 r行目c列目(p%)/ confidence q%」行。`state.lastSelection` が無ければ空文字列。`renderCurrentPanel()` が `state.focusedKey` があるとき(= マス選びが終わって数字判定中)にだけ先頭に差し込む |
 | `renderPromptPanel()` / `renderRequestBlock(req,failed,heading)` / `renderAllRequestBlock(allReq)` | 「現在の判定」パネルの直下の「モデルに送ったプロンプト」枠(SPEC F1、Issue #34、#38、#48)。`renderRequestBlock` が1件ぶんの表示(座標・失敗注記・見出し・`<pre>` の JSON)を組み立てる下請け。左上からモード(`orderMode` が `"confidence"` でも `"all"` でもないとき)は従来どおり `state.lastRequest` 1件だけを `heading=null` で表示。**確信度順モード**は `state.lastCellRequest`(見出し「マス選び」)→ `state.lastRequest`(見出し「数字」)の順で2段に並べる(どちらも無ければ従来と同じ「まだ判定していません」)。座標(`req.state.target`)・`lastRequestFailed` なら「(このプロンプトで失敗)」を添える処理は共通。**一括モード**は `state.lastAllRequest`(`{ request, failed, count }`)を `renderAllRequestBlock` に渡し、「一括: 質問 N 問」の要約行 + `<details>` の折りたたみで表示する(1周ぶんの `request` は空マスの数だけ質問を含み大きいため)。Jev 経路では Worker の `handleJudge` が返す `request`、Claude 経路ではブラウザが送ったリクエストボディをそのまま表示し、フロント側で組み立て直さない(二重管理を避けるため) |
 | `buildCellStyle()` | マスの状態(given/pending/correct/incorrect + focused)からインラインstyle文字列を返す。確信度順モード(Issue #38)では、`state.cellProbs` にそのマスの確率があり(未判定・非フォーカス)、`α = 0.08 + 0.6 * p / pmax`(`pmax` は `cellProbs` の最大値)の `rgba(125, 211, 252, α)` を背景にする(ヒートマップ) |
@@ -670,13 +670,12 @@ var compareGenerating = false;  // 「新しい問題」(比較シェル版)で�
 | `activeModelIdForPricing()` | 今の実行のモデル識別子(一括モードなら `currentModelId() + "/all"`)。`commitFocused()` の記録の `m` と同じ組み立て方を、コスト表示(単価未設定の注記の判定)でも使い回す |
 | `formatThousands(n)` / `formatMs(ms)` / `formatUsd(x)` / `formatUsdForModel(x, modelId)` | 表示の書式(SPEC 5章)。`formatMs` は3桁区切り+`" ms"`(負値は0扱い)。`formatUsd` は `$0.01` 以上は小数4桁(末尾0を削る)、それ未満は有効数字2桁程度、0 は `$0`。`formatUsdForModel` は `isPricedModel()` が false なら「(単価未設定)」を足す |
 | `formatRoundLogLine(entry)` / `formatTotalSummary()` / `formatLimitLogLine(entry)` / `countRoundLogEntries()` | 周回ログの1行・合計行(SPEC F1)。`entry` は `state.roundLog` の要素(`{ round, correct, total, ms, cost, m }`)。`formatRoundSummary()`(既存)の文字列に `— <ms> / <$>` を続ける。`formatLimitLogLine(entry)` は強制終了の専用行(`{ round, limit:true, wrong }`)を「N周で強制終了(最終周の不正解 M マス)」に整形する(Issue #60)。`countRoundLogEntries()` は `state.roundLog` のうち `entry.limit` が無いものだけを数え(強制終了の行は「周」ではない)、`formatTotalSummary()` の `(N周)` に使う |
-| `defaultPrices()` / `isValidPriceEntry(v)` / `loadPrices()` / `savePrices(next)` / `getPrices()` / `setPrice(modelId, field, value)` / `resetPrices()` | 単価(SPEC 5章)。`defaultPrices()` は呼ぶたびに新しいオブジェクトを返す純関数。`getPrices()` は `getRecords()` と同じ「初回だけ `localStorage` を読み、以後はモジュールスコープの `pricesCache` を使う」キャッシュ方式。`setPrice()` は数値・非負のときだけ反映し、`localStorage`(`scc.prices.v1`)に保存してキャッシュも更新する |
+| `defaultPrices()` / `isValidPriceEntry(v)` / `loadPrices()` / `getPrices()` | 単価(SPEC 5章)の読み取り専用の窓口。`defaultPrices()` は呼ぶたびに新しいオブジェクトを返す純関数。`getPrices()` は `getRecords()` と同じ「初回だけ `localStorage` を読み、以後はモジュールスコープの `pricesCache` を使う」キャッシュ方式。`loadPrices()` は `localStorage`(`scc.prices.v1`)を読み、形式が正しいエントリだけ既定値に上書きする(壊れた JSON・配列・不正値は既定値のまま)。**単価を編集する UI(単価パネル)は Issue #76 で削除した**ので、この `localStorage` に新しく値が書き込まれることはもう無いが、`loadPrices()` はそれより前にパネルが保存した値をそのまま読める形で残してある(`savePrices()` / `setPrice()` / `resetPrices()` は呼び出し元が無くなったので削除した) |
 | `priceModelKey(m)` / `isPricedModel(m)` / `costOf(rec)` | `priceModelKey()` は記録の `m` から `/all`・`+think` を外して単価テーブルのキーに正規化する。`costOf(rec)` は `rec.u` が無い、または単価が見つからないモデルなら 0 を返す純関数 |
 | `toRecordUsage(usage)` / `combineRecordUsage(a, b)` | Jev/Claude の `usage`(`{ input_tokens, output_tokens, cache_read_input_tokens? }`)を記録の形(`{ i, o, ci? }`)に変換・合算する。`combineRecordUsage` は確信度順(マス選び+数字)で使う |
 | `extractClaudeUsage(data)` | Claude(Anthropic Messages API)の応答から `usage` を取り出す。Worker の `extractUsage`(3.3)と同じ考え方で、欠けている・壊れていれば `undefined`(判定結果の検証には影響させない) |
-| `renderUsagePanel()` | 「この実行の消費」パネル(SPEC F1、Issue #55・#56。オーナー追加要望 2026-09-23)。`renderPricesPanel()` のすぐ上に置く(埋め込みモードでは `renderStats()` の直前)。トークン(`totalTokensIn` / `totalTokensOut`)・コスト(`formatUsdForModel(totalCostUsd, activeModelIdForPricing())`)・速度(`formatTps(totalTokensIn + totalTokensOut, totalLatencyMs)`。**レビュー S1**: 分母に `currentTotalElapsedMs()` を使うと速度モード/順番モードの演出待ち(`SLOW_BEFORE_COMMIT_MS` 等)が混ざって数倍ぶれるため、API 呼び出しの待ち時間の合計 `totalLatencyMs` だけを使う。演出待ちを含まない旨を表示にも添える)の3行(速度の行は `state.speedMode === "fast"` のときだけ出す。オーナー追加要望 2026-09-23: 「じっくり確認」は意図的に待ち時間を挟むモードなので速度の実測値を見る意味が薄い)|
+| `renderUsagePanel()` | 「この実行の消費」パネル(SPEC F1、Issue #55・#56。オーナー追加要望 2026-09-23)。`grid-panel`(盤面+凡例)の末尾に置く(Issue #76。以前は単価パネルの直上に置いていたが、単価パネルごと削除したので盤面の直下に移した)。トークン(`totalTokensIn` / `totalTokensOut`)・コスト(`formatUsdForModel(totalCostUsd, activeModelIdForPricing())`)・速度(`formatTps(totalTokensIn + totalTokensOut, totalLatencyMs)`。**レビュー S1**: 分母に `currentTotalElapsedMs()` を使うと速度モード/順番モードの演出待ち(`SLOW_BEFORE_COMMIT_MS` 等)が混ざって数倍ぶれるため、API 呼び出しの待ち時間の合計 `totalLatencyMs` だけを使う。演出待ちを含まない旨を表示にも添える)の3行(速度の行は `state.speedMode === "fast"` のときだけ出す。オーナー追加要望 2026-09-23: 「じっくり確認」は意図的に待ち時間を挟むモードなので速度の実測値を見る意味が薄い)|
 | `formatTps(tokens, elapsedMs)` | 平均トークン/秒。`tokens` が0以下・非有限、または `elapsedMs` が200未満・非有限なら "—"(値が暴れる・崩れた文字列になるのを防ぐ)。それ以外は `formatThousands(Math.round(tokens / (elapsedMs / 1000))) + " tok/s"` |
-| `renderPricesPanel()` | 単価パネル(SPEC F1)。モデルごとの入力/出力単価の `<input type="number">` と「既定値に戻す」ボタン。Claude モードに限らず常時表示する |
 
 ### 4.3 状態遷移(1マス)
 
@@ -821,6 +820,25 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
 
 ### 4.4 描画方針
 
+- **画面構成(Issue #76、オーナー要望 2026-09-23)**: `render()`(非埋め込み時)は
+  `renderBanner()` → `renderErrorBox()` → `<div class="top-controls">`(`renderControls()` +
+  `renderClaudeSettings()`)→ `<div class="layout">`(`grid-panel`: `renderGrid()` +
+  `renderLegend()` + `renderUsagePanel()`、`side-panel`: `renderStats()` + `renderCurrentPanel()`
+  + `renderRoundLog()` + `renderPromptPanel()` + `renderCalibration()`)の順に組み立てる。
+  以前は実行系ボタン+各トグルが `side-panel` の先頭にあったが、完了バナーの下・盤面の上の
+  横並びバー(`top-controls`)に外に出した。速度・難易度・モデル・順番・履歴・ルール候補の
+  6トグルは、選択中のものだけ見えればよいのでボタン群でなく `<select>` にした(id は
+  `speed-toggle` 等、ボタン群のときと同じものを流用。CSS の `#speed-toggle { display:
+  inline-flex; border: … }` 等は比較シェル(`renderCompareShellControls()`。同じ id を使う
+  ボタン群のまま、Issue #76 の対象外)と共有しているが、`<select>` に適用しても見た目を
+  崩さないのでそのまま流用できる)。「この実行の消費」パネル(`renderUsagePanel()`)は
+  `grid-panel` の末尾(盤面+凡例の直下)に移した。単価パネル(`renderPricesPanel()`・
+  `setPrice()`・`resetPrices()`・`savePrices()`)は画面から削除した(呼び出し元が無くなった
+  ので関数ごと削除。`getPrices()`/`loadPrices()`/`defaultPrices()`/`costOf()` は
+  読み取り専用のコスト計算としてそのまま残す)。`side-panel` は「一番見たいのが現在の判定、
+  次が周回ログ」という優先度に合わせて並べ替え、技術的な補足情報である `renderPromptPanel()`
+  を `renderRoundLog()` の後ろに回した。`renderBanner()` の完了/強制終了メッセージには
+  `formatMs(totalElapsedMs)` で開始から終了までの所要時間を添える
 - 状態が変わるたびに `render()` で該当領域を丸ごと再生成する。81マス+9本のバー程度なので差分更新は不要
 - 色や枠線は `buildCellStyle` が返すインラインstyleで指定(クラス切り替えではなく、状態から毎回組み立てる)
 - 「現在の判定」パネルは、結果が届いているマスについては座標とバーを出し、結果待ち・確定直後は
@@ -988,7 +1006,7 @@ new_sqlite_classes = ["RateLimitCounter"]
     - vm のコンテキストで作った配列は host とは別レルムなので、`deepStrictEqual` の前に host 側の配列へ移し替える(`hostRows`)。オブジェクト(`DIFFICULTY_GIVENS` など)も同じ理由で `deepStrictEqual` はプロトタイプ違いで落ちるので、値だけを個別に比較する
   - **難易度(ヒント数)**(`test/page.test.js`、Issue #21)。ジェネレーター系と同じ `runScript` harness を使う
     - 難易度ごとの `generatePuzzle(DIFFICULTY_GIVENS[difficulty])` を各10回: 常に一意解、解が `solution` と一致、ヒント数がやさしい36/ふつう30は**ちょうど**、むずかしいは25〜28(下限24以上、5章の実測分布どおりジェネレーター単体では時々ちょうどに届かないことがある契約を検証する)
-    - 難易度トグルの描画(`renderControls()`): 選択中のボタンだけに `active` クラスと `aria-pressed="true"` が付き、他は `aria-pressed="false"` であること。`setDifficulty("hard")` で `state.difficulty` が変わり、`reset()` 後も維持されること
+    - 難易度トグルの描画(`renderControls()`。Issue #76 でプルダウン化): 選択中の `<option>` だけに `selected` が付くこと。`setDifficulty("hard")` で `state.difficulty` が変わり、`reset()` 後も維持されること
     - `setDifficulty()` だけを呼んでも `GIVEN` は変わらない(次の `newPuzzle()` から効く)こと
     - `newPuzzle()` が `state.difficulty` に応じたヒント数で生成すること(`hard` で25〜28、`easy` で36ちょうど)
     - `newPuzzle()` の所要時間: `hard`(再試行が最も起きやすい)を10回で2秒以内であること(実測: 10回で200ms未満)
@@ -1045,7 +1063,7 @@ new_sqlite_classes = ["RateLimitCounter"]
     - Z4: Jev の 429(`Retry-After` ヘッダー)は停止扱い(`pauseReason` に秒数を含む)。`queue` の長さは変わらず、`state.allFetching` は `false` に戻ること。`run()` で再開するともう一度 `ask:"all"` の `fetch` をすること
     - Z5: Claude 経路のスキーマ(`buildClaudeAllRequest` / `buildClaudeAllSchema`。候補キー(その周の `queue`)がそれぞれ `required` で、各値は digit 判定と同じ形)、`system` に `ALL_NOTE` の文言を含むこと、`max_tokens` の下限(思考なし16000・adaptive 24000・Haiku(budget 2048)12000。`buildClaudeAllRequest` を直接呼んで検証)、`target` を送らないこと。応答検証(`validateClaudeAllAnswer`)はキーが1つ欠けていればエラー、揃っていれば通ること。`run()` 経由でも(固定問題の51マスなのでチャンク分割される。Issue #74)キー欠けの応答がエラーで停止すること
     - Z6: 2周目の一括は不正解マスだけを候補にする(`buildSelectionSnapshot()` で空マスがその1マスだけになる)こと。周回ログの形式は従来どおり
-    - Z7: URL `order=all` で `state.orderMode` が `"all"` になること、`setOrderMode("all")` が効き順番トグルに「一括」ボタン(`onclick="setOrderMode('all')"`)が出ること。比較シェル(`/compare`)の順番トグルにも「一括」があり、`compareSetOrderMode("all")` で `state.orderMode` が変わり `compareIframeSrc()` の組み立てに `order=all` が反映されること
+    - Z7: URL `order=all` で `state.orderMode` が `"all"` になること、`setOrderMode("all")` が効き順番トグル(`<select id="order-toggle">`。Issue #76 でプルダウン化)に「一括」の `<option>` が selected で出ること。比較シェル(`/compare`)の順番トグル(ボタン群のまま、Issue #76 の対象外)にも「一括」があり、`compareSetOrderMode("all")` で `state.orderMode` が変わり `compareIframeSrc()` の組み立てに `order=all` が反映されること
     - Z8: Claude 経路の一括で全マスが確定し(固定問題の51マスなのでチャンク分割される)、記録の `m` が `claude-opus-5+think/all`・`o` が `"all"` になること、キーが DOM に出ないこと。Jev 経路で `cells` に対象マスが欠けた応答は、1 マスも確定・記録せず `queue` も減らさずにエラー停止すること(`askAllRound` がキャッシュに入れる前に queue の全キーを確かめる)
     - Z9(Issue #74): `chunkArray()` の境界(割り切れる・余りが出る・空・要素1個)、`combineClaudeUsage()` の合算(片方 `undefined`・`cache_read_input_tokens` の合算)。固定問題(51マス)なら `CLAUDE_ALL_CHUNK_SIZE`(既定10)で6チャンクになること。`run()` 経由でチャンクごとに異なる `usage` を返し、合算された値が周の先頭1件の記録にだけ付き(二重計上しない)、プロンプト枠に「(6回に分割。先頭の1回だけ表示)」の注記が出ること
     - Z10(PR #75 レビュー S1): 6チャンク中1つだけ429にし、残り5チャンクは成功させる。成功していた5チャンクぶんの usage が `carryUsage` に積まれること、プロンプト枠に「(6回に分割。失敗した1回を表示)」の注記が出ること(`git stash` で `Promise.allSettled` 化前のコードに戻すと落ちることを確認済み)。再開(全チャンク再送信)後、`carryUsage` の分と再送信ぶんの usage が両方とも周の先頭1件の記録に合算されること
@@ -1054,7 +1072,7 @@ new_sqlite_classes = ["RateLimitCounter"]
     - AA2: `formatMs` / `formatUsd` の書式(3桁区切り、`$0.01` 未満は有効数字2桁程度、負値・0の扱い)。`formatRoundLogLine(entry)` が「N周目: M中K正解 (P%) — 3,214 ms / $0.0004」、`formatTotalSummary()` が `state.roundLog.length` を使って「合計 12,345 ms / $0.0012(3周)」になること
     - AA3: (a) 左上から(Jev)は応答の `usage` がそのまま記録の `u` に載り、`t`(数値のレイテンシ)も付くこと。(b) 確信度順(Jev)はマス選び+数字それぞれに別の `usage` を返し、記録1件の `u` が合算(`i`/`o` それぞれの和)になること。(c) 一括(Jev、空マス2つ)は周の先頭の記録だけに `u`/`t` が付き、2件目には付かない(`undefined`)こと。vm レルムの違いにより `deepEqual` は使わず `.i`/`.o` を個別に比較する(hostRows と同じ理由)
     - AA4: `costOf(rec)` が Jev(出力無料)・`/all` と `+think` を剥がした Claude の単価(`priceModelKey`)・`ci`(入力単価の10%)・単価未設定モデル(0)・`u` の無い記録(0)を正しく計算すること(浮動小数点誤差を許容する `approxEqual` ヘルパーで比較)。`formatUsd` / `formatUsdForModel`(単価未設定に「(単価未設定)」を足す)の書式
-    - AA5: `getPrices()` の既定値(`defaultPrices()` と一致)、`setPrice()` が正の数値だけ反映し `localStorage`(`scc.prices.v1`)に保存されること、負値・非数値・未知のモデル/フィールドは無視されること、`resetPrices()` で既定値に戻ること、壊れた `localStorage`(JSON でない・配列)や不正なエントリ(負値)が既定値にフォールバックすること
+    - AA5(Issue #76 で単価パネル削除に伴い改訂): `loadPrices()` が壊れた `localStorage`(JSON でない・配列)や不正なエントリ(負値)で既定値にフォールバックすること、削除前にパネルが保存した正当な値はそのまま読み込まれること(`setPrice()`/`resetPrices()` は関数ごと削除したのでテストも削除)
     - AA6: 埋め込みモード(`embed=1`)の `render()` が `postStatus()` で `elapsedMs` / `costUsd`(いずれも数値)を `window.parent.postMessage` すること。比較シェルの `renderCompareStatusHtml("jev")` が `compareStatus.jev.elapsedMs` / `.costUsd` を `formatMs()` / `formatUsd()` で見出しに表示すること(親側では計測し直さない)
     - AA7: #55 より前の記録(`at` が無く `t` がエポックミリ秒)を読み込むと `t` → `at` に付け替わり、新しい記録の `t`(レイテンシ)はそのままであること
     - AA8: 一括モードで周の先頭マスの確定待ち中に停止 → 再開しても、先頭の記録に `u`/`t` が付くこと(`pendingAllUsage` は `commitFocused()` で消費する)

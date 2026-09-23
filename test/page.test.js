@@ -819,44 +819,44 @@ test("初期表示は固定問題のまま、newPuzzle() で GIVEN / SOLUTION �
   assert.equal(ctx.state.done, false);
 });
 
-test("難易度トグルの描画: 選択中のボタンだけにアクセントが付き、setDifficulty() で state.difficulty が変わり reset() 後も維持される", async () => {
+test("難易度トグルの描画: 選択中の <option> だけに selected が付き、setDifficulty() で state.difficulty が変わり reset() 後も維持される(Issue #76 でプルダウン化)", async () => {
   var ctx = runScript(await getPageHtml());
 
-  function difficultyToggleHtml() {
+  function difficultySelectHtml() {
     var html = ctx.renderControls();
-    var m = html.match(/<div id="difficulty-toggle">[\s\S]*?<\/div>/);
+    var m = html.match(/<select id="difficulty-toggle"[^>]*>[\s\S]*?<\/select>/);
     assert.ok(m, "difficulty-toggle が見つからない");
     return m[0];
   }
-  function activeLabels(html) {
-    var re = /<button class="difficulty-btn active"[^>]*>([^<]*)<\/button>/g;
+  function selectedLabels(html) {
+    var re = /<option value="[a-z]+" selected>([^<]*)<\/option>/g;
     var labels = [];
     var m;
     while ((m = re.exec(html)) !== null) labels.push(m[1]);
     return labels;
   }
-  function pressedState(html, label) {
-    var re = new RegExp('aria-pressed="(true|false)"[^>]*>' + label + "</button>");
+  function selectedState(html, label) {
+    var re = new RegExp('<option value="[a-z]+"( selected)?>' + label + "</option>");
     var m = html.match(re);
-    assert.ok(m, label + " ボタンの aria-pressed が見つからない");
-    return m[1];
+    assert.ok(m, label + " の <option> が見つからない");
+    return m[1] === " selected";
   }
 
   // 既定は「ふつう」(normal)
   assert.equal(ctx.state.difficulty, "normal", "既定の難易度が normal でない");
-  var html0 = difficultyToggleHtml();
-  assert.deepEqual(activeLabels(html0), ["ふつう"], "既定でふつうだけがアクセントになっていない");
-  assert.equal(pressedState(html0, "ふつう"), "true");
-  assert.equal(pressedState(html0, "やさしい"), "false");
-  assert.equal(pressedState(html0, "むずかしい"), "false");
+  var html0 = difficultySelectHtml();
+  assert.deepEqual(selectedLabels(html0), ["ふつう"], "既定でふつうだけが selected になっていない");
+  assert.equal(selectedState(html0, "ふつう"), true);
+  assert.equal(selectedState(html0, "やさしい"), false);
+  assert.equal(selectedState(html0, "むずかしい"), false);
 
   // setDifficulty('hard') で切り替わる
   ctx.setDifficulty("hard");
   assert.equal(ctx.state.difficulty, "hard");
-  var html1 = difficultyToggleHtml();
-  assert.deepEqual(activeLabels(html1), ["むずかしい"], "hard 選択後にむずかしいだけがアクセントになっていない");
-  assert.equal(pressedState(html1, "むずかしい"), "true");
-  assert.equal(pressedState(html1, "ふつう"), "false");
+  var html1 = difficultySelectHtml();
+  assert.deepEqual(selectedLabels(html1), ["むずかしい"], "hard 選択後にむずかしいだけが selected になっていない");
+  assert.equal(selectedState(html1, "むずかしい"), true);
+  assert.equal(selectedState(html1, "ふつう"), false);
 
   // reset() しても難易度は維持される(speedMode と同じ扱い。DESIGN 4.1)
   ctx.reset();
@@ -2281,7 +2281,7 @@ test("V5: モデル設定は実行中・停止中に変えられず、reset() �
   assert.equal(ctx.state.claudeModel, "claude-sonnet-5");
   assert.equal(ctx.state.claudeThinking, false);
   ctx.render();
-  assert.ok(/id="model-toggle">\s*<button[^>]*disabled/.test(ctx.appElement.innerHTML), "実行中にモデルトグルが無効化されていない");
+  assert.ok(/<select id="model-toggle"[^>]*disabled/.test(ctx.appElement.innerHTML), "実行中にモデルトグルが無効化されていない");
 
   ctx.stop();
   ctx.setModelMode("jev");
@@ -2814,10 +2814,10 @@ test("W7: 確信度順でヒートマップの背景と『マス選び: N候補�
   assert.ok(html.indexOf("マス選び:") !== -1 && html.indexOf("候補") !== -1, "『マス選び: N候補中』がパネルに出ていない");
   assert.ok(html.indexOf("背景の濃さ") !== -1, "凡例にヒートマップの説明が出ていない");
 
-  // 実行中は順番トグルが無効
-  var orderToggleMatch = html.match(/<div id="order-toggle">([\s\S]*?)<\/div>/);
+  // 実行中は順番トグルが無効(Issue #76 でプルダウン化。select 自体に disabled が付く)
+  var orderToggleMatch = html.match(/<select id="order-toggle"[^>]*>/);
   assert.ok(orderToggleMatch, "order-toggle が描画されていない");
-  assert.ok(orderToggleMatch[1].indexOf("disabled") !== -1, "実行中に順番トグルが無効化されていない");
+  assert.ok(orderToggleMatch[0].indexOf("disabled") !== -1, "実行中に順番トグルが無効化されていない");
 });
 
 test("W8: プロンプト枠は「マス選び」「数字」の2段で、マス選びの失敗(502 の request / abort)を正しく扱う", { timeout: 10000 }, async () => {
@@ -2847,7 +2847,8 @@ test("W8: プロンプト枠は「マス選び」「数字」の2段で、マス
   }, "W8: lastRequest 待ち");
   ctx.render();
   var html = ctx.appElement.innerHTML;
-  var panel = html.slice(html.indexOf('id="prompt-panel"'), html.indexOf('id="round-log"'));
+  // プロンプト枠は周回ログの後ろに回した(Issue #76)ので、次の較正パネルまでで区切る
+  var panel = html.slice(html.indexOf('id="prompt-panel"'), html.indexOf('id="calibration-panel"'));
   assert.ok(panel.indexOf("マス選び") !== -1 && panel.indexOf("数字") !== -1, "プロンプト枠に「マス選び」「数字」の見出しが無い");
   assert.equal((panel.match(/<pre class="prompt-json">/g) || []).length, 2, "プロンプト枠の <pre> が2つでない");
   assert.ok(panel.indexOf("Which empty cell") !== -1, "マス選びの instructions が出ていない");
@@ -2953,7 +2954,7 @@ test("W10: 順番トグルは停止中もロックされ、reset() / newPuzzle()
   ctx.setOrderMode("scan");
   assert.equal(ctx.state.orderMode, "confidence", "停止中に順番が切り替わった");
   ctx.render();
-  assert.ok(/id="order-toggle">\s*<button[^>]*disabled/.test(ctx.appElement.innerHTML), "停止中に順番トグルが無効化されていない");
+  assert.ok(/<select id="order-toggle"[^>]*disabled/.test(ctx.appElement.innerHTML), "停止中に順番トグルが無効化されていない");
   ctx.reset();
   assert.equal(ctx.state.orderMode, "confidence", "reset() で順番が消えた");
   ctx.newPuzzle();
@@ -4036,10 +4037,11 @@ test("Z7: URL パラメータ order=all、setOrderMode(\"all\")、比較シェ�
   ctx2.setOrderMode("all");
   assert.equal(ctx2.state.orderMode, "all", "setOrderMode(\"all\") が効かない");
   ctx2.render();
-  var orderToggleMatch = ctx2.appElement.innerHTML.match(/<div id="order-toggle">([\s\S]*?)<\/div>/);
+  // Issue #76 でプルダウン化(<select id="order-toggle"> + <option>)
+  var orderToggleMatch = ctx2.appElement.innerHTML.match(/<select id="order-toggle"[^>]*>([\s\S]*?)<\/select>/);
   assert.ok(orderToggleMatch, "order-toggle が描画されていない");
-  assert.ok(orderToggleMatch[1].indexOf("一括") !== -1, "順番トグルに「一括」ボタンが無い");
-  assert.ok(orderToggleMatch[1].indexOf("setOrderMode('all')") !== -1, "「一括」ボタンの onclick が setOrderMode('all') でない");
+  assert.ok(orderToggleMatch[1].indexOf("一括") !== -1, "順番トグルに「一括」の選択肢が無い");
+  assert.ok(orderToggleMatch[1].indexOf('<option value="all" selected>') !== -1, "「一括」が選択済みになっていない");
 
   // 比較シェル(/compare、Issue #46)の順番トグルにも「一括」がある
   var fakeDoc = makeCompareDocument();
@@ -4575,31 +4577,15 @@ test("AA4: costOf() と formatUsd()(Jev出力無料・Claudeの入力/出力単�
   assert.equal(ctx.formatUsdForModel(0.042, "typesafe/jev"), "$0.042");
 });
 
-test("AA5: 単価の保存・読み込み・既定値に戻す・不正値のフォールバック", async () => {
+test("AA5: 単価の読み込みは既定値、壊れた/不正な localStorage は既定値にフォールバックする(Issue #76: 編集 UI は削除、読み込みだけ残す)", async () => {
   var ctx = runScript(await getPageHtml());
   var defaults = ctx.defaultPrices();
   assert.deepEqual(ctx.getPrices(), defaults);
 
-  ctx.setPrice("typesafe/jev", "in", "0.1");
-  assert.equal(ctx.getPrices()["typesafe/jev"].in, 0.1, "単価の変更が反映されていない");
-  // localStorage を読み直しても残る(保存されている)
-  assert.equal(ctx.loadPrices()["typesafe/jev"].in, 0.1);
-
-  // 不正値(負・数値でない)は無視される
-  ctx.setPrice("typesafe/jev", "in", "-5");
-  assert.equal(ctx.getPrices()["typesafe/jev"].in, 0.1, "負の値が反映されてしまった");
-  ctx.setPrice("typesafe/jev", "in", "abc");
-  assert.equal(ctx.getPrices()["typesafe/jev"].in, 0.1, "数値でない値が反映されてしまった");
-
-  // 未知のモデル・フィールドは無視される
-  ctx.setPrice("unknown-model", "in", "1");
-  assert.equal(Object.prototype.hasOwnProperty.call(ctx.getPrices(), "unknown-model"), false);
-  ctx.setPrice("typesafe/jev", "bogus-field", "1");
-  assert.equal(ctx.getPrices()["typesafe/jev"].in, 0.1);
-
-  // 既定値に戻す
-  ctx.resetPrices();
-  assert.deepEqual(ctx.getPrices(), defaults);
+  // 単価を編集する UI(単価パネル)は Issue #76 で削除した。setPrice()/resetPrices() も
+  // それに伴って削除済み(呼び出し元が無くなったため)。loadPrices() 自体は、この変更より
+  // 前にパネルから保存された localStorage の値をそのまま尊重するので、読み込みの経路だけ
+  // 残して検証する。
 
   // 壊れた localStorage は既定値にフォールバックする
   ctx.localStorage.setItem("scc.prices.v1", "not json");
@@ -4612,6 +4598,10 @@ test("AA5: 単価の保存・読み込み・既定値に戻す・不正値のフ
     defaults["typesafe/jev"].in,
     "不正なエントリ(負値)が採用されてしまった"
   );
+
+  // 以前のパネルが保存した正当な値は、削除後もそのまま読み込まれる(読み込み専用の後方互換)
+  ctx.localStorage.setItem("scc.prices.v1", JSON.stringify({ "typesafe/jev": { in: 0.1, out: 0 } }));
+  assert.equal(ctx.loadPrices()["typesafe/jev"].in, 0.1, "旧パネルが保存した値が読み込まれない");
 });
 
 test("AA6: postStatus() に elapsedMs/costUsd が乗り、比較シェルの見出しに ms と $ が出る", async () => {
@@ -4846,8 +4836,9 @@ test("AA11: 「この実行の消費」パネルに累計トークン・コス�
   // formatTps(745, totalLatencyMs=1000) = 745 tok/s(演出待ちではなく API 待ち時間が分母。レビュー S1)
   assert.ok(html.indexOf("745 tok/s") !== -1, "TPS が出ていない: " + html);
   assert.ok(html.indexOf("演出の待ちは含まない") !== -1, "速度の注記が出ていない");
-  // 単価パネルは「単価の設定」であって実消費ではないことが文言でわかる
-  assert.ok(html.indexOf("単価の設定") !== -1, "単価パネルの見出しが更新されていない");
+  // 単価パネル(単価の設定)は Issue #76 で画面から削除した。消費量だけが見える
+  assert.equal(html.indexOf("単価の設定"), -1, "単価パネルが削除されずに残っている");
+  assert.equal(html.indexOf('id="prices-panel"'), -1, "prices-panel が削除されずに残っている");
 
   // reset() でトークン累計・API待ち時間も0に戻る
   ctx.reset();
