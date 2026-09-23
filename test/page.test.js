@@ -4569,3 +4569,49 @@ test("AA10: 一時的な失敗の停止でも計時が止まる。reset() で計
   assert.equal(ctx2.state.roundLog[1].ms, 300, "2周目の ms に周またぎの待ちが入っている: " + ctx2.state.roundLog[1].ms);
   assert.equal(ctx2.totalElapsedMs, 5500, "全体の ms が 200 + 5000 + 300 でない: " + ctx2.totalElapsedMs);
 });
+
+test("AA11: 「この実行の消費」パネルに累計トークン・コスト・TPSが出る(単価パネルとは別、オーナー要望 2026-09-23)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  var fakeNow = 1000;
+  ctx.nowMs = function () { return fakeNow; };
+
+  ctx.run();
+  await waitFor(function () { return af.pending.length === 1; }, "AA11: fetch 待ち");
+  var entry = af.pending.shift();
+  var body = JSON.parse(entry.init.body);
+  var res = await makeCorrectResponse(ctx, body.target.row, body.target.col, body.puzzle).json();
+  res.usage = { input_tokens: 665, output_tokens: 80 };
+  fakeNow = 2000; // 1000ms かけて応答
+  entry.resolve({ ok: true, json: function () { return Promise.resolve(res); } });
+  await waitFor(function () { return ctx.getRecords().length === 1; }, "AA11: 確定待ち");
+
+  assert.equal(ctx.totalTokensIn, 665, "totalTokensIn が積算されていない");
+  assert.equal(ctx.totalTokensOut, 80, "totalTokensOut が積算されていない");
+  assert.ok(ctx.totalCostUsd > 0, "totalCostUsd が積算されていない");
+
+  ctx.render();
+  var html = ctx.appElement.innerHTML;
+  assert.ok(html.indexOf('id="usage-panel"') !== -1, "usage-panel が描画されていない");
+  assert.ok(html.indexOf("この実行の消費") !== -1);
+  assert.ok(html.indexOf("入力 665") !== -1, "トークン数が表示に出ていない: " + html);
+  assert.ok(html.indexOf("出力 80") !== -1);
+  // formatTps(745, 1000) = 745 tok/s
+  assert.ok(html.indexOf("745 tok/s") !== -1, "TPS が出ていない");
+  // 単価パネルは「単価の設定」であって実消費ではないことが文言でわかる
+  assert.ok(html.indexOf("単価の設定") !== -1, "単価パネルの見出しが更新されていない");
+
+  // reset() でトークン累計も0に戻る
+  ctx.reset();
+  assert.equal(ctx.totalTokensIn, 0);
+  assert.equal(ctx.totalTokensOut, 0);
+});
+
+test("AA12: formatTps() はトークンが無い・経過が短すぎるとき「—」を返す", async () => {
+  var ctx = runScript(await getPageHtml(), {});
+  assert.equal(ctx.formatTps(0, 5000), "—");
+  assert.equal(ctx.formatTps(100, 0), "—");
+  assert.equal(ctx.formatTps(100, 199), "—");
+  assert.equal(ctx.formatTps(1000, 1000), "1,000 tok/s");
+  assert.equal(ctx.formatTps(745, 1000), "745 tok/s");
+});

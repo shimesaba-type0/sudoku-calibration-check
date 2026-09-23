@@ -442,6 +442,9 @@ var roundElapsedMs = 0;         // 今の周で最初のリクエストを送っ
 var roundStarted = false;       // 今の周でまだ最初のリクエストを送っていないか
 var totalCostUsd = 0;           // この実行(reset() されるまで)の累計コスト
 var roundCostUsd = 0;           // 今の周の累計コスト
+var totalTokensIn = 0;          // この実行の累計入力トークン数(オーナー追加要望 2026-09-23。
+                                 // renderUsagePanel() が表示する)
+var totalTokensOut = 0;         // この実行の累計出力トークン数
 var pendingAllUsage = null;     // 一括モード(#48)の周の先頭1件に usage/レイテンシを付けるための
                                  // 一時置き場(askAllRound() が立て、commitFocused() が周の
                                  // 先頭1件の確定時に消費して null に戻す)
@@ -458,7 +461,7 @@ var compareGenerating = false;  // 「新しい問題」(比較シェル版)で�
 - `pauseClock()`: `haltRun()`(手動 `stop()` / 一時的な失敗による停止)・`showError()` で呼ぶ。走っている区間の分を両方の累計に足し込み、`runningSince` を `null` にする(周の積算 `roundElapsedMs` はリセットしない = 再開すれば続きから測れる)
 - `closeRoundClock(keepRunning)`: `finalizeRound()` の周回ログを積む直前に呼ぶ。走っている区間の分を足し込んでからその周の最終値を返し、`roundElapsedMs` / `roundStarted` を次の周のためにリセットする。`keepRunning`(次の周へ続くか)が true なら `runningSince` を今に付け替え(全体の計測は継続)、false(完了/強制終了)なら `null` にする
 
-コスト(`totalCostUsd` / `roundCostUsd`)は `commitFocused()` が記録を1件追記するたびに `costOf(record)` を両方へ足し込む(時間の計測とは独立)。いずれも `run()`(初回のみ)/ `reset()` で0に戻し、`newPuzzle()` は内部で `reset()` を呼ぶので同様に0に戻る。
+コスト(`totalCostUsd` / `roundCostUsd`)は `commitFocused()` が記録を1件追記するたびに `costOf(record)` を両方へ足し込む(時間の計測とは独立)。いずれも `run()`(初回のみ)/ `reset()` で0に戻し、`newPuzzle()` は内部で `reset()` を呼ぶので同様に0に戻る。`totalTokensIn` / `totalTokensOut` も同じタイミング(`record.u` があるときだけ)で足し込み、同じく0に戻る。
 
 **`readUrlOptions()` の結果(Issue #46)。** 通常ページ(`GET /`、`location.pathname !== "/compare"`)は起動時に一度だけ `location.search` を読み、`applyUrlOptions()` で次のように反映する。`localStorage` の設定より優先するが、`localStorage` には一切書き戻さない(通常ページの設定を汚さないため。`saveClaudeSettings()` を呼ばない)。
 
@@ -590,6 +593,8 @@ var compareGenerating = false;  // 「新しい問題」(比較シェル版)で�
 | `priceModelKey(m)` / `isPricedModel(m)` / `costOf(rec)` | `priceModelKey()` は記録の `m` から `/all`・`+think` を外して単価テーブルのキーに正規化する。`costOf(rec)` は `rec.u` が無い、または単価が見つからないモデルなら 0 を返す純関数 |
 | `toRecordUsage(usage)` / `combineRecordUsage(a, b)` | Jev/Claude の `usage`(`{ input_tokens, output_tokens, cache_read_input_tokens? }`)を記録の形(`{ i, o, ci? }`)に変換・合算する。`combineRecordUsage` は確信度順(マス選び+数字)で使う |
 | `extractClaudeUsage(data)` | Claude(Anthropic Messages API)の応答から `usage` を取り出す。Worker の `extractUsage`(3.3)と同じ考え方で、欠けている・壊れていれば `undefined`(判定結果の検証には影響させない) |
+| `renderUsagePanel()` | 「この実行の消費」パネル(SPEC F1、Issue #55・#56。オーナー追加要望 2026-09-23)。`renderPricesPanel()` のすぐ上に置く。トークン(`totalTokensIn` / `totalTokensOut`)・コスト(`formatUsdForModel(totalCostUsd, activeModelIdForPricing())`)・速度(`formatTps(totalTokensIn + totalTokensOut, currentTotalElapsedMs())`)の3行 |
+| `formatTps(tokens, elapsedMs)` | 平均トークン/秒。`tokens` が0以下、または `elapsedMs` が200未満なら "—"(値が暴れるため)。それ以外は `formatThousands(Math.round(tokens / (elapsedMs / 1000))) + " tok/s"` |
 | `renderPricesPanel()` | 単価パネル(SPEC F1)。モデルごとの入力/出力単価の `<input type="number">` と「既定値に戻す」ボタン。Claude モードに限らず常時表示する |
 
 ### 4.3 状態遷移(1マス)
@@ -961,7 +966,7 @@ new_sqlite_classes = ["RateLimitCounter"]
     - Z6: 2周目の一括は不正解マスだけを候補にする(`buildSelectionSnapshot()` で空マスがその1マスだけになる)こと。周回ログの形式は従来どおり
     - Z7: URL `order=all` で `state.orderMode` が `"all"` になること、`setOrderMode("all")` が効き順番トグルに「一括」ボタン(`onclick="setOrderMode('all')"`)が出ること。比較シェル(`/compare`)の順番トグルにも「一括」があり、`compareSetOrderMode("all")` で `state.orderMode` が変わり `compareIframeSrc()` の組み立てに `order=all` が反映されること
     - Z8: Claude 経路の一括で全マスが確定し、記録の `m` が `claude-opus-5+think/all`・`o` が `"all"` になること、キーが DOM に出ないこと。Jev 経路で `cells` に対象マスが欠けた応答は、1 マスも確定・記録せず `queue` も減らさずにエラー停止すること(`askAllRound` がキャッシュに入れる前に queue の全キーを確かめる)
-  - **計時・コスト**(`test/page.test.js` AA1〜AA10、Issue #55・#56)。S/T/W/Y/Z 系と同じ `runScript` / `makeAbortAwareFetch` / `waitFor` を使う。`ctx.nowMs = function(){...}` で `Date.now()` を差し替え(`RECORDS_MAX` の上書きと同じパターン)、実時間を待たずに確定値で検証する。`blankCells(solved, cells)` を新設(`ANSWER_KEY` の指定セルだけを `"."` にした81文字の盤面を作り、`applyPuzzleFromString()` で空マス数の少ない盤面に差し替えて周を短く終わらせる)
+  - **計時・コスト**(`test/page.test.js` AA1〜AA12、Issue #55・#56)。S/T/W/Y/Z 系と同じ `runScript` / `makeAbortAwareFetch` / `waitFor` を使う。`ctx.nowMs = function(){...}` で `Date.now()` を差し替え(`RECORDS_MAX` の上書きと同じパターン)、実時間を待たずに確定値で検証する。`blankCells(solved, cells)` を新設(`ANSWER_KEY` の指定セルだけを `"."` にした81文字の盤面を作り、`applyPuzzleFromString()` で空マス数の少ない盤面に差し替えて周を短く終わらせる)
     - AA1: 空マス2つの盤面で `run()` → 1マス目確定 → 2マス目 in-flight のまま `nowMs` を進めて `stop()`(この時点で `totalElapsedMs` / `roundElapsedMs` が期待どおりの値になること、`runningSince` が `null` になること)→ 停止中にさらに `nowMs` を進める(3600ms 相当)→ `run()` で再開(`runningSince` が再開時刻に付け替わること)→ 2マス目を確定して完了。`state.roundLog[0].ms` と `totalElapsedMs` が、停止中の分を除いた合計(400ms + 200ms = 600ms)になること、`roundElapsedMs` が完了後に0へ戻っていること
     - AA2: `formatMs` / `formatUsd` の書式(3桁区切り、`$0.01` 未満は有効数字2桁程度、負値・0の扱い)。`formatRoundLogLine(entry)` が「N周目: M中K正解 (P%) — 3,214 ms / $0.0004」、`formatTotalSummary()` が `state.roundLog.length` を使って「合計 12,345 ms / $0.0012(3周)」になること
     - AA3: (a) 左上から(Jev)は応答の `usage` がそのまま記録の `u` に載り、`t`(数値のレイテンシ)も付くこと。(b) 確信度順(Jev)はマス選び+数字それぞれに別の `usage` を返し、記録1件の `u` が合算(`i`/`o` それぞれの和)になること。(c) 一括(Jev、空マス2つ)は周の先頭の記録だけに `u`/`t` が付き、2件目には付かない(`undefined`)こと。vm レルムの違いにより `deepEqual` は使わず `.i`/`.o` を個別に比較する(hostRows と同じ理由)
@@ -972,5 +977,7 @@ new_sqlite_classes = ["RateLimitCounter"]
     - AA8: 一括モードで周の先頭マスの確定待ち中に停止 → 再開しても、先頭の記録に `u`/`t` が付くこと(`pendingAllUsage` は `commitFocused()` で消費する)
     - AA9: 確信度順で数字判定の in-flight 中に停止 → 再開すると、届いていたマス選びぶんの `usage` が持ち越され、記録 1 件の `u` が「マス選び 2 回 + 数字 1 回」の和になること
     - AA10: 一時的な失敗(429)の停止でも計時が止まり `runningSince` が `null` になること、`reset()` で計時とコストが 0 に戻ること、周をまたぐ待ち時間は全体にだけ入り次の周の `ms` に入らないこと
+    - AA11: `renderUsagePanel()` に累計トークン・コスト・TPS が出ること(オーナー追加要望 2026-09-23)、`reset()` でトークン累計も 0 に戻ること
+    - AA12: `formatTps()` の境界(トークン0、経過200ms未満は "—"。それ以外は四捨五入した tok/s)
 - E2E モック(`scripts/e2e/smoke.mjs`)の `/api/judge` 応答(`digit` / `cell` / `all` すべて)に固定の `usage`(`{ input_tokens, output_tokens }`)を足し、周回ログの1行目(`[2]` `[7]` `[9]` `[8]`)に `— <N,NNN> ms / $<...>` の形が出ることをチェックに追加した(Issue #55・#56)
 - CI(`.github/workflows/ci.yml`)は push と PR で `npm ci` → `npm test` → `npm run check` を実行する。`check` は `wrangler deploy --dry-run` で、認証なしで動く
