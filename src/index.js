@@ -61,6 +61,14 @@ var ASK_ALL = "all";
 // ask が未知の値だったときの 400 の文言(validateInput と handleJudge の保険で共用する)。
 var ASK_ERROR = "askはdigit・cell・where・allのいずれかである必要があります";
 
+// exclude(消去法。Issue #61)の 400 の文言。前の周で不正解だった数字を criteria から
+// 外して聞くための任意フィールドで、外した数字だけを送る(正解は送らない)。
+var EXCLUDE_ERROR = 'excludeは"1"〜"9"の文字列の配列である必要があります';
+var EXCLUDE_DUPLICATE_ERROR = "excludeに同じ数字が重複しています";
+var EXCLUDE_ALL_ERROR = "excludeで全部の数字を外すことはできません";
+var EXCLUDE_MAP_ERROR = 'ask:allのexcludeはマスのキー("r0c2")ごとの配列を持つオブジェクトである必要があります';
+var EXCLUDE_KEY_ERROR = 'ask:allのexcludeのキーは盤面の空マス("r0c2"形式)である必要があります';
+
 // ask:"cell" 用の固定文。NOTE と同じくルールを伝えるための説明だが、target が無く、
 // 代わりに空マスの一覧が criteria として与えられることを伝える。NOTE の文面は変えない。
 var CELL_NOTE =
@@ -488,6 +496,71 @@ function emptyCells(puzzle) {
 }
 
 /**
+ * exclude(外す数字の配列)を検証し、**残る数字**(1〜9 のうち外されなかったもの、昇順)を
+ * 返す(消去法。Issue #61)。戻り値は `{ digits }` か `{ error }`。
+ *
+ * - 省略(`undefined`)・空配列は「1つも外さない」= 1〜9 全部(省略時とまったく同じ payload)
+ * - 配列でない(`null` を含む)/ 要素が "1"〜"9" の文字列でない / 同じ数字が2回 → 400
+ * - 9個すべてを外すのは不可(聞く選択肢が無くなるため)→ 400
+ *
+ * 副作用の無い純粋関数なので、validateInput(400 の判定)と handleJudge(criteria の
+ * 組み立て)の両方から呼んでよい。
+ */
+function readExcludeList(value) {
+  if (value === undefined) return { digits: DIGITS.slice() };
+  if (!Array.isArray(value)) return { error: EXCLUDE_ERROR };
+
+  var seen = {};
+  for (var i = 0; i < value.length; i++) {
+    var digit = value[i];
+    if (typeof digit !== "string" || DIGITS.indexOf(digit) === -1) return { error: EXCLUDE_ERROR };
+    if (seen[digit] === true) return { error: EXCLUDE_DUPLICATE_ERROR };
+    seen[digit] = true;
+  }
+
+  var remaining = [];
+  for (var d = 0; d < DIGITS.length; d++) {
+    if (seen[DIGITS[d]] !== true) remaining.push(DIGITS[d]);
+  }
+  if (remaining.length === 0) return { error: EXCLUDE_ALL_ERROR };
+  return { digits: remaining };
+}
+
+/**
+ * ask:"all" の exclude(マスごとの「外す数字」。Issue #61)を検証し、
+ * **残る数字がマスごとに違うマスだけ** を `{ "r0c2": ["1","2",...], ... }` の形で返す。
+ * 戻り値は `{ byKey }` か `{ error }`。
+ *
+ * - キーは盤面の **空マス** のキー("r" + row + "c" + col)でなければ 400
+ *   (埋まっているマスは質問にならないので、黙って無視せず弾く)
+ * - 各値の規則は `readExcludeList` と同じ。1つも外さないマス(空配列)は `byKey` に載せず、
+ *   共通の 1〜9 の criteria を使い回させる(省略時と同じ payload になる)
+ */
+function readExcludeMap(value, puzzle) {
+  if (value === undefined) return { byKey: {} };
+  if (value === null || typeof value !== "object" || Array.isArray(value)) {
+    return { error: EXCLUDE_MAP_ERROR };
+  }
+
+  var cells = emptyCells(puzzle);
+  var isEmptyCell = {};
+  for (var c = 0; c < cells.length; c++) isEmptyCell[cells[c].key] = true;
+
+  var byKey = {};
+  var keys = Object.keys(value);
+  for (var k = 0; k < keys.length; k++) {
+    var key = keys[k];
+    if (isEmptyCell[key] !== true) return { error: EXCLUDE_KEY_ERROR };
+    var one = readExcludeList(value[key]);
+    if (one.error !== undefined) return { error: one.error };
+    // 1つも外していないマスは共通の criteria のままにする(空配列は省略と同じ扱い)
+    if (one.digits.length === DIGITS.length) continue;
+    byKey[key] = one.digits;
+  }
+  return { byKey: byKey };
+}
+
+/**
  * 入力検証(docs/DESIGN.md 3.3 手順3)。
  * 問題なければ null、不備があれば日本語の理由を返す。
  *
@@ -542,10 +615,31 @@ function validateInput(body, ask) {
     return "ask:allではdigitを指定できません";
   }
 
+  // exclude(消去法。Issue #61)は「そのマスに入る数字」を聞く質問(digit / all)だけのもの。
+  // cell(マス選び)/ where(数字ごと)は候補が数字ではないので、付いていたら 400 にする
+  // (target / digit の禁止と同じく、undefined 以外は null でも「付いている」扱い)。
+  if (ask === ASK_CELL && body.exclude !== undefined) {
+    return "ask:cellではexcludeを指定できません";
+  }
+  if (ask === ASK_WHERE && body.exclude !== undefined) {
+    return "ask:whereではexcludeを指定できません";
+  }
+
   for (var r = 0; r < 9; r++) {
     if (typeof puzzle[r] !== "string" || !CELL_PATTERN.test(puzzle[r])) {
       return "puzzleの各行は1〜9と.だけからなる9文字の文字列である必要があります";
     }
+  }
+
+  // exclude の中身(Issue #61)。digit は数字の配列、all はマス(空マスのキー)ごとの配列。
+  // all のキーが空マスかどうかを盤面で見るので、各行の形式を確かめた後で検証する。
+  if (ask === ASK_DIGIT) {
+    var excluded = readExcludeList(body.exclude);
+    if (excluded.error !== undefined) return excluded.error;
+  }
+  if (ask === ASK_ALL) {
+    var excludedAll = readExcludeMap(body.exclude, puzzle);
+    if (excludedAll.error !== undefined) return excludedAll.error;
   }
 
   if (ask === ASK_DIGIT) {
@@ -646,10 +740,14 @@ function allCellMessages(templates, key) {
   return messages;
 }
 
-/** digit / all の質問に共通の criteria(1〜9)を criteria に詰める。 */
-function fillDigitCriteria(criteria) {
-  for (var i = 0; i < DIGITS.length; i++) {
-    criteria[DIGITS[i]] = "the digit " + DIGITS[i];
+/**
+ * digit / all の質問の criteria を criteria に詰める。`digits` を省略すると 1〜9 全部、
+ * 渡すとその数字だけ(exclude で外した残り。Issue #61)。
+ */
+function fillDigitCriteria(criteria, digits) {
+  var list = digits === undefined ? DIGITS : digits;
+  for (var i = 0; i < list.length; i++) {
+    criteria[list[i]] = "the digit " + list[i];
   }
   return criteria;
 }
@@ -666,16 +764,21 @@ function checkAnswerKeys(answers, expectedKeys, message) {
 /**
  * ask:"all" の回答(空マスの数だけ choice の回答が並んだもの)を検証する(Issue #48)。
  * `answers` のキー集合が `expectedKeys`(空マスのキー)と **ちょうど一致**(個数と各キー)し、
- * 各回答が digit と同じ基準(`validateAnswer(answer, DIGITS, ...)`)を満たすこと。
+ * 各回答が digit と同じ基準(`validateAnswer(answer, digits, ...)`)を満たすこと。
+ * `digitsByKey` は exclude(Issue #61)で候補を絞ったマスだけの「残りの数字」
+ * (`{ "r0c2": ["1","2",...] }`)。載っていないマスは 1〜9(DIGITS)で検証する。
  * 問題なければ null、不備があれば日本語の理由を返す。マス単位の不備は
  * 「どのマスで落ちたか」が分かる文言になる(ANSWER_MESSAGES.all)。
  */
-function validateAllAnswers(answers, expectedKeys, messages) {
+function validateAllAnswers(answers, expectedKeys, digitsByKey, messages) {
   var badKeys = checkAnswerKeys(answers, expectedKeys, messages.keys);
   if (badKeys !== null) return badKeys;
   for (var i = 0; i < expectedKeys.length; i++) {
     var expected = expectedKeys[i];
-    var bad = validateAnswer(answers[expected], DIGITS, allCellMessages(messages.cell, expected));
+    var digits = Object.prototype.hasOwnProperty.call(digitsByKey, expected)
+      ? digitsByKey[expected]
+      : DIGITS;
+    var bad = validateAnswer(answers[expected], digits, allCellMessages(messages.cell, expected));
     if (bad !== null) return bad;
   }
   return null;
@@ -855,21 +958,30 @@ async function handleJudge(request, env) {
   var expectedKeys = [];
   var payload;
   var cellsByKey = null;
+  // ask:"all" で exclude(Issue #61)により候補を絞ったマスだけの「残りの数字」。
+  var digitsByKey = {};
 
   if (ask === ASK_ALL) {
     // 一括: 空マスごとに choice の質問を1つ作り、「そのマスに入る数字」を1回でまとめて
     // 聞く(Issue #48)。criteria は digit 経路と同じ 1〜9 で、質問ごとに同じオブジェクトを
     // 使い回す(`request` にそのまま載るので JSON にできる形のまま)。
     // target は渡さない(残りの全マスに聞く質問なので、対象マスが存在しない)。
+    // exclude(Issue #61)で数字を外したマスだけは、残りの数字だけの別の criteria にする
+    // (validateInput が通っているので readExcludeMap はここでは必ず成功する)。
     fillDigitCriteria(criteria);
+    var excludeByKey = readExcludeMap(body.exclude, body.puzzle).byKey;
     var allCells = emptyCells(body.puzzle);
     var allQuestions = {};
     for (var k = 0; k < allCells.length; k++) {
       var allCell = allCells[k];
+      var cellDigits = Object.prototype.hasOwnProperty.call(excludeByKey, allCell.key)
+        ? excludeByKey[allCell.key]
+        : undefined;
+      if (cellDigits !== undefined) digitsByKey[allCell.key] = cellDigits;
       allQuestions[allCell.key] = {
         type: "choice",
         instructions: allInstructions(allCell.row, allCell.col),
-        criteria: criteria,
+        criteria: cellDigits === undefined ? criteria : fillDigitCriteria({}, cellDigits),
       };
       expectedKeys.push(allCell.key);
     }
@@ -927,9 +1039,12 @@ async function handleJudge(request, env) {
       },
     };
   } else if (ask === ASK_DIGIT) {
-    fillDigitCriteria(criteria);
-    for (var i = 0; i < DIGITS.length; i++) {
-      expectedKeys.push(DIGITS[i]);
+    // exclude(Issue #61)で外した数字は criteria からも expectedKeys からも落とす。
+    // 省略・空配列なら 1〜9 全部で従来とまったく同じ payload になる。
+    var digitChoices = readExcludeList(body.exclude).digits;
+    fillDigitCriteria(criteria, digitChoices);
+    for (var i = 0; i < digitChoices.length; i++) {
+      expectedKeys.push(digitChoices[i]);
     }
     payload = {
       state: {
@@ -979,7 +1094,7 @@ async function handleJudge(request, env) {
       badAnswer = extractedAll.error;
     } else {
       answers = extractedAll.answers;
-      badAnswer = validateAllAnswers(answers, expectedKeys, ANSWER_MESSAGES[ask]);
+      badAnswer = validateAllAnswers(answers, expectedKeys, digitsByKey, ANSWER_MESSAGES[ask]);
     }
   } else if (ask === ASK_WHERE) {
     var extractedWhere = extractAnswers(result);
