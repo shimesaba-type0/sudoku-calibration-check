@@ -4380,3 +4380,25 @@ test("AA6: postStatus() に elapsedMs/costUsd が乗り、比較シェルの見�
   assert.ok(html.indexOf("12,345 ms") !== -1, "比較シェルの見出しに ms 表記が出ていない: " + html);
   assert.ok(html.indexOf("$0.0012") !== -1, "比較シェルの見出しに $ 表記が出ていない: " + html);
 });
+
+test("AA7: #55 より前の記録(t がエポックミリ秒)は読み込み時に t → at に付け替え、新しい記録の t(レイテンシ)はそのまま", async () => {
+  var legacy = [
+    { t: 1758500000000, p: "x", r: 0, c: 2, round: 1, choice: "4", pc: 0.6, conf: 0.3, ok: true, m: "typesafe/jev" },
+    { at: 1758500001000, t: 1234, u: { i: 665, o: 80 }, p: "x", r: 0, c: 3, round: 1, choice: "6", pc: 0.5, conf: 0.2, ok: true, m: "typesafe/jev" },
+  ];
+  var store = {};
+  store["scc.records.v1"] = JSON.stringify(legacy);
+  var ctx = runScript(await getPageHtml(), {
+    localStorage: {
+      getItem: function (k) { return Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null; },
+      setItem: function (k, v) { store[k] = String(v); },
+      removeItem: function (k) { delete store[k]; },
+    },
+  });
+  var recs = ctx.getRecords();
+  assert.equal(recs.length, 2);
+  assert.equal(recs[0].at, 1758500000000, "古い記録の t が at に移っていない");
+  assert.equal(recs[0].t, undefined, "古い記録の t(時刻)がレイテンシとして残っている");
+  assert.equal(recs[1].at, 1758500001000);
+  assert.equal(recs[1].t, 1234, "新しい記録の t(レイテンシ)が変わった");
+});

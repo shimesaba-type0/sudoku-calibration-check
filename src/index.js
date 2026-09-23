@@ -3016,11 +3016,28 @@ var PAGE_HTML = `<!doctype html>
         stashBrokenRecords(raw);
         return { ok: true, records: [] };
       }
+      migrateLegacyRecordTimestamps(parsed);
       return { ok: true, records: parsed };
     } catch (e) {
       // getItem 自体が例外を投げた場合。中身が読めていないので「読めなかった」として扱う。
       return { ok: false, records: [] };
     }
+  }
+
+  // #55 より前の記録は「記録した時刻」を t(エポックミリ秒)に持っていた。#55 で t を
+  // 「呼び出しのレイテンシ(ミリ秒)」に転用し、時刻は at に移したので、古い記録は読み込み時に
+  // t → at に付け替える(レイテンシと取り違えてエクスポートやコスト集計に混ざらないように)。
+  // 判定基準: at が無く、t がエポックらしい大きさ(1e11 以上 ≒ 1973 年以降)のとき。
+  function migrateLegacyRecordTimestamps(records) {
+    for (var i = 0; i < records.length; i++) {
+      var rec = records[i];
+      if (!rec || typeof rec !== "object") continue;
+      if (rec.at === undefined && typeof rec.t === "number" && rec.t >= 1e11) {
+        rec.at = rec.t;
+        delete rec.t;
+      }
+    }
+    return records;
   }
 
   // records を正本(localStorage)に書き込み、キャッシュも同期する。
