@@ -4636,14 +4636,19 @@ var PAGE_HTML = `<!doctype html>
   // 「この実行の消費」パネル(Issue #55・#56。オーナー追加要望 2026-09-23: 単価パネルは
   // レートの「定義」であって、いま実際にどれだけ消費したかが見えないという指摘への対応)。
   // 単価パネルのすぐ上に置き、同じ場所を見れば「単価の定義」と「実消費」が両方わかるようにする。
+  // 速度(tok/s)は「最速」モードのときだけ出す(オーナー追加要望 2026-09-23。「じっくり確認」は
+  // 意図的に待ち時間を挟むモードなので、速度の実測値を見る意味が薄い)。
   function renderUsagePanel() {
     var tokensIn = totalTokensIn;
     var tokensOut = totalTokensOut;
+    var speedLine = state.speedMode === "fast"
+      ? "<p class=\\"usage-row\\">速度: " + formatTps(tokensIn + tokensOut, totalLatencyMs) + "(API待ち時間ぶんの平均。演出の待ちは含まない)</p>"
+      : "";
     return "<div id=\\"usage-panel\\" class=\\"panel\\">" +
       "<p class=\\"panel-title\\">この実行の消費</p>" +
       "<p class=\\"usage-row\\">トークン: 入力 " + formatThousands(tokensIn) + " / 出力 " + formatThousands(tokensOut) + "</p>" +
       "<p class=\\"usage-row\\">コスト: " + formatUsdForModel(totalCostUsd, activeModelIdForPricing()) + "</p>" +
-      "<p class=\\"usage-row\\">速度: " + formatTps(tokensIn + tokensOut, totalLatencyMs) + "(API待ち時間ぶんの平均。演出の待ちは含まない)</p>" +
+      speedLine +
       "</div>";
   }
 

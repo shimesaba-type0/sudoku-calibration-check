@@ -4583,9 +4583,10 @@ test("AA10: 一時的な失敗の停止でも計時が止まる。reset() で計
   assert.equal(ctx2.totalElapsedMs, 5500, "全体の ms が 200 + 5000 + 300 でない: " + ctx2.totalElapsedMs);
 });
 
-test("AA11: 「この実行の消費」パネルに累計トークン・コスト・TPSが出る(単価パネルとは別、オーナー要望 2026-09-23)", { timeout: 10000 }, async () => {
+test("AA11: 「この実行の消費」パネルに累計トークン・コスト・TPSが出る(単価パネルとは別、オーナー要望 2026-09-23)。速度(tok/s)は「最速」モードのときだけ出る", { timeout: 10000 }, async () => {
   var af = makeAbortAwareFetch();
   var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.setSpeed("fast"); // 速度の行は「最速」だけに出す(オーナー追加要望 2026-09-23)
   var fakeNow = 1000;
   ctx.nowMs = function () { return fakeNow; };
 
@@ -4621,6 +4622,23 @@ test("AA11: 「この実行の消費」パネルに累計トークン・コス�
   assert.equal(ctx.totalTokensIn, 0);
   assert.equal(ctx.totalTokensOut, 0);
   assert.equal(ctx.totalLatencyMs, 0);
+
+  // 「じっくり確認」(既定)では速度の行を出さない(トークン・コストは出す)
+  var af2 = makeAbortAwareFetch();
+  var ctx2 = runScript(await getPageHtml(), { fetch: af2.fetch });
+  assert.equal(ctx2.state.speedMode, "slow", "既定はじっくり確認のはず");
+  ctx2.run();
+  await waitFor(function () { return af2.pending.length === 1; }, "AA11: じっくり確認の fetch 待ち");
+  var entry2 = af2.pending.shift();
+  var body2 = JSON.parse(entry2.init.body);
+  var res2 = await makeCorrectResponse(ctx2, body2.target.row, body2.target.col, body2.puzzle).json();
+  res2.usage = { input_tokens: 100, output_tokens: 10 };
+  entry2.resolve({ ok: true, json: function () { return Promise.resolve(res2); } });
+  await waitFor(function () { return ctx2.getRecords().length === 1; }, "AA11: じっくり確認の確定待ち");
+  ctx2.render();
+  var html2 = ctx2.appElement.innerHTML;
+  assert.ok(html2.indexOf("入力 100") !== -1, "じっくり確認でもトークン数は出るはず: " + html2);
+  assert.equal(html2.indexOf("tok/s"), -1, "じっくり確認モードなのに速度(tok/s)の行が出ている: " + html2);
 });
 
 test("AA13: 一括モードでも totalTokensIn/totalTokensOut/totalLatencyMs は周の先頭1件ぶんだけ積算される(二重計上しない、レビュー N4)", { timeout: 10000 }, async () => {
