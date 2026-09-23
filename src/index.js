@@ -1330,6 +1330,10 @@ var PAGE_HTML = `<!doctype html>
     padding: 14px 16px;
   }
   .panel-title { font-size: 12px; color: var(--muted); margin: 0 0 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+  /* 「現在の判定」見出し行の右の空きスペースに経過時間を出す(Issue #80)。*/
+  .panel-title-row { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; margin: 0 0 8px; }
+  .panel-title-row .panel-title { margin: 0; }
+  .panel-title-elapsed { font-size: 12px; font-family: "IBM Plex Mono", monospace; color: var(--muted); white-space: nowrap; }
 
   .controls { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
   button {
@@ -1436,7 +1440,6 @@ var PAGE_HTML = `<!doctype html>
   #round-log li { font-size: 12px; font-family: "IBM Plex Mono", monospace; color: var(--muted); }
   #round-log li.round-log-total { color: var(--text); font-weight: 600; }
   #round-log li.round-log-limit { color: var(--incorrect); }
-  .elapsed-line { margin-top: 8px; }
 
   .banner { border-radius: 8px; padding: 12px 14px; font-size: 14px; font-weight: 600; margin-bottom: 14px; }
   .banner.success { background: var(--correct-bg); color: var(--correct); border: 1px solid var(--correct); }
@@ -1457,6 +1460,9 @@ var PAGE_HTML = `<!doctype html>
   .compare-status h2 { margin: 0 0 4px; font-size: 14px; font-family: "IBM Plex Mono", monospace; }
   .compare-meta { color: var(--muted); font-size: 12px; }
   .compare-notice { color: var(--incorrect); font-size: 12px; margin-top: 4px; }
+  /* 「Claude が動いているか分からない」対応(Issue #80)。.prompt-json/.prompt-details は
+     既存のスタイル(1432行目あたり)をそのまま使うので、ここでは上のマージンだけ足す。*/
+  .compare-prompt { margin-top: 8px; }
   .compare-frame { width: 100%; height: 1100px; border: 1px solid var(--panel-border); border-radius: 10px; background: var(--panel-bg); }
 
   @media (max-width: 900px) {
@@ -2221,7 +2227,10 @@ var PAGE_HTML = `<!doctype html>
                               // run() / reset() / newPuzzle() / stop() で null に戻る
     historyMode: true,        // 消去法(履歴、Issue #61)のトグル。既定あり。orderMode と同じく
                               // modelSettingsLocked() でロックし、reset() / newPuzzle() をまたいで保持する
-    ruleMode: true            // ルール候補(消去法、Issue #63)のトグル。既定あり。historyMode と同じ扱い
+    ruleMode: true,           // ルール候補(消去法、Issue #63)のトグル。既定あり。historyMode と同じ扱い
+    instantMode: false        // 一括+最速の「描画省略」トグル(Issue #80)。orderMode==="all" かつ
+                              // speedMode==="fast" のときだけ選べる(renderControls() で無効化)。
+                              // 有効なら commitAllInstant() が1マスずつの render() を挟まず一気に確定する
   };
   // 描画に不要な進行管理はモジュール変数(docs/DESIGN.md 4.1)
   var queue = [];
@@ -2811,6 +2820,16 @@ var PAGE_HTML = `<!doctype html>
   function setRuleMode(on) {
     if (modelSettingsLocked()) return;
     state.ruleMode = !!on;
+    render();
+  }
+
+  // 一括+最速の「描画省略」トグル(Issue #80)。ロック条件は他の周番系トグルと同じ
+  // (周の途中で切り替えると、その周だけ演出ありなしが混ざって分かりにくくなるため)。
+  // orderMode/speedMode の組み合わせが合わないときは renderControls() が select 自体を
+  // 無効化するが、直接呼ばれても安全なように commitAllInstant() 側でも再確認する。
+  function setInstantMode(on) {
+    if (modelSettingsLocked()) return;
+    state.instantMode = !!on;
     render();
   }
 
@@ -3606,6 +3625,8 @@ var PAGE_HTML = `<!doctype html>
   // 一括モード(Issue #48)の周の入口。allResults(この周のキャッシュ)がまだ無ければ
   // askAllRound() で1回だけ呼び、届いたら1マスずつ focusCellFromCache() へ渡す。
   // 既にキャッシュがある(= 応答済み、または停止/再開で戻ってきた)ならすぐ次のマスへ。
+  // 「描画省略」(Issue #80、一括+最速だけで選べる)が有効なら、1マスずつではなく
+  // commitAllInstant() でこの周の残り全マスを一気に確定する。
   function focusNextAll(token) {
     if (queue.length === 0) {
       finalizeRound();
@@ -3615,8 +3636,32 @@ var PAGE_HTML = `<!doctype html>
       askAllRound(token);
       return;
     }
+    if (state.instantMode && state.speedMode === "fast") {
+      commitAllInstant();
+      return;
+    }
     var cell = queue.shift();
     focusCellFromCache(cell, token);
+  }
+
+  // 一括+最速の「描画省略」(Issue #80)。focusCellFromCache() の「フォーカス→バー表示→
+  // 確定→次へ」(render() を挟む)をせず、この周の残り全マスを同期ループでまとめて
+  // commitJudgment() する。allResults から judgeCell を呼ばずに読むだけの一括モードの
+  // 性質上、ループの途中で fetch や setTimeout による割り込みは起きない(同期処理)ので、
+  // 呼び出し元(focusNextAll)が isCurrent(token) を確認済みであれば token の再チェックは
+  // 不要(引数を取らない)。
+  function commitAllInstant() {
+    while (queue.length > 0) {
+      var cell = queue.shift();
+      var key = cell.r + "-" + cell.c;
+      var result = allResults ? allResults[key] : null;
+      if (!result) {
+        showError("一括の結果に対象マスがありません: " + key);
+        return;
+      }
+      commitJudgment(cell.r, cell.c, result.choice, result.confidence, result.probabilities, undefined, 0);
+    }
+    finalizeRound();
   }
 
   // 一括モードの周ぶんの呼び出し。応答は "r0c2" 形式のキーで届くので "r-c" 形式に
@@ -3742,8 +3787,24 @@ var PAGE_HTML = `<!doctype html>
     var key = r + "-" + c;
     // 確定待ちのマスが、いまフォーカスしているマスと違うなら何もしない
     if (state.focusedKey !== key) return;
-    var correct = pendingCommit.choice === SOLUTION[r][c];
-    state.values[key] = { value: pendingCommit.choice, status: correct ? "correct" : "incorrect" };
+    commitJudgment(r, c, pendingCommit.choice, pendingCommit.confidence, pendingCommit.probabilities, pendingCommit.usage, pendingCommit.latencyMs);
+    state.focusedKey = null;
+    state.currentProbs = null;
+    // 確信度順(Issue #38)のヒートマップは、このマスが確定したら消す
+    // (次のマス選びまでヒートマップは出さない)。
+    state.cellProbs = null;
+    pendingCommit = null;
+    render();
+  }
+
+  // commitFocused() の本体(記録の作成・統計・usage/コストの積み上げ)を、呼び出し元の
+  // pendingCommit/state.focusedKey から独立させたもの(Issue #80)。一括モード+最速の
+  // 「描画省略」(commitAllInstant())が、1マスごとの render() を挟まずにこれだけを
+  // ループで呼べるようにするための切り出し(render() はここでは呼ばない。呼び出し元の責務)。
+  function commitJudgment(r, c, choice, confidence, probabilities, usage, latencyMs) {
+    var key = r + "-" + c;
+    var correct = choice === SOLUTION[r][c];
+    state.values[key] = { value: choice, status: correct ? "correct" : "incorrect" };
     roundTally.total += 1;
     if (correct) {
       roundTally.correct += 1;
@@ -3751,14 +3812,13 @@ var PAGE_HTML = `<!doctype html>
       roundWrong.push({ r: r, c: c });
       // 消去法(履歴。Issue #61): 次にこのマスを聞くときの exclude に積む
       // (トグルの状態に関わらず記録する。単純化のため。excludeFor() 側でトグルを見て使うか決める)。
-      addWrongDigit(key, pendingCommit.choice);
+      addWrongDigit(key, choice);
     }
     // 集計ビュー用の記録(SPEC F1 拡張2)。正誤が確定したこの時点で1件追記する。
-    var probs = pendingCommit.probabilities;
-    var pc = probs && typeof probs[pendingCommit.choice] === "number" ? probs[pendingCommit.choice] : null;
-    var conf = typeof pendingCommit.confidence === "number" ? pendingCommit.confidence : null;
+    var pc = probabilities && typeof probabilities[choice] === "number" ? probabilities[choice] : null;
+    var conf = typeof confidence === "number" ? confidence : null;
     // 消去法(Issue #61・#63): 候補の数(n、除外なしなら9)とトグルの状態(e=履歴、rc=ルール候補)。
-    var candidateCount = probs ? Object.keys(probs).length : DIGITS.length;
+    var candidateCount = probabilities ? Object.keys(probabilities).length : DIGITS.length;
     // 一括モード(Issue #48)は m を currentModelId() + "/all"(Jev なら "typesafe/jev/all"、
     // Claude なら例 "claude-opus-5+think/all")にし、o:"all" を添える(較正図で typesafe/jev/all のように
     // 別項目として絞り込めるように。SPEC 3章)。他のモードは従来どおり currentModelId()。
@@ -3770,7 +3830,7 @@ var PAGE_HTML = `<!doctype html>
       r: r,
       c: c,
       round: state.round,
-      choice: pendingCommit.choice,
+      choice: choice,
       pc: pc,
       conf: conf,
       ok: correct,
@@ -3782,28 +3842,28 @@ var PAGE_HTML = `<!doctype html>
     if (isAll) record.o = "all";
     // usage(トークン使用量)とレイテンシ(Issue #55・#56、SPEC 5章)。u/t が無い記録は
     // 較正には使うがコスト計算からは自然に除外される(costOf() が u の無い記録を 0 とする)。
-    var usage = pendingCommit.usage || null;
-    var latencyMs = typeof pendingCommit.latencyMs === "number" ? pendingCommit.latencyMs : 0;
+    var recUsage = usage || null;
+    var recLatencyMs = typeof latencyMs === "number" ? latencyMs : 0;
     // 一括モード: 周の先頭1件の確定時に pendingAllUsage を消費する(2件目以降には付かない)
     if (isAll && pendingAllUsage) {
-      usage = pendingAllUsage.usage;
-      latencyMs = typeof pendingAllUsage.latencyMs === "number" ? pendingAllUsage.latencyMs : 0;
+      recUsage = pendingAllUsage.usage;
+      recLatencyMs = typeof pendingAllUsage.latencyMs === "number" ? pendingAllUsage.latencyMs : 0;
       pendingAllUsage = null;
     }
     // 停止で捨てた(応答済みだが未確定だった)呼び出しぶんの usage/レイテンシを持ち越して足す
     // (PR #67 レビュー S2。中断された in-flight の呼び出しぶんは測れないので含まれない)
     if (carryUsage) {
-      usage = combineRecordUsage(carryUsage.usage, usage);
-      latencyMs += typeof carryUsage.latencyMs === "number" ? carryUsage.latencyMs : 0;
+      recUsage = combineRecordUsage(carryUsage.usage, recUsage);
+      recLatencyMs += typeof carryUsage.latencyMs === "number" ? carryUsage.latencyMs : 0;
       carryUsage = null;
     }
     inflightPriorUsage = null;
-    if (usage) {
-      record.u = { i: usage.i, o: usage.o };
-      if (typeof usage.ci === "number") record.ci = usage.ci;
+    if (recUsage) {
+      record.u = { i: recUsage.i, o: recUsage.o };
+      if (typeof recUsage.ci === "number") record.ci = recUsage.ci;
     }
-    if (usage && isFinite(latencyMs)) {
-      record.t = Math.round(latencyMs);
+    if (recUsage && isFinite(recLatencyMs)) {
+      record.t = Math.round(recLatencyMs);
     }
     appendRecord(record);
     var cost = costOf(record);
@@ -3818,18 +3878,11 @@ var PAGE_HTML = `<!doctype html>
     state.lastJudgment = {
       r: r,
       c: c,
-      choice: pendingCommit.choice,
-      confidence: pendingCommit.confidence,
+      choice: choice,
+      confidence: confidence,
       status: correct ? "correct" : "incorrect",
-      probs: state.currentProbs
+      probs: buildDigitBars(probabilities, choice)
     };
-    state.focusedKey = null;
-    state.currentProbs = null;
-    // 確信度順(Issue #38)のヒートマップは、このマスが確定したら消す
-    // (次のマス選びまでヒートマップは出さない)。
-    state.cellProbs = null;
-    pendingCommit = null;
-    render();
   }
 
   function finalizeRound() {
@@ -3877,7 +3930,9 @@ var PAGE_HTML = `<!doctype html>
     roundTally = { correct: 0, total: 0 };
     snapshotSettledKeys(); // この周の queue から外れた(= 前の周までに正解した)マスだけを次の判定材料にする
     render();
-    var betweenRoundsMs = state.speedMode === "slow" ? SLOW_BETWEEN_ROUNDS_MS : FAST_BETWEEN_ROUNDS_MS;
+    // 一括+最速の「描画省略」(Issue #80)は周またぎの演出待ちも0にする(「本当の最速」の対象)。
+    var betweenRoundsMs = (state.instantMode && state.speedMode === "fast") ? 0
+      : state.speedMode === "slow" ? SLOW_BETWEEN_ROUNDS_MS : FAST_BETWEEN_ROUNDS_MS;
     setTimeout(function () {
       if (!isCurrent(token)) return;
       focusNext();
@@ -4038,6 +4093,7 @@ var PAGE_HTML = `<!doctype html>
     var keepOrderMode = state.orderMode;
     var keepHistoryMode = state.historyMode;
     var keepRuleMode = state.ruleMode;
+    var keepInstantMode = state.instantMode;
     state = {
       round: 1,
       values: {},
@@ -4067,7 +4123,8 @@ var PAGE_HTML = `<!doctype html>
       lastAllRequest: null,
       pauseReason: null,
       historyMode: keepHistoryMode,
-      ruleMode: keepRuleMode
+      ruleMode: keepRuleMode,
+      instantMode: keepInstantMode
     };
     queue = [];
     roundWrong = [];
@@ -4232,7 +4289,15 @@ var PAGE_HTML = `<!doctype html>
       // 全体の走っている時間(ミリ秒)と累計コスト(Issue #55・#56)。比較シェルはこれを
       // そのまま表示する(親側で経過時間を測り直さない。docs/DESIGN.md 4.2)。
       elapsedMs: currentTotalElapsedMs(),
-      costUsd: totalCostUsd
+      costUsd: totalCostUsd,
+      // モデルに送った直近のプロンプト(Issue #80、「Claude が動いているか分からない」対応)。
+      // 比較シェルは renderPromptPanelBody() にそのまま渡して、埋め込みモードでは
+      // 描かれない「モデルに送ったプロンプト」パネルと同じ内容を各カラムに出す。
+      orderMode: state.orderMode,
+      lastRequest: state.lastRequest,
+      lastRequestFailed: state.lastRequestFailed,
+      lastCellRequest: state.lastCellRequest,
+      lastAllRequest: state.lastAllRequest
     };
     try {
       window.parent.postMessage(payload, location.origin);
@@ -4360,6 +4425,21 @@ var PAGE_HTML = `<!doctype html>
       "</div>";
   }
 
+  // renderPromptPanelBody() の結果を比較シェル向けに整える(Issue #80 レビュー S1)。
+  // 一括モードは renderAllRequestBlock() 自身が要約1行+折りたたみを持つのでそのまま返す。
+  // 左上から/確信度順モードは生の <pre>(最大320px、確信度順は2段で最大640px)がそのまま
+  // 出るため、Jev/Claude 2枚のタイミングのずれ(例: 片方がキー未設定でまだ何も送っていない)
+  // で2カラムの縦幅が大きく食い違い、iframe がずれて見える・ガクガク動く問題があった。
+  // 「まだ判定していません」の空表示以外はここでも折りたたみ、閉じた状態の縦幅を
+  // だいたい揃える(開いたときのスクロール位置が .compare-status の毎回の innerHTML
+  // 差し替えで引き継がれない点は、一括モードの既存の制約と同じ。Issue #80 のスコープ外)。
+  function renderComparePromptBody(info) {
+    var body = renderPromptPanelBody(info);
+    if (info.orderMode === "all") return body; // 既に要約+折りたたみを持つ
+    if (body.indexOf("まだ判定していません") !== -1) return body; // 空表示は折りたたむ意味が無い
+    return "<details class=\\"prompt-details\\"><summary>プロンプトを表示</summary>" + body + "</details>";
+  }
+
   function renderCompareStatusHtml(which) {
     var status = compareStatus[which];
     // モデル名は子が status で申告したもの(子の設定を正とする)。届く前は親の設定で仮表示。
@@ -4375,10 +4455,22 @@ var PAGE_HTML = `<!doctype html>
     if (which === "claude" && loadAnthropicKey() === null) {
       notice = "<div class=\\"compare-notice\\">Claude のキー未設定(通常ページの設定パネルで保存してください)</div>";
     }
+    // 「Claude が動いているか分からない」問題への対応(Issue #80)。埋め込みモードの
+    // iframe は「モデルに送ったプロンプト」パネルを描かない(SPEC F1)ので、代わりに
+    // 子が postStatus() で申告してきた直近のリクエストを、通常ページと同じ
+    // renderPromptPanelBody() でここに出す。status が届く前(まだ判定していない)は
+    // orderMode だけ親の現在値で仮表示する(renderPromptPanelBody() 側が空表示にする)。
+    var promptHtml = "<div class=\\"compare-prompt\\">" + renderComparePromptBody({
+      orderMode: status && typeof status.orderMode === "string" ? status.orderMode : state.orderMode,
+      lastRequest: status ? status.lastRequest : null,
+      lastRequestFailed: status ? status.lastRequestFailed : false,
+      lastCellRequest: status ? status.lastCellRequest : null,
+      lastAllRequest: status ? status.lastAllRequest : null
+    }) + "</div>";
     return "<h2>" + escapeHtml(modelId) + "</h2>" +
       "<div class=\\"compare-meta\\">経過 " + escapeHtml(formatMs(elapsedMs)) + " ・ " + round + "周目 ・ 正解 " + correct + " / " + total +
       " ・ " + escapeHtml(compareStatusText(status)) + " ・ " + escapeHtml(formatUsd(costUsd)) + "</div>" +
-      notice;
+      notice + promptHtml;
   }
 
   function renderCompareTopbarInPlace() {
@@ -4621,17 +4713,17 @@ var PAGE_HTML = `<!doctype html>
   }
 
   // render() のたびに <select> を作り直すと、開いているプルダウンやフォーカスが失われる
-  // (Opus レビュー S1、PR #78)。実行中でも切り替えられるのは速度・難易度だけ(他の4つは
+  // (Opus レビュー S1、PR #78)。実行中でも切り替えられるのは速度・難易度だけ(他は
   // modelSettingsLocked() でロックされ、無効化された <select> はそもそもフォーカスできない)
-  // ので、この6つの id だけを見れば足りる。
-  var TOP_CONTROLS_SELECT_IDS = ["speed-toggle", "difficulty-toggle", "model-toggle", "order-toggle", "history-toggle", "rules-toggle"];
+  // ので、この7つの id だけを見れば足りる(instant-toggle は Issue #80 で追加)。
+  var TOP_CONTROLS_SELECT_IDS = ["speed-toggle", "difficulty-toggle", "model-toggle", "order-toggle", "instant-toggle", "history-toggle", "rules-toggle"];
   function isControlSelectFocused() {
     var el = document.activeElement;
     return !!(el && el.tagName === "SELECT" && TOP_CONTROLS_SELECT_IDS.indexOf(el.id) !== -1);
   }
 
-  // 実行系ボタン + 6つのトグル(速度・難易度・モデル・順番・履歴・ルール候補)を横並びの
-  // 1本のバーにする(オーナー要望 2026-09-23、Issue #76)。選択肢が複数あるトグルは
+  // 実行系ボタン + 7つのトグル(速度・難易度・モデル・順番・描画・履歴・ルール候補)を横並びの
+  // 1本のバーにする(オーナー要望 2026-09-23、Issue #76・#80)。選択肢が複数あるトグルは
   // 「選択中のものだけ見えればいい」ので、ボタン群の代わりに <select> にした
   // (見た目を保ったまま横幅を大きく取らない)。id はボタン群のときと同じものを流用する
   // (aria-pressed は select の選択状態そのものがネイティブに伝わるので不要になった)。
@@ -4653,6 +4745,10 @@ var PAGE_HTML = `<!doctype html>
     // 順番トグル・消去法の2トグル(左上から / 確信度順 / 一括、履歴、ルール候補)は
     // モデルトグルと同じ条件でロックする(周の途中で切り替えると意味が崩れるため)。
     var orderDisabled = modelSettingsLocked() ? "disabled" : "";
+    // 描画省略トグル(Issue #80)は一括+最速のときだけ選べる。それ以外の組み合わせでは
+    // 有効にしても実行時に何も変わらない(focusNextAll() が orderMode/speedMode を
+    // 見て判断する)ので、混乱を避けるために select 自体を無効化しておく。
+    var instantDisabled = (modelSettingsLocked() || state.orderMode !== "all" || state.speedMode !== "fast") ? "disabled" : "";
     return "<div class=\\"controls\\">" +
       "<button id=\\"run-btn\\" onclick=\\"" + runOnclick + "\\" " + runDisabled + ">" + runLabel + "</button>" +
       "<button id=\\"reset-btn\\" onclick=\\"reset()\\" " + resetDisabled + ">リセット</button>" +
@@ -4674,6 +4770,10 @@ var PAGE_HTML = `<!doctype html>
       "<option value=\\"scan\\"" + (state.orderMode === "scan" ? " selected" : "") + ">左上から</option>" +
       "<option value=\\"confidence\\"" + (state.orderMode === "confidence" ? " selected" : "") + ">確信度順</option>" +
       "<option value=\\"all\\"" + (state.orderMode === "all" ? " selected" : "") + ">一括</option>" +
+      "</select>" +
+      "<select id=\\"instant-toggle\\" aria-label=\\"描画\\" onchange=\\"setInstantMode(this.value === '1')\\" " + instantDisabled + ">" +
+      "<option value=\\"0\\"" + (state.instantMode ? "" : " selected") + ">毎回表示</option>" +
+      "<option value=\\"1\\"" + (state.instantMode ? " selected" : "") + ">省略(最速)</option>" +
       "</select>" +
       "<select id=\\"history-toggle\\" aria-label=\\"消去法(履歴)\\" onchange=\\"setHistoryMode(this.value === '1')\\" " + orderDisabled + ">" +
       "<option value=\\"1\\"" + (state.historyMode ? " selected" : "") + ">履歴あり</option>" +
@@ -4797,18 +4897,20 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function renderCurrentPanel() {
-    var head = "<div id=\\"current-panel\\" class=\\"panel\\"><p class=\\"panel-title\\">現在の判定</p>";
+    // 開始から終了までの経過時間(ミリ秒。Issue #80)を見出し行の右の空きスペースに
+    // 常時出す。currentTotalElapsedMs() は走っていないとき最後の値のまま(DESIGN 4.4)
+    // なので、未実行時は 0 ms、実行中はライブ更新、停止/完了後は最後の値で止まる。
+    // 累計コストは「この実行の消費」パネルと重複していたので、こちらからは削除した(Issue #80)。
+    var head = "<div id=\\"current-panel\\" class=\\"panel\\">" +
+      "<div class=\\"panel-title-row\\"><p class=\\"panel-title\\">現在の判定</p>" +
+      "<span class=\\"panel-title-elapsed\\">" + formatMs(currentTotalElapsedMs()) + "</span></div>";
     var tail = "</div>";
-    // 実行中の経過(ミリ秒)と累計コスト(Issue #55・#56)。render() のたびに更新するだけで、
-    // 走っていないとき(currentTotalElapsedMs() が totalElapsedMs のまま)は最後の値が残る。
-    var elapsedLine = "<p class=\\"muted elapsed-line\\">経過 " + formatMs(currentTotalElapsedMs()) +
-      " / " + formatUsdForModel(totalCostUsd, activeModelIdForPricing()) + "</p>";
 
     // 停止中(Issue #32): 残りマス数を示し、フォーカスの枠線は消える
     // (state.focusedKey が null なので buildCellStyle 側で自然に消える)。
     // 直前に確定した判定があれば、参考として下に残す。
     if (isPaused()) {
-      var pausedBody = elapsedLine + "<p class=\\"muted\\">停止中(残り " + queue.length + " マス)</p>";
+      var pausedBody = "<p class=\\"muted\\">停止中(残り " + queue.length + " マス)</p>";
       // 一時的な失敗による停止(Issue #43)は理由を添える。手動停止(state.pauseReason
       // が null のまま)では出ない。
       if (state.pauseReason) {
@@ -4832,7 +4934,7 @@ var PAGE_HTML = `<!doctype html>
 
     // 一括モード(Issue #48)の呼び出し中: 応答が届くまでは座標もバーも無い。
     if (state.allFetching) {
-      return head + elapsedLine + "<p class=\\"muted\\">一括で判定中…(" + queue.length + " マス)</p>" + tail;
+      return head + "<p class=\\"muted\\">一括で判定中…(" + queue.length + " マス)</p>" + tail;
     }
 
     // 結果が届いている最中のマス: 座標とバーをそのまま出す
@@ -4843,14 +4945,14 @@ var PAGE_HTML = `<!doctype html>
         confidenceText = "<span class=\\"confidence\\">confidence " + Math.round(pendingCommit.confidence * 100) + "%</span>";
       }
       var selLine1 = state.orderMode === "confidence" ? renderSelectionLine() : "";
-      return head + elapsedLine + selLine1 +
+      return head + selLine1 +
         "<div class=\\"coords\\">" + coordLabel(Number(parts[0]), Number(parts[1])) + confidenceText + "</div>" +
         "<div class=\\"bars\\">" + renderBars(state.currentProbs) + "</div>" + tail;
     }
 
     // 待ち時間中は「いま聞いているマス」+「直前に確定した判定」を並べる。
     // 最速モードでも結果が一瞬で消えないようにするため(DESIGN 4.4)。
-    var body = elapsedLine;
+    var body = "";
     if (state.focusedKey) {
       if (state.orderMode === "confidence") body += renderSelectionLine();
       var p2 = state.focusedKey.split("-");
@@ -4904,43 +5006,54 @@ var PAGE_HTML = `<!doctype html>
       "<pre class=\\"prompt-json\\">" + escapeHtml(JSON.stringify(allReq.request, null, 2)) + "</pre></details>";
   }
 
-  // 「モデルに送ったプロンプト」パネル(Issue #34、#37、#38)。Jev なら Worker が env.AI.run に渡した
-  // ペイロード(request)をそのまま JSON で表示する。フロント側で組み立て直さない
-  // (handleJudge と二重管理にしないため)。停止中・エラー時も直近の値を残す。
-  // 確信度順モードでは、マス選び(state.lastCellRequest)と数字(state.lastRequest)を
-  // 見出し付きで2段に並べる。左上からのときは従来どおり数字のリクエスト1つだけ。
+  // 「モデルに送ったプロンプト」の中身組み立て(Issue #34、#37、#38。見出し・panel の
+  // 外枠は呼び出し元)。info は { orderMode, lastRequest, lastRequestFailed,
+  // lastCellRequest, lastAllRequest }。Jev なら Worker が env.AI.run に渡したペイロード
+  // (request)をそのまま JSON で表示する。フロント側で組み立て直さない(handleJudge と
+  // 二重管理にしないため)。停止中・エラー時も直近の値を残す。確信度順モードでは、
+  // マス選び(lastCellRequest)と数字(lastRequest)を見出し付きで2段に並べる。
+  // 左上からのときは従来どおり数字のリクエスト1つだけ。通常ページの renderPromptPanel()
+  // と、比較モード(Issue #80)の比較シェル側の両方がこれを呼ぶ(二重管理にしないため)。
+  function renderPromptPanelBody(info) {
+    var empty = "<p class=\\"muted\\">まだ判定していません(実行すると直近の判定に使ったプロンプトが表示されます)</p>";
+
+    // 一括モード(Issue #48)は「一括」1段(質問N問の要約 + 折りたたみ)。空表示の文言も
+    // 一括専用のものにする(Issue #80 レビュー N4。切り出し時に一般的な文言に統一して
+    // しまっていたのを戻した)。
+    if (info.orderMode === "all") {
+      var allReq = info.lastAllRequest;
+      if (!allReq) return "<p class=\\"muted\\">まだ判定していません(実行すると直近の一括判定に使ったプロンプトが表示されます)</p>";
+      return renderAllRequestBlock(allReq);
+    }
+
+    if (info.orderMode !== "confidence") {
+      var req = info.lastRequest;
+      if (!req) return empty;
+      return renderRequestBlock(req, info.lastRequestFailed, null);
+    }
+
+    if (!info.lastCellRequest && !info.lastRequest) return empty;
+    var body = "";
+    if (info.lastCellRequest) {
+      body += renderRequestBlock(info.lastCellRequest, false, "マス選び");
+    }
+    if (info.lastRequest) {
+      body += renderRequestBlock(info.lastRequest, info.lastRequestFailed, "数字");
+    }
+    return body;
+  }
+
+  // 「モデルに送ったプロンプト」パネル(通常ページ)。state からそのまま info を組み立てる。
   function renderPromptPanel() {
     var head = "<div id=\\"prompt-panel\\" class=\\"panel\\"><p class=\\"panel-title\\">モデルに送ったプロンプト</p>";
     var tail = "</div>";
-
-    // 一括モード(Issue #48)は「一括」1段(質問N問の要約 + 折りたたみ)。
-    if (state.orderMode === "all") {
-      var allReq = state.lastAllRequest;
-      if (!allReq) {
-        return head + "<p class=\\"muted\\">まだ判定していません(実行すると直近の一括判定に使ったプロンプトが表示されます)</p>" + tail;
-      }
-      return head + renderAllRequestBlock(allReq) + tail;
-    }
-
-    if (state.orderMode !== "confidence") {
-      var req = state.lastRequest;
-      if (!req) {
-        return head + "<p class=\\"muted\\">まだ判定していません(実行すると直近の判定に使ったプロンプトが表示されます)</p>" + tail;
-      }
-      return head + renderRequestBlock(req, state.lastRequestFailed, null) + tail;
-    }
-
-    if (!state.lastCellRequest && !state.lastRequest) {
-      return head + "<p class=\\"muted\\">まだ判定していません(実行すると直近の判定に使ったプロンプトが表示されます)</p>" + tail;
-    }
-    var body = "";
-    if (state.lastCellRequest) {
-      body += renderRequestBlock(state.lastCellRequest, false, "マス選び");
-    }
-    if (state.lastRequest) {
-      body += renderRequestBlock(state.lastRequest, state.lastRequestFailed, "数字");
-    }
-    return head + body + tail;
+    return head + renderPromptPanelBody({
+      orderMode: state.orderMode,
+      lastRequest: state.lastRequest,
+      lastRequestFailed: state.lastRequestFailed,
+      lastCellRequest: state.lastCellRequest,
+      lastAllRequest: state.lastAllRequest
+    }) + tail;
   }
 
   // 周回ログ1行ぶん(Issue #55・#56)。「N周目: M中K正解 (P%) — 3,214 ms / $0.0004」。
@@ -5173,7 +5286,13 @@ var PAGE_HTML = `<!doctype html>
     // PR #78)。innerHTML を丸ごと作り直す方式だと、実行中に高頻度で render() が走る
     // (一括モードの確定ごとなど)せいで、開いたプルダウンやキーボードフォーカスが
     // 一瞬で失われて選べなくなる。フォーカスが外れた次の render() でまとめて反映される。
-    if (!embedMode && isControlSelectFocused()) return;
+    // state.running のときだけガードする(Issue #80 レビュー M1)。ガードを常時
+    // 効かせると、実行前に(select は選んだあとも focus を保つブラウザの挙動のため)
+    // 速度→順番と select を渡り歩くだけで render() が一度も走らず、instant-toggle の
+    // 無効化状態が更新されない(= 一括+最速を選んでも有効化されたように見えない)問題が
+    // 起きる。高頻度 render() が起きるのはそもそも state.running のときだけなので、
+    // ここに絞っても PR #78 の元の目的(実行中の select 操作を止めない)は損なわない。
+    if (!embedMode && state.running && isControlSelectFocused()) return;
     var app = document.getElementById("app");
     // 周回ログのスクロール位置を引き継ぐ(innerHTML を作り直すと先頭に戻るため)。
     // 末尾に居たときは末尾のままにする。

@@ -518,13 +518,21 @@ test("focusNext / focusCellForDigit / finalizeRound の非同期コールバッ�
 test("commitFocused はフォーカス中のマスと一致しなければ何もしない", async () => {
   var html = await getPageHtml();
   var script = extractScript(html);
+  // commitFocused() 本体(記録の作成・統計)は commitJudgment() に切り出されている
+  // (Issue #80。一括+最速の commitAllInstant() が同じロジックを render() を挟まず
+  // 呼べるようにするための refactor)。commitFocused() 側はガードと commitJudgment()
+  // 呼び出しだけを持つ。
   var src = stripLineComments(extractFunctionSource(script, "commitFocused"));
 
   assert.ok(/if \(!pendingCommit\) return;/.test(src), "pendingCommit が無いときの early return が無い");
   var guard = src.indexOf('if (state.focusedKey !== key) return;');
-  var mutate = src.indexOf("state.values[key] =");
+  var callCommit = src.indexOf("commitJudgment(");
   assert.ok(guard >= 0, "フォーカスとのずれを見る early return が無い");
-  assert.ok(guard < mutate, "ガードは state.values を書き換える前に置く");
+  assert.ok(callCommit >= 0, "commitFocused が commitJudgment を呼んでいない");
+  assert.ok(guard < callCommit, "ガードは commitJudgment() を呼ぶ前に置く");
+
+  var judgmentSrc = stripLineComments(extractFunctionSource(script, "commitJudgment"));
+  assert.ok(/state\.values\[key\] =/.test(judgmentSrc), "commitJudgment が state.values を書き換えていない");
 });
 
 test("開始前の「この周の進捗」は 0 / 51 と読める(roundSize の初期値が TOTAL_EMPTY)", async () => {
@@ -540,8 +548,9 @@ test("直前の判定を state.lastJudgment に残す(最速モードでも結�
   var html = await getPageHtml();
   var script = extractScript(html);
   assert.ok(/lastJudgment: null/.test(script), "state に lastJudgment が無い");
-  var commitSrc = extractFunctionSource(script, "commitFocused");
-  assert.ok(/state\.lastJudgment = \{/.test(commitSrc), "commitFocused が lastJudgment を更新していない");
+  // lastJudgment の更新は commitJudgment() 側(commitFocused() から切り出された。Issue #80)
+  var commitSrc = extractFunctionSource(script, "commitJudgment");
+  assert.ok(/state\.lastJudgment = \{/.test(commitSrc), "commitJudgment が lastJudgment を更新していない");
   var panelSrc = extractFunctionSource(script, "renderCurrentPanel");
   assert.ok(/state\.lastJudgment/.test(panelSrc), "現在の判定パネルが lastJudgment を表示していない");
   var resetSrc = extractFunctionSource(script, "reset");
@@ -5426,4 +5435,224 @@ test("AC2: 速度/難易度の <select> にフォーカスがあるあいだ ren
   ctx.setDifficulty("easy");
   assert.notEqual(app.innerHTML, beforeBlurHtml, "フォーカスが外れたのに再描画されない");
   assert.ok(app.innerHTML.indexOf('<option value="easy" selected>') !== -1, "最新の state が反映されていない: " + app.innerHTML);
+});
+
+// ---------------------------------------------------------------------------
+// Issue #80(オーナー要望 2026-09-23): 一括+最速の描画省略トグル、「現在の判定」
+// 見出し行の経過時間、比較モードのプロンプト可視化。
+// ---------------------------------------------------------------------------
+
+test("AD1: 一括+最速+描画省略(instantMode)は、1回の応答後に render() を挟まず一気に確定し、usage は先頭1件だけに付く(Issue #80)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var renderCount = 0;
+  var htmlValue = "";
+  var app = {
+    get innerHTML() { return htmlValue; },
+    set innerHTML(v) { htmlValue = v; renderCount++; },
+  };
+  var fakeDoc = {
+    activeElement: null,
+    getElementById: function (id) { return id === "app" ? app : null; },
+    querySelector: function () { return null; },
+    querySelectorAll: function () { return []; },
+    createElement: function (tag) { return { tagName: tag, href: "", download: "", click: function () {} }; },
+    body: { appendChild: function () {}, removeChild: function () {} },
+  };
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch, document: fakeDoc });
+  ctx.applyPuzzleFromString(blankCells(ANSWER_KEY, [[0, 0], [4, 4]]));
+  ctx.setOrderMode("all");
+  ctx.setSpeed("fast");
+  ctx.setInstantMode(true);
+  assert.equal(ctx.state.instantMode, true, "setInstantMode(true) が state に反映されていない");
+
+  ctx.run();
+  await waitFor(function () { return af.pending.length === 1; }, "AD1: fetch 待ち");
+  var entry = af.pending.shift();
+  var body = JSON.parse(entry.init.body);
+  var keys = ctx.selectionKeys();
+  var allRes = await makeAllResponse(ctx, body.puzzle, keys).json();
+  allRes.usage = { input_tokens: 9000, output_tokens: 4000 };
+
+  var beforeResolveCount = renderCount;
+  entry.resolve({ ok: true, json: function () { return Promise.resolve(allRes); } });
+
+  await waitFor(function () { return ctx.state.done === true; }, "AD1: 完了待ち");
+
+  // 通常の一括モード(Z1/Z2)は1マスごとに render() を複数回挟む(フォーカス→バー表示→確定)。
+  // 描画省略が効いていれば、応答が届いてから完了までの render() はごく少数で済むはず。
+  var rendersAfterResolve = renderCount - beforeResolveCount;
+  assert.ok(rendersAfterResolve <= 2, "描画省略のはずが1マスずつ render() している(" + rendersAfterResolve + "回)");
+
+  assert.equal(Object.keys(ctx.state.values).length, 2, "全マスが確定していない");
+  var records = ctx.getRecords();
+  assert.equal(records.length, 2, "記録の件数が空マス数と一致しない");
+  records.forEach(function (rec) {
+    assert.equal(rec.m, "typesafe/jev/all", "記録の m が typesafe/jev/all でない: " + rec.m);
+    assert.equal(rec.o, "all", "記録の o が all でない: " + rec.o);
+  });
+  assert.equal(records[0].u.i, 9000, "先頭レコードに usage が付いていない");
+  assert.equal(records[0].u.o, 4000);
+  assert.equal(records[1].u, undefined, "2件目にも usage が付いている(二重計上)");
+  assert.equal(af.pending.length, 0, "一括なのに複数回 fetch している");
+});
+
+test("AD2: 描画省略トグル(instant-toggle)は一括+最速のときだけ有効。それ以外・実行中はロックされる(Issue #80)", async () => {
+  var ctx = runScript(await getPageHtml());
+
+  function instantSelectHtml() {
+    var html = ctx.renderControls();
+    var m = html.match(/<select id="instant-toggle"[^>]*>/);
+    assert.ok(m, "instant-toggle が見つからない: " + html);
+    return m[0];
+  }
+
+  // 既定(左上から + じっくり確認)では無効
+  assert.ok(instantSelectHtml().includes("disabled"), "scan+slow で無効化されていない: " + instantSelectHtml());
+
+  ctx.setOrderMode("all");
+  assert.ok(instantSelectHtml().includes("disabled"), "一括+じっくりで無効化されていない: " + instantSelectHtml());
+
+  ctx.setSpeed("fast");
+  assert.ok(!instantSelectHtml().includes("disabled"), "一括+最速で無効化されたまま: " + instantSelectHtml());
+
+  // 実行中・停止中は他のトグルと同じ条件でロックされる(modelSettingsLocked())
+  ctx.state.running = true;
+  assert.ok(instantSelectHtml().includes("disabled"), "実行中に無効化されていない: " + instantSelectHtml());
+
+  // setInstantMode() 自体もロック中は無視する(直接呼ばれても安全なように)
+  ctx.state.instantMode = false;
+  ctx.setInstantMode(true);
+  assert.equal(ctx.state.instantMode, false, "実行中に setInstantMode が効いてしまった");
+  ctx.state.running = false;
+
+  // 選択肢のラベル
+  var full = ctx.renderControls();
+  assert.ok(full.indexOf(">毎回表示</option>") !== -1, "「毎回表示」の選択肢が無い: " + full);
+  assert.ok(full.indexOf(">省略(最速)</option>") !== -1, "「省略(最速)」の選択肢が無い: " + full);
+});
+
+test("AD3: 描画省略が立っていても、一括+じっくり確認のときは従来どおり1マスずつ表示する(orderMode/speedMode の実行時チェック、Issue #80)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.applyPuzzleFromString(blankCells(ANSWER_KEY, [[0, 0], [4, 4]]));
+  ctx.setOrderMode("all");
+  ctx.setSpeed("slow");
+  ctx.setInstantMode(true); // UI 上は無効化される組み合わせだが、state を直接立てても安全か確認する
+  assert.equal(ctx.state.instantMode, true);
+
+  ctx.run();
+  await waitFor(function () { return af.pending.length === 1; }, "AD3: fetch 待ち");
+  var entry = af.pending.shift();
+  var body = JSON.parse(entry.init.body);
+  var keys = ctx.selectionKeys();
+  entry.resolve(makeAllResponse(ctx, body.puzzle, keys));
+
+  // 描画省略が誤って発動していれば、この時点で2マスとも即確定して state.done になってしまう。
+  // 一括+じっくりでは従来どおり1マスずつフォーカスするはずなので、まだ完了していない。
+  await waitFor(function () { return ctx.state.focusedKey !== null; }, "AD3: 1マス目のフォーカス待ち");
+  assert.equal(ctx.state.done, false, "一括+じっくりなのに即座に完了した(描画省略が誤って発動した)");
+  assert.equal(Object.keys(ctx.state.values).length, 0, "1マス目の確定待ちのはずが、もう値が入っている");
+
+  await waitFor(function () { return ctx.state.done === true; }, "AD3: 完了待ち");
+  assert.equal(Object.keys(ctx.state.values).length, 2);
+});
+
+test("AD4: 「現在の判定」パネルの見出し行に経過時間(ミリ秒)が出る。重複していたコスト表示は消えた(Issue #80)", async () => {
+  var ctx = runScript(await getPageHtml());
+
+  // 未実行: 0ms
+  var idleHtml = ctx.renderCurrentPanel();
+  assert.ok(idleHtml.indexOf('class="panel-title-row"') !== -1, "見出し行のラッパーが無い: " + idleHtml);
+  assert.ok(idleHtml.indexOf('class="panel-title-elapsed"') !== -1, "経過時間の span が無い: " + idleHtml);
+  assert.ok(idleHtml.indexOf(ctx.formatMs(0)) !== -1, "未実行時に 0 ms が出ていない: " + idleHtml);
+
+  // 実行中: currentTotalElapsedMs() をライブに反映する
+  ctx.totalElapsedMs = 0;
+  ctx.runningSince = 1000;
+  ctx.nowMs = function () { return 4234; };
+  var runningHtml = ctx.renderCurrentPanel();
+  assert.ok(runningHtml.indexOf(ctx.formatMs(3234)) !== -1, "実行中の経過時間(ミリ秒)が出ていない: " + runningHtml);
+  assert.ok(runningHtml.indexOf("$") === -1, "現在の判定パネルにコスト表示が残っている(この実行の消費パネルと重複、Issue #80)");
+
+  // 停止後は最後の値のまま(currentTotalElapsedMs() が totalElapsedMs をそのまま返す。DESIGN 4.4)
+  ctx.runningSince = null;
+  ctx.totalElapsedMs = 3234;
+  var stoppedHtml = ctx.renderCurrentPanel();
+  assert.ok(stoppedHtml.indexOf(ctx.formatMs(3234)) !== -1, "停止後に最後の経過時間が残っていない: " + stoppedHtml);
+});
+
+test("AD5: 比較モードで「Claude が動いているか分からない」問題への対応。postStatus() に lastRequest 系が乗り、比較シェルが各カラムに同じ内容を出す(Issue #80)", async () => {
+  // (a) postStatus() の payload に orderMode/lastAllRequest が乗る
+  var posted = [];
+  var fakeWindow = {
+    parent: { postMessage: function (payload, origin) { posted.push({ payload: payload, origin: origin }); } },
+    addEventListener: function () {},
+  };
+  var ctx = runScript(await getPageHtml(), {
+    location: { pathname: "/", search: "embed=1&order=all", origin: "https://example.com" },
+    window: fakeWindow,
+  });
+  ctx.state.lastAllRequest = { request: { hello: "world" }, failed: false, count: 51, chunkCount: 1 };
+  ctx.render();
+  var last = posted[posted.length - 1];
+  assert.equal(last.payload.orderMode, "all", "orderMode が status に乗っていない");
+  assert.ok(last.payload.lastAllRequest && last.payload.lastAllRequest.count === 51, "lastAllRequest が status に乗っていない");
+
+  // (b) 比較シェル: status 未着時は「まだ判定していません」(プロンプト欄のラッパーは出る)
+  var compareCtx = runScript(await getPageHtml(), {
+    location: { pathname: "/compare", search: "", origin: "https://example.com" },
+  });
+  var emptyHtml = compareCtx.renderCompareStatusHtml("jev");
+  assert.ok(emptyHtml.indexOf("まだ判定していません") !== -1, "status 未着時の空表示が出ていない: " + emptyHtml);
+  assert.ok(emptyHtml.indexOf('class="compare-prompt"') !== -1, "プロンプト欄のラッパーが無い: " + emptyHtml);
+
+  // (c) 一括モード: 子から届いた lastAllRequest がそのまま出る(質問数の要約 + 折りたたみ)
+  compareCtx.compareStatus.claude = {
+    type: "status", model: "claude-opus-5+think", round: 1, correct: 0, total: 51, remaining: 51,
+    running: true, paused: false, done: false, elapsedMs: 100, costUsd: 0,
+    orderMode: "all", lastAllRequest: { request: { hello: "claude" }, failed: false, count: 51, chunkCount: 6 },
+  };
+  var claudeHtml = compareCtx.renderCompareStatusHtml("claude");
+  assert.ok(claudeHtml.indexOf("質問 51 問") !== -1, "一括モードの質問数要約が出ていない: " + claudeHtml);
+  assert.ok(claudeHtml.indexOf("6回に分割") !== -1, "チャンク分割の注記が出ていない: " + claudeHtml);
+  assert.ok(claudeHtml.indexOf("prompt-details") !== -1, "折りたたみが出ていない: " + claudeHtml);
+
+  // (d) 左上からモード: 数字のリクエストがそのまま出る
+  compareCtx.compareStatus.jev = {
+    type: "status", model: "typesafe/jev", round: 1, correct: 0, total: 51, remaining: 51,
+    running: true, paused: false, done: false, elapsedMs: 50, costUsd: 0,
+    orderMode: "scan", lastRequest: { state: { puzzle: "x", target: { row: 0, col: 2 } } }, lastRequestFailed: false,
+  };
+  var jevHtml = compareCtx.renderCompareStatusHtml("jev");
+  assert.ok(jevHtml.indexOf("の判定に使用") !== -1, "scan モードのリクエスト要約が出ていない: " + jevHtml);
+  // (e) 左上から/確信度順モードの生の <pre> は比較シェルだけ折りたたむ(縦幅がそろわず
+  // iframe がずれる問題への対応、Opus レビュー S1)。一括モード(c)は自前の折りたたみを
+  // 持つので二重に包まれないこと、未送信(b)は折りたたまないことも確認する。
+  assert.ok(jevHtml.indexOf('<details class="prompt-details">') !== -1, "scan モードの比較シェル表示が折りたたまれていない(レビュー S1): " + jevHtml);
+  assert.equal((claudeHtml.match(/<details class="prompt-details">/g) || []).length, 1, "一括モードが二重に折りたたまれている(レビュー S1): " + claudeHtml);
+  assert.ok(emptyHtml.indexOf("<details") === -1, "未送信の空表示まで折りたたまれている: " + emptyHtml);
+});
+
+test("AD6: 実行前に select を渡り歩くだけでも instant-toggle の有効/無効が反映される(select は選んだあともフォーカスを保つブラウザの挙動でも render() が止まらないこと、Opus レビューM1)", async () => {
+  var app = { innerHTML: "" };
+  var fakeDoc = {
+    activeElement: null,
+    getElementById: function (id) { return id === "app" ? app : null; },
+    querySelector: function () { return null; },
+    querySelectorAll: function () { return []; },
+    createElement: function (tag) { return { tagName: tag, href: "", download: "", click: function () {} }; },
+    body: { appendChild: function () {}, removeChild: function () {} },
+  };
+  var ctx = runScript(await getPageHtml(), { document: fakeDoc });
+
+  // 実行前(state.running===false)は順番トグルもロックされないので選べる
+  ctx.setOrderMode("all");
+  assert.ok(/<select id="instant-toggle"[^>]*disabled/.test(app.innerHTML), "前提: 一括だけ(速度はまだ slow)では instant-toggle は無効のはず: " + app.innerHTML);
+
+  // 速度セレクトにフォーカスがある状態で「最速」を選ぶ(select は選択後もフォーカスを
+  // 保つブラウザの挙動を模している。isControlSelectFocused() が真になる)
+  fakeDoc.activeElement = { tagName: "SELECT", id: "speed-toggle" };
+  ctx.setSpeed("fast");
+  assert.ok(!/<select id="instant-toggle"[^>]*disabled/.test(app.innerHTML),
+    "実行中でもないのに select にフォーカスがあるという理由だけで render() が止まり、instant-toggle が無効のままになっている(M1)");
 });
