@@ -896,9 +896,16 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
   足し、`renderCompareStatusHtml(which)` が `compareStatus[which]` からそのまま `info` を
   組み立てて `renderPromptPanelBody()` を呼ぶ(通常ページと二重管理にしない)。比較シェルの
   `.compare-status` は `updateCompareStatus()` のたびに `innerHTML` を丸ごと差し替えるので、
-  折りたたみ(`<details class="prompt-details">`。一括モードのときだけ)の開閉状態は
-  引き継がない(通常ページの `render()` にある `oldDetails`/`detailsWasOpen` の仕組みは
-  1個の `<details>` しか想定しておらず、2カラム分への拡張は今回のスコープ外。Issue #80)
+  折りたたみ(`<details class="prompt-details">`)の開閉状態は引き継がない(通常ページの
+  `render()` にある `oldDetails`/`detailsWasOpen` の仕組みは1個の `<details>` しか想定して
+  おらず、2カラム分への拡張は今回のスコープ外。Issue #80)。**`renderComparePromptBody(info)`**
+  (レビュー S1): 左上から/確信度順モードの `renderRequestBlock()` は折りたたみを持たない生の
+  `<pre>`(最大320px、確信度順は2段で最大640px)をそのまま返すため、Jev/Claude の応答タイミングが
+  ずれる(例: 片方が API キー未設定でまだ何も送っていない)と2カラムの縦幅が大きく食い違い、
+  `<iframe>` がずれて見える・高頻度更新でガクガクする問題があった。比較シェルだけ、
+  `renderPromptPanelBody()` の結果を(一括モードと「まだ判定していません」を除いて)
+  `<details class="prompt-details"><summary>プロンプトを表示</summary>…</details>` で包み、
+  閉じた状態の縦幅をどのモードでもだいたい揃える(開閉状態を引き継がない制約は上記と同じ)
 - **確信度順モード(Issue #38)** は `state.orderMode` だけで分岐し、`buildCellStyle` /
   `renderCurrentPanel` / `renderPromptPanel` / `renderLegend` / `renderControls` の既存の
   関数にロジックを足す形にしてある(専用のコンポーネントを新設しない)。ヒートマップは
@@ -916,8 +923,9 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
   `pendingCommit`)を使うので、`renderGrid` / `renderCurrentPanel` の本体側は
   モードを意識しない
 - **描画省略トグル(Issue #80、オーナー要望 2026-09-23)**: 一括モードでも「フォーカス→
-  バー表示→確定→次へ」を1マスずつ `render()` する演出が入るため、最速モードでも51マスの
-  完走に約1秒+51回の `innerHTML` 再構築がかかる問題への対応。`commitFocused()` の本体
+  バー表示→確定→次へ」を1マスずつ `render()` する演出が入るため(1マスにつき `render()` が
+  3回: フォーカス直後・バー表示直後・`commitFocused()` の確定後)、最速モードでも51マスの
+  完走に約1秒+150回前後の `innerHTML` 再構築がかかる問題への対応。`commitFocused()` の本体
   (記録の作成・統計・usage/コストの積み上げ・`state.lastJudgment` の更新)を
   `commitJudgment(r, c, choice, confidence, probabilities, usage, latencyMs)` として
   切り出し(`commitFocused()` はガードと呼び出しだけになる)、`state.instantMode` が

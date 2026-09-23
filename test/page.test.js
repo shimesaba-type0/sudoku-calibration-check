@@ -5625,4 +5625,34 @@ test("AD5: 比較モードで「Claude が動いているか分からない」�
   };
   var jevHtml = compareCtx.renderCompareStatusHtml("jev");
   assert.ok(jevHtml.indexOf("の判定に使用") !== -1, "scan モードのリクエスト要約が出ていない: " + jevHtml);
+  // (e) 左上から/確信度順モードの生の <pre> は比較シェルだけ折りたたむ(縦幅がそろわず
+  // iframe がずれる問題への対応、Opus レビュー S1)。一括モード(c)は自前の折りたたみを
+  // 持つので二重に包まれないこと、未送信(b)は折りたたまないことも確認する。
+  assert.ok(jevHtml.indexOf('<details class="prompt-details">') !== -1, "scan モードの比較シェル表示が折りたたまれていない(レビュー S1): " + jevHtml);
+  assert.equal((claudeHtml.match(/<details class="prompt-details">/g) || []).length, 1, "一括モードが二重に折りたたまれている(レビュー S1): " + claudeHtml);
+  assert.ok(emptyHtml.indexOf("<details") === -1, "未送信の空表示まで折りたたまれている: " + emptyHtml);
+});
+
+test("AD6: 実行前に select を渡り歩くだけでも instant-toggle の有効/無効が反映される(select は選んだあともフォーカスを保つブラウザの挙動でも render() が止まらないこと、Opus レビューM1)", async () => {
+  var app = { innerHTML: "" };
+  var fakeDoc = {
+    activeElement: null,
+    getElementById: function (id) { return id === "app" ? app : null; },
+    querySelector: function () { return null; },
+    querySelectorAll: function () { return []; },
+    createElement: function (tag) { return { tagName: tag, href: "", download: "", click: function () {} }; },
+    body: { appendChild: function () {}, removeChild: function () {} },
+  };
+  var ctx = runScript(await getPageHtml(), { document: fakeDoc });
+
+  // 実行前(state.running===false)は順番トグルもロックされないので選べる
+  ctx.setOrderMode("all");
+  assert.ok(/<select id="instant-toggle"[^>]*disabled/.test(app.innerHTML), "前提: 一括だけ(速度はまだ slow)では instant-toggle は無効のはず: " + app.innerHTML);
+
+  // 速度セレクトにフォーカスがある状態で「最速」を選ぶ(select は選択後もフォーカスを
+  // 保つブラウザの挙動を模している。isControlSelectFocused() が真になる)
+  fakeDoc.activeElement = { tagName: "SELECT", id: "speed-toggle" };
+  ctx.setSpeed("fast");
+  assert.ok(!/<select id="instant-toggle"[^>]*disabled/.test(app.innerHTML),
+    "実行中でもないのに select にフォーカスがあるという理由だけで render() が止まり、instant-toggle が無効のままになっている(M1)");
 });

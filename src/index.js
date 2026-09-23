@@ -4425,6 +4425,21 @@ var PAGE_HTML = `<!doctype html>
       "</div>";
   }
 
+  // renderPromptPanelBody() の結果を比較シェル向けに整える(Issue #80 レビュー S1)。
+  // 一括モードは renderAllRequestBlock() 自身が要約1行+折りたたみを持つのでそのまま返す。
+  // 左上から/確信度順モードは生の <pre>(最大320px、確信度順は2段で最大640px)がそのまま
+  // 出るため、Jev/Claude 2枚のタイミングのずれ(例: 片方がキー未設定でまだ何も送っていない)
+  // で2カラムの縦幅が大きく食い違い、iframe がずれて見える・ガクガク動く問題があった。
+  // 「まだ判定していません」の空表示以外はここでも折りたたみ、閉じた状態の縦幅を
+  // だいたい揃える(開いたときのスクロール位置が .compare-status の毎回の innerHTML
+  // 差し替えで引き継がれない点は、一括モードの既存の制約と同じ。Issue #80 のスコープ外)。
+  function renderComparePromptBody(info) {
+    var body = renderPromptPanelBody(info);
+    if (info.orderMode === "all") return body; // 既に要約+折りたたみを持つ
+    if (body.indexOf("まだ判定していません") !== -1) return body; // 空表示は折りたたむ意味が無い
+    return "<details class=\\"prompt-details\\"><summary>プロンプトを表示</summary>" + body + "</details>";
+  }
+
   function renderCompareStatusHtml(which) {
     var status = compareStatus[which];
     // モデル名は子が status で申告したもの(子の設定を正とする)。届く前は親の設定で仮表示。
@@ -4445,7 +4460,7 @@ var PAGE_HTML = `<!doctype html>
     // 子が postStatus() で申告してきた直近のリクエストを、通常ページと同じ
     // renderPromptPanelBody() でここに出す。status が届く前(まだ判定していない)は
     // orderMode だけ親の現在値で仮表示する(renderPromptPanelBody() 側が空表示にする)。
-    var promptHtml = "<div class=\\"compare-prompt\\">" + renderPromptPanelBody({
+    var promptHtml = "<div class=\\"compare-prompt\\">" + renderComparePromptBody({
       orderMode: status && typeof status.orderMode === "string" ? status.orderMode : state.orderMode,
       lastRequest: status ? status.lastRequest : null,
       lastRequestFailed: status ? status.lastRequestFailed : false,
@@ -5002,10 +5017,12 @@ var PAGE_HTML = `<!doctype html>
   function renderPromptPanelBody(info) {
     var empty = "<p class=\\"muted\\">まだ判定していません(実行すると直近の判定に使ったプロンプトが表示されます)</p>";
 
-    // 一括モード(Issue #48)は「一括」1段(質問N問の要約 + 折りたたみ)。
+    // 一括モード(Issue #48)は「一括」1段(質問N問の要約 + 折りたたみ)。空表示の文言も
+    // 一括専用のものにする(Issue #80 レビュー N4。切り出し時に一般的な文言に統一して
+    // しまっていたのを戻した)。
     if (info.orderMode === "all") {
       var allReq = info.lastAllRequest;
-      if (!allReq) return empty;
+      if (!allReq) return "<p class=\\"muted\\">まだ判定していません(実行すると直近の一括判定に使ったプロンプトが表示されます)</p>";
       return renderAllRequestBlock(allReq);
     }
 
@@ -5269,7 +5286,13 @@ var PAGE_HTML = `<!doctype html>
     // PR #78)。innerHTML を丸ごと作り直す方式だと、実行中に高頻度で render() が走る
     // (一括モードの確定ごとなど)せいで、開いたプルダウンやキーボードフォーカスが
     // 一瞬で失われて選べなくなる。フォーカスが外れた次の render() でまとめて反映される。
-    if (!embedMode && isControlSelectFocused()) return;
+    // state.running のときだけガードする(Issue #80 レビュー M1)。ガードを常時
+    // 効かせると、実行前に(select は選んだあとも focus を保つブラウザの挙動のため)
+    // 速度→順番と select を渡り歩くだけで render() が一度も走らず、instant-toggle の
+    // 無効化状態が更新されない(= 一括+最速を選んでも有効化されたように見えない)問題が
+    // 起きる。高頻度 render() が起きるのはそもそも state.running のときだけなので、
+    // ここに絞っても PR #78 の元の目的(実行中の select 操作を止めない)は損なわない。
+    if (!embedMode && state.running && isControlSelectFocused()) return;
     var app = document.getElementById("app");
     // 周回ログのスクロール位置を引き継ぐ(innerHTML を作り直すと先頭に戻るため)。
     // 末尾に居たときは末尾のままにする。
