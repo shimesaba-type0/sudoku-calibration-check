@@ -1340,9 +1340,9 @@ var PAGE_HTML = `<!doctype html>
   button:hover:not(:disabled) { border-color: var(--accent); }
   button:disabled { opacity: 0.5; cursor: not-allowed; }
   #run-btn { background: var(--accent); color: #0b1220; border-color: var(--accent); font-weight: 600; }
-  #speed-toggle, #difficulty-toggle, #model-toggle, #thinking-toggle, #order-toggle { display: inline-flex; border: 1px solid var(--panel-border); border-radius: 6px; overflow: hidden; }
-  .speed-btn, .difficulty-btn, .model-btn, .thinking-btn, .order-btn { border: none; border-radius: 0; background: var(--panel-bg); }
-  .speed-btn.active, .difficulty-btn.active, .model-btn.active, .thinking-btn.active, .order-btn.active { background: var(--accent); color: #0b1220; }
+  #speed-toggle, #difficulty-toggle, #model-toggle, #thinking-toggle, #order-toggle, #history-toggle, #rules-toggle { display: inline-flex; border: 1px solid var(--panel-border); border-radius: 6px; overflow: hidden; }
+  .speed-btn, .difficulty-btn, .model-btn, .thinking-btn, .order-btn, .history-btn, .rules-btn { border: none; border-radius: 0; background: var(--panel-bg); }
+  .speed-btn.active, .difficulty-btn.active, .model-btn.active, .thinking-btn.active, .order-btn.active, .history-btn.active, .rules-btn.active { background: var(--accent); color: #0b1220; }
   .claude-row { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-bottom: 8px; }
   .claude-row label { font-size: 13px; color: var(--muted); }
   input[type="password"], input[type="number"], select {
@@ -1398,6 +1398,9 @@ var PAGE_HTML = `<!doctype html>
   .bar-track { background: var(--border); border-radius: 4px; height: 10px; overflow: hidden; }
   .bar-fill { height: 100%; border-radius: 4px; }
   .bar-pct { text-align: right; font-family: "IBM Plex Mono", monospace; color: var(--muted); }
+  /* 消去法(Issue #61・#63)で外した数字のバー。0%と紛れないよう「×」+ 薄いグレーにする */
+  .bar-row-excluded { opacity: 0.5; }
+  .bar.excluded { height: 100%; width: 100%; background: var(--muted); opacity: 0.35; }
   .muted { color: var(--muted); font-size: 13px; margin: 0; }
   .prompt-json {
     overflow: auto;
@@ -1419,6 +1422,7 @@ var PAGE_HTML = `<!doctype html>
   #round-log ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; max-height: 220px; overflow-y: auto; }
   #round-log li { font-size: 12px; font-family: "IBM Plex Mono", monospace; color: var(--muted); }
   #round-log li.round-log-total { color: var(--text); font-weight: 600; }
+  #round-log li.round-log-limit { color: var(--incorrect); }
   .elapsed-line { margin-top: 8px; }
 
   .banner { border-radius: 8px; padding: 12px 14px; font-size: 14px; font-weight: 600; margin-bottom: 14px; }
@@ -1530,6 +1534,115 @@ var PAGE_HTML = `<!doctype html>
     });
     return cells.map(function (cell) {
       return "r" + cell.r + "c" + cell.c;
+    });
+  }
+
+  // ルール候補(消去法。Issue #63)。実盤面(GIVEN + state.values。正誤問わず確定済みの
+  // マスだけを見る。未確定マス(まだ state.values に値が無いマス)の推測は含めない)から、
+  // (r,c) と同じ行・列・3x3ブロックに **既にある** 数字の集合を返す純粋関数。数独のルールだけを
+  // 使う消去法で、正解(SOLUTION)は一切見ない。一括モードで queue のマスを "." にする前の
+  // 実盤面(buildSnapshot() / buildSelectionSnapshot() が送る盤面より前の状態)を使う。
+  // 昇順・重複なしの配列を返す(9個の自由変数は GIVEN と state だけ。buildSnapshot() と
+  // 同じ形でテストからも直接評価できる)。
+  function ruleExclusions(r, c) {
+    function valueAt(rr, cc) {
+      var given = GIVEN[rr][cc];
+      if (given !== ".") return given;
+      var cell = state.values[rr + "-" + cc];
+      return cell ? cell.value : ".";
+    }
+    var set = {};
+    for (var i = 0; i < 9; i++) {
+      if (i !== c) {
+        var rowDigit = valueAt(r, i);
+        if (rowDigit !== ".") set[rowDigit] = true;
+      }
+      if (i !== r) {
+        var colDigit = valueAt(i, c);
+        if (colDigit !== ".") set[colDigit] = true;
+      }
+    }
+    var blockR = Math.floor(r / 3) * 3;
+    var blockC = Math.floor(c / 3) * 3;
+    for (var rr2 = blockR; rr2 < blockR + 3; rr2++) {
+      for (var cc2 = blockC; cc2 < blockC + 3; cc2++) {
+        if (rr2 === r && cc2 === c) continue;
+        var blockDigit = valueAt(rr2, cc2);
+        if (blockDigit !== ".") set[blockDigit] = true;
+      }
+    }
+    var out = Object.keys(set);
+    out.sort();
+    return out;
+  }
+
+  // "r-c" → 前の周でそのマスに入れて不正解だった数字の配列(消去法の履歴。Issue #61)。
+  // 周をまたいで保持し、reset() / newPuzzle() で空にする(停止/再開では保つ)。
+  var wrongDigits = {};
+
+  // 2つの数字配列(重複ありうる)を昇順・重複なしにまとめる純粋関数。
+  function unionDigits(a, b) {
+    var set = {};
+    var all = a.concat(b);
+    for (var i = 0; i < all.length; i++) set[all[i]] = true;
+    var out = Object.keys(set);
+    out.sort();
+    return out;
+  }
+
+  // commitFocused() が不正解のときに呼ぶ。同じ数字の重複は追加しない。
+  function addWrongDigit(key, digit) {
+    var list = wrongDigits[key];
+    if (!list) {
+      list = [];
+      wrongDigits[key] = list;
+    }
+    if (list.indexOf(digit) === -1) list.push(digit);
+  }
+
+  // (r,c) を聞くときに Worker / Claude の exclude に渡す「外す数字」(消去法。Issue #61・#63)。
+  // 履歴(wrongDigits、トグル state.historyMode)とルール候補(ruleExclusions、トグル
+  // state.ruleMode)の和集合。9個全部になったら(理論上は正解が必ず残るので起きないが、
+  // バグや正解表の不整合への防御として)履歴側を捨ててルール側だけにし、それでも9個なら
+  // 空にする(Worker の 400「excludeで全部の数字を外すことはできません」を絶対に踏まないため)。
+  function excludeFor(r, c) {
+    var key = r + "-" + c;
+    var historyList = state.historyMode ? (wrongDigits[key] || []) : [];
+    var ruleList = state.ruleMode ? ruleExclusions(r, c) : [];
+    var combined = unionDigits(historyList, ruleList);
+    if (combined.length >= DIGITS.length) {
+      combined = ruleList.slice().sort();
+      if (combined.length >= DIGITS.length) combined = [];
+    }
+    return combined;
+  }
+
+  // 一括モード(Issue #48)の exclude マップ。queue の各マスについて excludeFor(r,c) を
+  // 計算し、空でないものだけ "r<row>c<col>" キーで集める(空マスは省く。Worker の
+  // ask:"all" の契約どおり)。
+  function excludeMapForQueue() {
+    var map = {};
+    for (var i = 0; i < queue.length; i++) {
+      var cell = queue[i];
+      var list = excludeFor(cell.r, cell.c);
+      if (list.length > 0) map["r" + cell.r + "c" + cell.c] = list;
+    }
+    return map;
+  }
+
+  // 1〜9の確率バー用のデータを作る純粋関数(focusCellForDigit / focusCellFromCache 共通)。
+  // probabilities に無いキー(消去法。Issue #61・#63 で exclude した数字)は
+  // excluded:true にする(renderBars() が「×」表示に使う)。
+  function buildDigitBars(probabilities, choice) {
+    return DIGITS.map(function (d) {
+      var has = probabilities && Object.prototype.hasOwnProperty.call(probabilities, d);
+      var p = has ? probabilities[d] : 0;
+      return {
+        digit: d,
+        pct: Math.round((typeof p === "number" ? p : 0) * 100),
+        isPick: d === choice,
+        excluded: !has
+      };
     });
   }
 
@@ -1907,25 +2020,52 @@ var PAGE_HTML = `<!doctype html>
   var CLAUDE_ALL_INSTRUCTIONS = "Which digit from 1 to 9 belongs in each empty cell of this Sudoku grid? " +
     "Answer for every cell key required by the schema (each key is formatted as \\"r<row>c<col>\\", zero-based).";
   // structured outputs(output_config.format = json_schema)のスキーマ。Worker の
-  // validateAnswer と同じ形(choice は 1〜9、probabilities は 1〜9 の 9 キー、confidence は数値)。
-  var CLAUDE_OUTPUT_SCHEMA = (function () {
+  // validateAnswer と同じ形(choice は digits、probabilities は digits ぶんのキー、confidence は数値)。
+  // digits は既定で 1〜9(DIGITS)だが、消去法(Issue #61・#63)で候補を絞ったときはその残りだけを渡す。
+  function buildClaudeDigitSchema(digits) {
+    var list = digits || DIGITS;
     var probProps = {};
-    for (var i = 0; i < DIGITS.length; i++) probProps[DIGITS[i]] = { type: "number" };
+    for (var i = 0; i < list.length; i++) probProps[list[i]] = { type: "number" };
     return {
       type: "object",
       properties: {
-        choice: { type: "string", enum: DIGITS.slice() },
-        probabilities: { type: "object", properties: probProps, required: DIGITS.slice(), additionalProperties: false },
+        choice: { type: "string", enum: list.slice() },
+        probabilities: { type: "object", properties: probProps, required: list.slice(), additionalProperties: false },
         confidence: { type: "number" }
       },
       required: ["choice", "probabilities", "confidence"],
       additionalProperties: false
     };
-  })();
+  }
+
+  // 消去法(履歴 Issue #61・ルール候補 Issue #63)で候補を絞ったときだけ system の末尾に足す1文。
+  // Worker 側の NOTE / ALL_NOTE とは別に、Claude 経路だけの注記として足す(候補を絞っていない
+  // ときはこれまでどおりのプロンプトのまま変えない)。
+  var EXCLUDE_NOTE = "Digits already ruled out for a cell are omitted from its choices.";
+
+  // exclude(外す数字の配列。省略・空なら何も外さない)を引いた「残りの数字」を返す。
+  // 昇順を保つ(DIGITS がもともと昇順なので filter だけで足りる)。
+  function remainingDigits(exclude) {
+    if (!exclude || exclude.length === 0) return DIGITS;
+    return DIGITS.filter(function (d) { return exclude.indexOf(d) === -1; });
+  }
+
+  // digit 判定(exclude 込み。Issue #61・#63)の Claude 応答検証メッセージ。Worker の
+  // ANSWER_MESSAGES.digit / digitExcluded と同じ考え方で、候補を絞っているときだけ文言を変える。
+  function digitAnswerMessages(excluded) {
+    return {
+      keys: excluded
+        ? "Claude の応答の probabilities が候補の数字(exclude後)とちょうど一致していません"
+        : "Claude の応答の probabilities が 1〜9 の 9 キーになっていません",
+      choice: excluded
+        ? "Claude の応答の choice が候補の数字(exclude後)のいずれかではありません"
+        : "Claude の応答の choice が 1〜9 のいずれかではありません"
+    };
+  }
   var DIGIT_NUMBERS = [1, 2, 3, 4, 5, 6, 7, 8, 9];
 
   // 確信度順モード(Issue #38)のマス選び用スキーマ。choice / probabilities のキーは
-  // その時点の queue のマス("r<row>c<col>")。DIGITS 固定の CLAUDE_OUTPUT_SCHEMA と違い、
+  // その時点の queue のマス("r<row>c<col>")。数字の候補を組み立てる buildClaudeDigitSchema と違い、
   // 呼び出しごとに候補が変わるので毎回組み立てる。
   function buildClaudeCellSchema(keys) {
     var probProps = {};
@@ -1943,19 +2083,26 @@ var PAGE_HTML = `<!doctype html>
   }
 
   // 一括モード(Issue #48)のスキーマ。keys(その周の queue、行優先)ごとに、digit 判定と
-  // 同じ形(choice は 1〜9、probabilities は 1〜9 の 9 キー、confidence は数値)の
-  // オブジェクトを required で持つ。呼び出しのたびに候補(= queue)が変わるので毎回組み立てる
+  // 同じ形(choice / probabilities / confidence)のオブジェクトを required で持つ。
+  // excludeByKey(Issue #61・#63、マスのキー →「外す数字」)があるマスだけ、そのマスの
+  // choice.enum / probabilities を残りの数字だけに絞る(無いマスは従来どおり 1〜9)。
+  // 呼び出しのたびに候補(= queue、exclude とも)が変わるので毎回組み立てる
   // (buildClaudeCellSchema と同じ考え方)。
-  function buildClaudeAllSchema(keys) {
-    var digitProbProps = {};
-    for (var d = 0; d < DIGITS.length; d++) digitProbProps[DIGITS[d]] = { type: "number" };
+  function buildClaudeAllSchema(keys, excludeByKey) {
+    var byKey = excludeByKey || {};
     var cellProps = {};
     for (var i = 0; i < keys.length; i++) {
-      cellProps[keys[i]] = {
+      var key = keys[i];
+      // byKey[key] は「外す数字」(exclude、Worker に送るのと同じ形)。remainingDigits() で
+      // 残りの数字に変換してからスキーマに使う(無いマスは remainingDigits(undefined) = DIGITS)。
+      var digits = remainingDigits(byKey[key]);
+      var digitProbProps = {};
+      for (var d = 0; d < digits.length; d++) digitProbProps[digits[d]] = { type: "number" };
+      cellProps[key] = {
         type: "object",
         properties: {
-          choice: { type: "string", enum: DIGITS.slice() },
-          probabilities: { type: "object", properties: digitProbProps, required: DIGITS.slice(), additionalProperties: false },
+          choice: { type: "string", enum: digits.slice() },
+          probabilities: { type: "object", properties: digitProbProps, required: digits.slice(), additionalProperties: false },
           confidence: { type: "number" }
         },
         required: ["choice", "probabilities", "confidence"],
@@ -2034,8 +2181,11 @@ var PAGE_HTML = `<!doctype html>
     lastCellRequest: null,    // 直近のマス選びでモデルに送ったリクエスト(Jev なら request、Claude なら送ったボディ)
     allFetching: false,       // 一括モード(Issue #48)の呼び出し中か(結果が届くまで座標もバーも無い)
     lastAllRequest: null,     // 直近の一括呼び出し { request, failed, count }(プロンプト枠。Issue #48)
-    pauseReason: null         // 一時的な失敗による停止の理由文言(Issue #43)。手動 stop() では null のまま。
+    pauseReason: null,        // 一時的な失敗による停止の理由文言(Issue #43)。手動 stop() では null のまま。
                               // run() / reset() / newPuzzle() / stop() で null に戻る
+    historyMode: true,        // 消去法(履歴、Issue #61)のトグル。既定あり。orderMode と同じく
+                              // modelSettingsLocked() でロックし、reset() / newPuzzle() をまたいで保持する
+    ruleMode: true            // ルール候補(消去法、Issue #63)のトグル。既定あり。historyMode と同じ扱い
   };
   // 描画に不要な進行管理はモジュール変数(docs/DESIGN.md 4.1)
   var queue = [];
@@ -2357,20 +2507,24 @@ var PAGE_HTML = `<!doctype html>
   // -------------------------------------------------------------------
   // 判定 1 件。スナップショットはここで 1 回だけ作り(フォーカス確定後、SPEC F3)、
   // モデルトグルに応じて Jev(Worker 経由)か Claude(ブラウザ直呼び)に渡す。
+  // exclude(消去法。Issue #61・#63)は excludeFor(r,c) をここで1回だけ計算して両経路に渡す。
   // _t(ミリ秒。fetch開始→応答JSON取得までのレイテンシ、Issue #55)を結果に添える。
   async function judgeCell(r, c, signal) {
     var puzzle = buildSnapshot();
+    var exclude = excludeFor(r, c);
     var startedAt = nowMs();
-    var result = state.modelMode === "claude" ? await judgeCellClaude(puzzle, r, c, signal) : await judgeCellJev(puzzle, r, c, signal);
+    var result = state.modelMode === "claude" ? await judgeCellClaude(puzzle, r, c, exclude, signal) : await judgeCellJev(puzzle, r, c, exclude, signal);
     result._t = nowMs() - startedAt;
     return result;
   }
 
-  async function judgeCellJev(puzzle, r, c, signal) {
+  async function judgeCellJev(puzzle, r, c, exclude, signal) {
+    var body = { puzzle: puzzle, target: { row: r, col: c } };
+    if (exclude && exclude.length > 0) body.exclude = exclude;
     var res = await fetch("/api/judge", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ puzzle: puzzle, target: { row: r, col: c } }),
+      body: JSON.stringify(body),
       signal: signal
     });
     if (res.ok) return res.json();
@@ -2445,21 +2599,26 @@ var PAGE_HTML = `<!doctype html>
 
   // 一括モード(Issue #48)の1周ぶん。スナップショットはここで1回だけ作り
   // (buildSelectionSnapshot()。queue の全マスを "." にしたもの)、モデルトグルに応じて
-  // Jev / Claude に渡す。戻り値はどちらも { cells, request }(cells はマスのキー →
+  // Jev / Claude に渡す。exclude(消去法。Issue #61・#63)は excludeMapForQueue() を
+  // ここで1回だけ計算して両経路に渡す(空マスは省く。全部空なら渡さない)。
+  // 戻り値はどちらも { cells, request }(cells はマスのキー →
   // { choice, probabilities, confidence })+ _t(Issue #55)。
   async function askAll(signal) {
     var puzzle = buildSelectionSnapshot();
+    var excludeByKey = excludeMapForQueue();
     var startedAt = nowMs();
-    var result = state.modelMode === "claude" ? await askAllClaude(puzzle, signal) : await askAllJev(puzzle, signal);
+    var result = state.modelMode === "claude" ? await askAllClaude(puzzle, excludeByKey, signal) : await askAllJev(puzzle, excludeByKey, signal);
     result._t = nowMs() - startedAt;
     return result;
   }
 
-  async function askAllJev(puzzle, signal) {
+  async function askAllJev(puzzle, excludeByKey, signal) {
+    var body = { puzzle: puzzle, ask: "all" };
+    if (excludeByKey && Object.keys(excludeByKey).length > 0) body.exclude = excludeByKey;
     var res = await fetch("/api/judge", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ puzzle: puzzle, ask: "all" }),
+      body: JSON.stringify(body),
       signal: signal
     });
     if (res.ok) return res.json();
@@ -2605,6 +2764,21 @@ var PAGE_HTML = `<!doctype html>
     render();
   }
 
+  // 消去法(履歴。Issue #61 / ルール候補。Issue #63)の2つのトグル。順番トグルと同じ条件で
+  // ロックする(周の途中で切り替えると、そのマスに渡す candidate の意味が周内で混ざるため)。
+  // localStorage には保存しない(orderMode と同じく reset() / newPuzzle() をまたいで state で保持)。
+  function setHistoryMode(on) {
+    if (modelSettingsLocked()) return;
+    state.historyMode = !!on;
+    render();
+  }
+
+  function setRuleMode(on) {
+    if (modelSettingsLocked()) return;
+    state.ruleMode = !!on;
+    render();
+  }
+
   // 記録(scc.records.v1)の m に入れるモデル識別子。Claude は思考の有無で分ける。
   function currentModelId() {
     if (state.modelMode === "claude") return state.claudeModel + (state.claudeThinking ? "+think" : "");
@@ -2623,18 +2797,23 @@ var PAGE_HTML = `<!doctype html>
   // Claude に送るリクエストボディ。ヘッダー(キー)は含めない。これがそのまま
   // state.lastRequest(「モデルに送ったプロンプト」パネル)になる。
   // 盤面は Jev と同じ buildSnapshot()(対象マスは "."、SOLUTION 由来の情報なし)。
-  function buildClaudeRequest(puzzle, r, c) {
+  // exclude(消去法。Issue #61・#63、省略・空なら何も外さない)があるときだけ、
+  // スキーマの choice.enum / probabilities を残りの数字に絞り、system の末尾に
+  // EXCLUDE_NOTE を足す(無いときはこれまでどおりのプロンプトのまま)。
+  function buildClaudeRequest(puzzle, r, c, exclude) {
+    var digits = remainingDigits(exclude);
+    var hasExclude = digits.length < DIGITS.length;
     var body = {
       model: state.claudeModel,
       max_tokens: CLAUDE_ANSWER_MAX_TOKENS,
-      system: CLAUDE_SYSTEM,
+      system: hasExclude ? CLAUDE_SYSTEM + " " + EXCLUDE_NOTE : CLAUDE_SYSTEM,
       messages: [
         {
           role: "user",
           content: INSTRUCTIONS + "\\n" + JSON.stringify({ puzzle: puzzle, target: { row: r, col: c } })
         }
       ],
-      output_config: { format: { type: "json_schema", schema: CLAUDE_OUTPUT_SCHEMA } }
+      output_config: { format: { type: "json_schema", schema: buildClaudeDigitSchema(digits) } }
     };
     var thinking = claudeThinkingConfig(state.claudeModel, state.claudeThinking);
     if (thinking) {
@@ -2676,21 +2855,24 @@ var PAGE_HTML = `<!doctype html>
   // 一括モード(Issue #48)のリクエストボディ(Claude 経路)。buildClaudeCellRequest と同じ
   // 組み立て方だが、system が CLAUDE_ALL_SYSTEM、messages[0].content が
   // CLAUDE_ALL_INSTRUCTIONS + 改行 + { puzzle }(target は無い)、スキーマが
-  // buildClaudeAllSchema(keys)(マスごとに choice/probabilities/confidence の3つ組)。
+  // buildClaudeAllSchema(keys, excludeByKey)(マスごとに choice/probabilities/confidence の3つ組)。
+  // excludeByKey(消去法。Issue #61・#63)にキーが1つでもあれば system の末尾に EXCLUDE_NOTE を足す
+  // (無ければこれまでどおりのプロンプトのまま)。
   // max_tokens は出力が大きい(最大64マス×9確率)ので、既存の設定と一括専用の最低値の
   // 大きい方を使う(docs/DESIGN.md 3.6)。
-  function buildClaudeAllRequest(puzzle, keys) {
+  function buildClaudeAllRequest(puzzle, keys, excludeByKey) {
+    var hasExclude = excludeByKey && Object.keys(excludeByKey).length > 0;
     var body = {
       model: state.claudeModel,
       max_tokens: CLAUDE_ALL_ANSWER_MAX_TOKENS, // 思考なしの最低値
-      system: CLAUDE_ALL_SYSTEM,
+      system: hasExclude ? CLAUDE_ALL_SYSTEM + " " + EXCLUDE_NOTE : CLAUDE_ALL_SYSTEM,
       messages: [
         {
           role: "user",
           content: CLAUDE_ALL_INSTRUCTIONS + "\\n" + JSON.stringify({ puzzle: puzzle })
         }
       ],
-      output_config: { format: { type: "json_schema", schema: buildClaudeAllSchema(keys) } }
+      output_config: { format: { type: "json_schema", schema: buildClaudeAllSchema(keys, excludeByKey) } }
     };
     var thinking = claudeThinkingConfig(state.claudeModel, state.claudeThinking);
     if (thinking) {
@@ -2706,29 +2888,31 @@ var PAGE_HTML = `<!doctype html>
   // Worker の validateAnswer と同じ基準で Claude の JSON を検証する。expectedKeys は
   // choice / probabilities が取りうるキーの集合(省略時は DIGITS。確信度順のマス選び
   // (Issue #38)では queue のマスのキーを渡す)。Worker の validateAnswer と同じく
-  // 一般化してある(3.3 と同じ考え方)。
-  function validateClaudeAnswer(answer, expectedKeys) {
+  // 一般化してある(3.3 と同じ考え方)。keysMessage / choiceMessage を渡すと既定の文言
+  // (expectedKeys の有無で「候補マスの…」/「1〜9の…」を出し分けるだけの単純な規則)を
+  // 上書きできる(消去法。Issue #61・#63、digitAnswerMessages() が使う)。
+  function validateClaudeAnswer(answer, expectedKeys, keysMessage, choiceMessage) {
     var keys2 = expectedKeys || DIGITS;
     // digit(expectedKeys 省略)の文言は #37 のまま。cell は候補マスの文言(Worker の ANSWER_MESSAGES と同じ方針)。
-    var keysMessage = expectedKeys
+    var km = keysMessage || (expectedKeys
       ? "Claude の応答の probabilities が候補マスのキーと一致していません"
-      : "Claude の応答の probabilities が 1〜9 の 9 キーになっていません";
-    var choiceMessage = expectedKeys
+      : "Claude の応答の probabilities が 1〜9 の 9 キーになっていません");
+    var cm = choiceMessage || (expectedKeys
       ? "Claude の応答の choice が候補マスのいずれかではありません"
-      : "Claude の応答の choice が 1〜9 のいずれかではありません";
+      : "Claude の応答の choice が 1〜9 のいずれかではありません");
     if (!answer || typeof answer !== "object") return "Claude の応答が JSON オブジェクトではありません";
     var probabilities = answer.probabilities;
     if (probabilities === null || typeof probabilities !== "object" || Array.isArray(probabilities)) {
       return "Claude の応答に probabilities がありません";
     }
     var keys = Object.keys(probabilities);
-    if (keys.length !== keys2.length) return keysMessage;
+    if (keys.length !== keys2.length) return km;
     for (var i = 0; i < keys2.length; i++) {
       var k = keys2[i];
-      if (!Object.prototype.hasOwnProperty.call(probabilities, k)) return keysMessage;
+      if (!Object.prototype.hasOwnProperty.call(probabilities, k)) return km;
       if (typeof probabilities[k] !== "number" || !isFinite(probabilities[k])) return "Claude の応答の probabilities に数値でない値が含まれています";
     }
-    if (typeof answer.choice !== "string" || keys2.indexOf(answer.choice) === -1) return choiceMessage;
+    if (typeof answer.choice !== "string" || keys2.indexOf(answer.choice) === -1) return cm;
     if (typeof answer.confidence !== "number" || !isFinite(answer.confidence)) return "Claude の応答の confidence が数値ではありません";
     return null;
   }
@@ -2769,27 +2953,11 @@ var PAGE_HTML = `<!doctype html>
     return { answer: parsed };
   }
 
-  // 一括モード(Issue #48)の応答の検証。answer はマスのキー(expectedKeys = queue の
-  // キー一覧)をそれぞれ持つオブジェクトで、各値は digit 判定と同じ基準
-  // (validateClaudeAnswer(answer[key], DIGITS))を満たす必要がある。Worker の
-  // validateAllAnswers(docs/DESIGN.md 3.3)と同じ考え方で、どのマスで落ちたかが
-  // わかる文言にする。
-  function validateClaudeAllAnswer(answer, expectedKeys) {
-    if (!answer || typeof answer !== "object" || Array.isArray(answer)) return "Claude の応答が JSON オブジェクトではありません";
-    var keys = Object.keys(answer);
-    if (keys.length !== expectedKeys.length) return "Claude の応答のキーが対象マスと一致していません";
-    for (var i = 0; i < expectedKeys.length; i++) {
-      var k = expectedKeys[i];
-      if (!Object.prototype.hasOwnProperty.call(answer, k)) return "Claude の応答のキーが対象マスと一致していません";
-      var bad = validateClaudeAnswer(answer[k], DIGITS);
-      if (bad !== null) return k + " の応答: " + bad;
-    }
-    return null;
-  }
-
-  // 一括モードの応答から JSON をまとめて取り出す。{ answer } か { error }。
-  // answer はマスのキー → { choice, probabilities, confidence } のオブジェクト。
-  function parseClaudeAllAnswer(data, expectedKeys) {
+  // digit 判定(exclude 込み。Issue #61・#63)の Claude 応答の取り出し・検証。digits は
+  // remainingDigits(exclude) の結果(省略なら DIGITS そのまま)。parseClaudeAnswer と違い、
+  // 文言は digitAnswerMessages() で「候補の数字(exclude後)」/「1〜9」を出し分ける
+  // (expectedKeys の有無だけで cell 向けの文言に化ける parseClaudeAnswer は使わない)。
+  function parseClaudeDigitAnswer(data, digits) {
     var extracted = extractClaudeText(data);
     if (extracted.error) return { error: extracted.error };
     var parsed;
@@ -2798,7 +2966,48 @@ var PAGE_HTML = `<!doctype html>
     } catch (e) {
       return { error: "Claude の応答を JSON として解釈できません" };
     }
-    var bad = validateClaudeAllAnswer(parsed, expectedKeys);
+    var list = digits || DIGITS;
+    var messages = digitAnswerMessages(list.length < DIGITS.length);
+    var bad = validateClaudeAnswer(parsed, list, messages.keys, messages.choice);
+    if (bad !== null) return { error: bad };
+    return { answer: parsed };
+  }
+
+  // 一括モード(Issue #48)の応答の検証。answer はマスのキー(expectedKeys = queue の
+  // キー一覧)をそれぞれ持つオブジェクトで、各値は digit 判定と同じ基準を満たす必要がある。
+  // Worker の validateAllAnswers(docs/DESIGN.md 3.3)と同じ考え方で、どのマスで落ちたかが
+  // わかる文言にする。excludeByKey(Issue #61・#63)にあるマスは、その残りの数字だけで
+  // 検証し文言も「候補の数字(exclude後)」にする(digitAnswerMessages())。無いマスは
+  // 従来どおり DIGITS で検証する。
+  function validateClaudeAllAnswer(answer, expectedKeys, excludeByKey) {
+    if (!answer || typeof answer !== "object" || Array.isArray(answer)) return "Claude の応答が JSON オブジェクトではありません";
+    var byKey = excludeByKey || {};
+    var keys = Object.keys(answer);
+    if (keys.length !== expectedKeys.length) return "Claude の応答のキーが対象マスと一致していません";
+    for (var i = 0; i < expectedKeys.length; i++) {
+      var k = expectedKeys[i];
+      if (!Object.prototype.hasOwnProperty.call(answer, k)) return "Claude の応答のキーが対象マスと一致していません";
+      // byKey[k] は「外す数字」(exclude)。remainingDigits() で残りの数字に変換する(buildClaudeAllSchema と同じ)。
+      var digits = remainingDigits(byKey[k]);
+      var messages = digitAnswerMessages(digits.length < DIGITS.length);
+      var bad = validateClaudeAnswer(answer[k], digits, messages.keys, messages.choice);
+      if (bad !== null) return k + " の応答: " + bad;
+    }
+    return null;
+  }
+
+  // 一括モードの応答から JSON をまとめて取り出す。{ answer } か { error }。
+  // answer はマスのキー → { choice, probabilities, confidence } のオブジェクト。
+  function parseClaudeAllAnswer(data, expectedKeys, excludeByKey) {
+    var extracted = extractClaudeText(data);
+    if (extracted.error) return { error: extracted.error };
+    var parsed;
+    try {
+      parsed = JSON.parse(extracted.text);
+    } catch (e) {
+      return { error: "Claude の応答を JSON として解釈できません" };
+    }
+    var bad = validateClaudeAllAnswer(parsed, expectedKeys, excludeByKey);
     if (bad !== null) return { error: bad };
     return { answer: parsed };
   }
@@ -2812,11 +3021,12 @@ var PAGE_HTML = `<!doctype html>
 
   // ブラウザから api.anthropic.com を直接呼ぶ(CORS 対応。ブラウザからの直接呼び出しには
   // anthropic-dangerous-direct-browser-access ヘッダーが必要)。キーは x-api-key ヘッダーにだけ載せる。
+  // exclude(消去法。Issue #61・#63)は excludeFor(r,c) の結果をそのまま渡す。
   // 戻り値は judgeCellJev と同じ形 { probabilities, choice, confidence, request }。
-  async function judgeCellClaude(puzzle, r, c, signal) {
+  async function judgeCellClaude(puzzle, r, c, exclude, signal) {
     var key = loadAnthropicKey();
     if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」でキーを保存してください)");
-    var body = buildClaudeRequest(puzzle, r, c);
+    var body = buildClaudeRequest(puzzle, r, c, exclude);
     var res;
     try {
       res = await fetch(ANTHROPIC_MESSAGES_URL, {
@@ -2853,7 +3063,7 @@ var PAGE_HTML = `<!doctype html>
       if (isTransientClaudeStatus(res.status)) httpErr.transient = true;
       throw httpErr;
     }
-    var parsed = parseClaudeAnswer(data);
+    var parsed = parseClaudeDigitAnswer(data, remainingDigits(exclude));
     if (parsed.error) {
       var formatErr = new Error(parsed.error);
       formatErr.request = body;
@@ -2934,13 +3144,14 @@ var PAGE_HTML = `<!doctype html>
   }
 
   // 一括モード(Issue #48)の1周ぶん(Claude 経路)。judgeCellClaude / askCellClaude と
-  // 同じ組み立て。戻り値は askAllJev と同じ形 { cells, request }(cells は
+  // 同じ組み立て。excludeByKey(消去法。Issue #61・#63)は excludeMapForQueue() の結果を
+  // そのまま渡す。戻り値は askAllJev と同じ形 { cells, request }(cells は
   // マスのキー → { choice, probabilities, confidence })。
-  async function askAllClaude(puzzle, signal) {
+  async function askAllClaude(puzzle, excludeByKey, signal) {
     var key = loadAnthropicKey();
     if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」でキーを保存してください)");
     var keys = selectionKeys();
-    var body = buildClaudeAllRequest(puzzle, keys);
+    var body = buildClaudeAllRequest(puzzle, keys, excludeByKey);
     var res;
     try {
       res = await fetch(ANTHROPIC_MESSAGES_URL, {
@@ -2976,7 +3187,7 @@ var PAGE_HTML = `<!doctype html>
       if (isTransientClaudeStatus(res.status)) httpErr.transient = true;
       throw httpErr;
     }
-    var parsed = parseClaudeAllAnswer(data, keys);
+    var parsed = parseClaudeAllAnswer(data, keys, excludeByKey);
     if (parsed.error) {
       var formatErr = new Error(parsed.error);
       formatErr.request = body;
@@ -3246,11 +3457,7 @@ var PAGE_HTML = `<!doctype html>
     inflightController = new AbortController();
     judgeCell(cell.r, cell.c, inflightController.signal).then(function (result) {
       if (!isCurrent(token)) return; // リセット後などの古い世代は捨てる
-      var probs = DIGITS.map(function (d) {
-        var p = result.probabilities ? result.probabilities[d] : 0;
-        return { digit: d, pct: Math.round((typeof p === "number" ? p : 0) * 100), isPick: d === result.choice };
-      });
-      state.currentProbs = probs;
+      state.currentProbs = buildDigitBars(result.probabilities, result.choice);
       // Worker が Jev に渡したペイロードそのもの(Issue #34)。停止中でも消さず、
       // 次の判定が確定するまで(エラー時もそのまま)残す。
       if (result.request && typeof result.request === "object") {
@@ -3404,11 +3611,7 @@ var PAGE_HTML = `<!doctype html>
       showError("一括の結果に対象マスがありません: " + key);
       return;
     }
-    var probs = DIGITS.map(function (d) {
-      var p = result.probabilities ? result.probabilities[d] : 0;
-      return { digit: d, pct: Math.round((typeof p === "number" ? p : 0) * 100), isPick: d === result.choice };
-    });
-    state.currentProbs = probs;
+    state.currentProbs = buildDigitBars(result.probabilities, result.choice);
     // 一括の usage/レイテンシ(pendingAllUsage)はここでは付けず、commitFocused() が確定時に
     // 周の先頭1件へ消費する(確定待ち中に停止 → 再開しても消えないように。PR #67 レビュー M1)。
     pendingCommit = {
@@ -3445,11 +3648,16 @@ var PAGE_HTML = `<!doctype html>
       roundTally.correct += 1;
     } else {
       roundWrong.push({ r: r, c: c });
+      // 消去法(履歴。Issue #61): 次にこのマスを聞くときの exclude に積む
+      // (履歴トグルが「なし」でも記録はしておき、あとで「あり」に戻したときに効くようにする)。
+      addWrongDigit(key, pendingCommit.choice);
     }
     // 集計ビュー用の記録(SPEC F1 拡張2)。正誤が確定したこの時点で1件追記する。
     var probs = pendingCommit.probabilities;
     var pc = probs && typeof probs[pendingCommit.choice] === "number" ? probs[pendingCommit.choice] : null;
     var conf = typeof pendingCommit.confidence === "number" ? pendingCommit.confidence : null;
+    // 消去法(Issue #61・#63): 候補の数(n、除外なしなら9)とトグルの状態(e=履歴、rc=ルール候補)。
+    var candidateCount = probs ? Object.keys(probs).length : DIGITS.length;
     // 一括モード(Issue #48)は m を currentModelId() + "/all"(Jev なら "typesafe/jev/all"、
     // Claude なら例 "claude-opus-5+think/all")にし、o:"all" を添える(較正図で typesafe/jev/all のように
     // 別項目として絞り込めるように。SPEC 3章)。他のモードは従来どおり currentModelId()。
@@ -3465,7 +3673,10 @@ var PAGE_HTML = `<!doctype html>
       pc: pc,
       conf: conf,
       ok: correct,
-      m: modelId // どのモデルの判定か(Issue #37)。無い記録は Jev 扱い
+      m: modelId, // どのモデルの判定か(Issue #37)。無い記録は Jev 扱い
+      n: candidateCount, // 消去法(Issue #61・#63)後に候補だった数字の数(9 = 除外なし)
+      e: state.historyMode, // 履歴トグル(消去法。Issue #61)の状態
+      rc: state.ruleMode // ルール候補トグル(消去法。Issue #63)の状態
     };
     if (isAll) record.o = "all";
     // usage(トークン使用量)とレイテンシ(Issue #55・#56、SPEC 5章)。u/t が無い記録は
@@ -3546,6 +3757,10 @@ var PAGE_HTML = `<!doctype html>
       state.done = true;
       state.running = false;
       state.stoppedAtLimit = true;
+      // 強制終了(Issue #60)。統計カードの「この周の進捗」だけでは全部正解したように
+      // 見える問題があったので、周回ログの末尾にも「N周で強制終了(最終周の不正解 M マス)」を
+      // 1行足す(既存の合計行より前。renderRoundLog() が formatLimitLogLine() で描く)。
+      state.roundLog.push({ round: state.round, limit: true, wrong: roundWrong.length });
       render();
       return;
     }
@@ -3714,6 +3929,8 @@ var PAGE_HTML = `<!doctype html>
     var keepClaudeThinking = state.claudeThinking;
     var keepCalibFilter = state.calibModelFilter;
     var keepOrderMode = state.orderMode;
+    var keepHistoryMode = state.historyMode;
+    var keepRuleMode = state.ruleMode;
     state = {
       round: 1,
       values: {},
@@ -3741,7 +3958,9 @@ var PAGE_HTML = `<!doctype html>
       lastCellRequest: null,
       allFetching: false,
       lastAllRequest: null,
-      pauseReason: null
+      pauseReason: null,
+      historyMode: keepHistoryMode,
+      ruleMode: keepRuleMode
     };
     queue = [];
     roundWrong = [];
@@ -3749,6 +3968,7 @@ var PAGE_HTML = `<!doctype html>
     roundSize = TOTAL_EMPTY;
     started = false;
     pendingCommit = null;
+    wrongDigits = {}; // 消去法(履歴。Issue #61)もリセット/新しい問題で消す
     allResults = null; // 一括モード(Issue #48)のキャッシュもリセット/新しい問題で捨てる
     pendingAllUsage = null;
     carryUsage = null;
@@ -3825,6 +4045,9 @@ var PAGE_HTML = `<!doctype html>
     if (params.model === "jev" || params.model === "claude") opts.model = params.model;
     if (params.order === "scan" || params.order === "confidence" || params.order === "all") opts.order = params.order;
     if (params.speed === "slow" || params.speed === "fast") opts.speed = params.speed;
+    // 消去法の2トグル(Issue #61・#63、比較シェル/埋め込み用)。不正値(0/1以外)は無視する。
+    if (params.history === "0" || params.history === "1") opts.history = params.history === "1";
+    if (params.rules === "0" || params.rules === "1") opts.rules = params.rules === "1";
     opts.embed = params.embed === "1";
     return opts;
   }
@@ -3861,6 +4084,8 @@ var PAGE_HTML = `<!doctype html>
     if (opts.model) state.modelMode = opts.model;
     if (opts.order) state.orderMode = opts.order;
     if (opts.speed) state.speedMode = opts.speed;
+    if (typeof opts.history === "boolean") state.historyMode = opts.history;
+    if (typeof opts.rules === "boolean") state.ruleMode = opts.rules;
     embedMode = !!opts.embed;
   }
 
@@ -3923,6 +4148,8 @@ var PAGE_HTML = `<!doctype html>
       }
       if (data.type === "setSpeed" && (data.mode === "slow" || data.mode === "fast")) { setSpeed(data.mode); return; }
       if (data.type === "setOrderMode" && typeof data.mode === "string") { setOrderMode(data.mode); return; }
+      if (data.type === "setHistoryMode" && typeof data.on === "boolean") { setHistoryMode(data.on); return; }
+      if (data.type === "setRuleMode" && typeof data.on === "boolean") { setRuleMode(data.on); return; }
     });
   }
 
@@ -3937,7 +4164,9 @@ var PAGE_HTML = `<!doctype html>
       "&model=" + encodeURIComponent(model) +
       "&puzzle=" + encodeURIComponent(GIVEN.join("")) +
       "&speed=" + encodeURIComponent(state.speedMode) +
-      "&order=" + encodeURIComponent(state.orderMode);
+      "&order=" + encodeURIComponent(state.orderMode) +
+      "&history=" + (state.historyMode ? "1" : "0") +
+      "&rules=" + (state.ruleMode ? "1" : "0");
     return "/?" + qs;
   }
 
@@ -3981,6 +4210,11 @@ var PAGE_HTML = `<!doctype html>
     var scanActive = state.orderMode === "scan" ? " active" : "";
     var confidenceActive = state.orderMode === "confidence" ? " active" : "";
     var allOrderActive = state.orderMode === "all" ? " active" : "";
+    // 消去法の2トグル(Issue #61・#63)。順番トグルと同じ条件でロックする(orderDisabled 共有)。
+    var historyOnActive = state.historyMode ? " active" : "";
+    var historyOffActive = state.historyMode ? "" : " active";
+    var ruleOnActive = state.ruleMode ? " active" : "";
+    var ruleOffActive = state.ruleMode ? "" : " active";
     var easyActive = state.difficulty === "easy" ? " active" : "";
     var normalActive = state.difficulty === "normal" ? " active" : "";
     var hardActive = state.difficulty === "hard" ? " active" : "";
@@ -3998,6 +4232,14 @@ var PAGE_HTML = `<!doctype html>
       "<button class=\\"order-btn" + scanActive + "\\" onclick=\\"compareSetOrderMode('scan')\\" " + orderDisabled + ">左上から</button>" +
       "<button class=\\"order-btn" + confidenceActive + "\\" onclick=\\"compareSetOrderMode('confidence')\\" " + orderDisabled + ">確信度順</button>" +
       "<button class=\\"order-btn" + allOrderActive + "\\" onclick=\\"compareSetOrderMode('all')\\" " + orderDisabled + ">一括</button>" +
+      "</div>" +
+      "<div id=\\"history-toggle\\">" +
+      "<button class=\\"history-btn" + historyOnActive + "\\" onclick=\\"compareSetHistoryMode(true)\\" " + orderDisabled + ">履歴あり</button>" +
+      "<button class=\\"history-btn" + historyOffActive + "\\" onclick=\\"compareSetHistoryMode(false)\\" " + orderDisabled + ">履歴なし</button>" +
+      "</div>" +
+      "<div id=\\"rules-toggle\\">" +
+      "<button class=\\"rules-btn" + ruleOnActive + "\\" onclick=\\"compareSetRuleMode(true)\\" " + orderDisabled + ">ルールあり</button>" +
+      "<button class=\\"rules-btn" + ruleOffActive + "\\" onclick=\\"compareSetRuleMode(false)\\" " + orderDisabled + ">ルールなし</button>" +
       "</div>" +
       "<div id=\\"difficulty-toggle\\">" +
       "<button class=\\"difficulty-btn" + easyActive + "\\" onclick=\\"compareSetDifficulty('easy')\\">やさしい</button>" +
@@ -4078,6 +4320,22 @@ var PAGE_HTML = `<!doctype html>
     if (compareEitherRunning() || compareEitherPaused()) return; // 子と同じロック(S2)
     state.orderMode = mode;
     comparePostToFrames({ type: "setOrderMode", mode: mode });
+    renderCompareTopbarInPlace();
+  }
+
+  // 消去法の2トグル(履歴 Issue #61 / ルール候補 Issue #63)。compareSetOrderMode と同じ
+  // ロック条件で、両 iframe に postMessage して同時に切り替える。
+  function compareSetHistoryMode(on) {
+    if (compareEitherRunning() || compareEitherPaused()) return;
+    state.historyMode = !!on;
+    comparePostToFrames({ type: "setHistoryMode", on: !!on });
+    renderCompareTopbarInPlace();
+  }
+
+  function compareSetRuleMode(on) {
+    if (compareEitherRunning() || compareEitherPaused()) return;
+    state.ruleMode = !!on;
+    comparePostToFrames({ type: "setRuleMode", on: !!on });
     renderCompareTopbarInPlace();
   }
 
@@ -4278,6 +4536,11 @@ var PAGE_HTML = `<!doctype html>
     var confidenceActive = state.orderMode === "confidence" ? " active" : "";
     var allOrderActive = state.orderMode === "all" ? " active" : "";
     var orderDisabled = modelSettingsLocked() ? "disabled" : "";
+    // 消去法の2トグル(履歴 Issue #61 / ルール候補 Issue #63)。順番トグルと同じ条件でロックする。
+    var historyOnActive = state.historyMode ? " active" : "";
+    var historyOffActive = state.historyMode ? "" : " active";
+    var ruleOnActive = state.ruleMode ? " active" : "";
+    var ruleOffActive = state.ruleMode ? "" : " active";
     return "<div class=\\"controls\\">" +
       "<button id=\\"run-btn\\" onclick=\\"" + runOnclick + "\\" " + runDisabled + ">" + runLabel + "</button>" +
       "<button id=\\"reset-btn\\" onclick=\\"reset()\\" " + resetDisabled + ">リセット</button>" +
@@ -4299,6 +4562,14 @@ var PAGE_HTML = `<!doctype html>
       "<button class=\\"order-btn" + scanActive + "\\" aria-pressed=\\"" + (state.orderMode === "scan") + "\\" onclick=\\"setOrderMode('scan')\\" " + orderDisabled + ">左上から</button>" +
       "<button class=\\"order-btn" + confidenceActive + "\\" aria-pressed=\\"" + (state.orderMode === "confidence") + "\\" onclick=\\"setOrderMode('confidence')\\" " + orderDisabled + ">確信度順</button>" +
       "<button class=\\"order-btn" + allOrderActive + "\\" aria-pressed=\\"" + (state.orderMode === "all") + "\\" onclick=\\"setOrderMode('all')\\" " + orderDisabled + ">一括</button>" +
+      "</div>" +
+      "<div id=\\"history-toggle\\">" +
+      "<button class=\\"history-btn" + historyOnActive + "\\" aria-pressed=\\"" + state.historyMode + "\\" onclick=\\"setHistoryMode(true)\\" " + orderDisabled + ">履歴あり</button>" +
+      "<button class=\\"history-btn" + historyOffActive + "\\" aria-pressed=\\"" + !state.historyMode + "\\" onclick=\\"setHistoryMode(false)\\" " + orderDisabled + ">履歴なし</button>" +
+      "</div>" +
+      "<div id=\\"rules-toggle\\">" +
+      "<button class=\\"rules-btn" + ruleOnActive + "\\" aria-pressed=\\"" + state.ruleMode + "\\" onclick=\\"setRuleMode(true)\\" " + orderDisabled + ">ルールあり</button>" +
+      "<button class=\\"rules-btn" + ruleOffActive + "\\" aria-pressed=\\"" + !state.ruleMode + "\\" onclick=\\"setRuleMode(false)\\" " + orderDisabled + ">ルールなし</button>" +
       "</div>" +
       "</div>";
   }
@@ -4373,15 +4644,18 @@ var PAGE_HTML = `<!doctype html>
     return "<div class=\\"stat-card\\"><div class=\\"stat-label\\">" + escapeHtml(label) + "</div><div class=\\"stat-value\\">" + escapeHtml(value) + "</div></div>";
   }
 
+  // 「この周の進捗 7 / 7 (100%)」が正解率に見える問題(Issue #60)。判定済み数(分母は
+  // roundSize、正解率ではない)と正解数(分母は roundSize、正解率)を別のカードに分ける。
   function renderStats() {
     var correctCount = countCorrectValues();
     var remaining = TOTAL_EMPTY - correctCount;
-    var roundPct = roundSize === 0 ? 0 : Math.round((roundTally.total / roundSize) * 100);
+    var roundCorrectPct = roundSize === 0 ? 0 : Math.round((roundTally.correct / roundSize) * 100);
     return "<div id=\\"stats\\" class=\\"stats\\">" +
       statCard("現在の周", state.round + "周目") +
       statCard("残りマス", remaining + " / " + TOTAL_EMPTY) +
       statCard("累計正解", correctCount + "問") +
-      statCard("この周の進捗", roundTally.total + " / " + roundSize + " (" + roundPct + "%)") +
+      statCard("この周の判定済み", roundTally.total + " / " + roundSize) +
+      statCard("この周の正解", roundTally.correct + " / " + roundSize + " (" + roundCorrectPct + "%)") +
       "</div>";
   }
 
@@ -4390,8 +4664,15 @@ var PAGE_HTML = `<!doctype html>
   }
 
   // 1〜9の確率バー。並びは常に 1〜9 の昇順(不変条件3)。choice の棒だけアクセント色。
+  // 消去法(Issue #61・#63)で外した数字(p.excluded)は0%のバーではなく「×」で示す
+  // (グレー、class="bar excluded")。
   function renderBars(probs) {
     return probs.map(function (p) {
+      if (p.excluded) {
+        return "<div class=\\"bar-row bar-row-excluded\\"><span class=\\"bar-label\\">" + p.digit + "</span>" +
+          "<div class=\\"bar-track\\"><div class=\\"bar excluded\\"></div></div>" +
+          "<span class=\\"bar-pct\\">×</span></div>";
+      }
       var barColor = p.isPick ? "var(--accent)" : "var(--border)";
       return "<div class=\\"bar-row\\"><span class=\\"bar-label\\">" + p.digit + "</span>" +
         "<div class=\\"bar-track\\"><div class=\\"bar-fill\\" style=\\"width:" + p.pct + "%;background:" + barColor + ";\\"></div></div>" +
@@ -4557,11 +4838,27 @@ var PAGE_HTML = `<!doctype html>
       formatMs(entry.ms) + " / " + formatUsdForModel(entry.cost, entry.m);
   }
 
+  // 強制終了(Issue #60)の周回ログの1行。「15周で強制終了(最終周の不正解 N マス)」。
+  // entry は finalizeRound() が decision==="limit" のときだけ追加で積む { round, limit:true, wrong }。
+  function formatLimitLogLine(entry) {
+    return entry.round + "周で強制終了(最終周の不正解 " + entry.wrong + " マス)";
+  }
+
+  // 実際に実行した周の数(state.roundLog のうち、通常の周1件につき1エントリのもの。
+  // Issue #60 の強制終了の行(entry.limit===true)は周そのものではないので数えない)。
+  function countRoundLogEntries() {
+    var n = 0;
+    for (var i = 0; i < state.roundLog.length; i++) {
+      if (!state.roundLog[i].limit) n++;
+    }
+    return n;
+  }
+
   // 完了/強制終了時に周回ログの末尾に添える合計行。「合計 12,345 ms / $0.0012(3周)」。
   function formatTotalSummary() {
     var modelId = activeModelIdForPricing();
     return "合計 " + formatMs(totalElapsedMs) + " / " + formatUsdForModel(totalCostUsd, modelId) +
-      "(" + state.roundLog.length + "周)";
+      "(" + countRoundLogEntries() + "周)";
   }
 
   function renderRoundLog() {
@@ -4569,6 +4866,7 @@ var PAGE_HTML = `<!doctype html>
       return "<div id=\\"round-log\\" class=\\"panel\\"><p class=\\"panel-title\\">周回ログ</p><p class=\\"muted\\">まだ記録はありません</p></div>";
     }
     var items = state.roundLog.map(function (entry) {
+      if (entry.limit) return "<li class=\\"round-log-limit\\">" + escapeHtml(formatLimitLogLine(entry)) + "</li>";
       return "<li>" + escapeHtml(formatRoundLogLine(entry)) + "</li>";
     }).join("");
     if (state.done) {

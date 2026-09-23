@@ -927,6 +927,10 @@ test("「新しい問題」の後に run() すると、新しい GIVEN の空マ
   };
 
   ctx = runScript(await getPageHtml(), { fetch: fetchStub });
+  // このテストは「puzzle と target だけが載ること」を検証するので、消去法(Issue #61・#63)の
+  // exclude が混ざらないよう両トグルを切っておく(exclude 自体のテストは AB 系で行う)。
+  ctx.setHistoryMode(false);
+  ctx.setRuleMode(false);
 
   ctx.newPuzzle();
   await waitFor(function () {
@@ -2036,10 +2040,13 @@ var ANTHROPIC_URL = "https://api.anthropic.com/v1/messages";
 var TEST_KEY = "sk-ant-test-0123456789abcdef";
 
 /** Messages API の成功応答(structured outputs の JSON をテキストブロックで返す)を模す。 */
-function makeClaudeResponse(ctx, row, col, overrides) {
+// digits(任意): 応答の probabilities/choice をこの数字だけに絞る(消去法。Issue #61・#63 で
+// exclude されたリクエストのスキーマに合わせるため。省略時は従来どおり1〜9全部)。
+function makeClaudeResponse(ctx, row, col, overrides, digits) {
   var digit = ctx.SOLUTION[row][col];
+  var list = digits || ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
   var probabilities = {};
-  for (var d = 1; d <= 9; d++) probabilities[String(d)] = String(d) === digit ? 0.6 : 0.05;
+  list.forEach(function (d) { probabilities[d] = d === digit ? 0.6 : 0.05; });
   var answer = Object.assign({ choice: digit, probabilities: probabilities, confidence: 0.42 }, overrides || {});
   return {
     ok: true,
@@ -2120,7 +2127,7 @@ test("V2: Claude 経路はブラウザから api.anthropic.com を直接呼び�
   assert.deepStrictEqual(hostRows(sent.puzzle), hostRows(ctx.buildSnapshot()), "盤面が buildSnapshot() と一致しない");
   assert.ok(!content.includes("SOLUTION"), "SOLUTION が混ざっている");
 
-  entry.resolve(makeClaudeResponse(ctx, target.row, target.col));
+  entry.resolve(makeClaudeResponse(ctx, target.row, target.col, undefined, body.output_config.format.schema.properties.choice.enum));
   await waitFor(function () {
     return ctx.state.values[target.row + "-" + target.col] !== undefined;
   }, "V2: 確定待ち");
@@ -2365,7 +2372,7 @@ test("V8: stop_reason が max_tokens ならエラー、content の先頭が thin
     var entry = af.pending.shift();
     var body = JSON.parse(entry.init.body);
     var target = JSON.parse(body.messages[0].content.split("\n")[1]).target;
-    var res = makeClaudeResponse(ctx, target.row, target.col);
+    var res = makeClaudeResponse(ctx, target.row, target.col, undefined, body.output_config.format.schema.properties.choice.enum);
     var orig = res.json;
     res.json = function () {
       return orig().then(mutate);
@@ -2978,9 +2985,10 @@ test("Y1: Claude の 429 は停止扱いになる(errorMessage は立たず、�
       return af.pending.length === 1;
     }, "Y1: " + (i + 1) + "マス目の fetch 待ち");
     var okEntry = af.pending.shift();
-    var okContent = JSON.parse(okEntry.init.body).messages[0].content;
+    var okBody = JSON.parse(okEntry.init.body);
+    var okContent = okBody.messages[0].content;
     var okTarget = JSON.parse(okContent.slice(okContent.indexOf("\n") + 1)).target;
-    okEntry.resolve(makeClaudeResponse(ctx, okTarget.row, okTarget.col));
+    okEntry.resolve(makeClaudeResponse(ctx, okTarget.row, okTarget.col, undefined, okBody.output_config.format.schema.properties.choice.enum));
     await waitFor(function () {
       return ctx.state.values[okTarget.row + "-" + okTarget.col] !== undefined;
     }, "Y1: " + (i + 1) + "マス目の確定待ち");
@@ -4033,14 +4041,18 @@ test("Z7: URL パラメータ order=all、setOrderMode(\"all\")、比較シェ�
 });
 
 test("Z8: 一括モードの Claude 経路で全マスが確定し、記録の m が \"claude-opus-5+think/all\"・o が \"all\" になる。応答に対象マスが欠けていれば1マスも確定・記録しない", { timeout: 10000 }, async () => {
-  function claudeAllResponse(ctx, keys, omitFirst) {
+  // schemaProps(任意): body.output_config.format.schema.properties。渡すとキーごとに
+  // そのマスのスキーマの enum(消去法。Issue #61・#63 で絞られた残りの数字)だけを
+  // probabilities/choice に使う(省略時は従来どおり1〜9全部)。
+  function claudeAllResponse(ctx, keys, omitFirst, schemaProps) {
     var answer = {};
     keys.forEach(function (k, i) {
       if (omitFirst && i === 0) return;
       var m = /^r(\d)c(\d)$/.exec(k);
       var digit = ctx.SOLUTION[Number(m[1])][Number(m[2])];
+      var list = (schemaProps && schemaProps[k] && schemaProps[k].properties.choice.enum) || ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
       var probabilities = {};
-      for (var d = 1; d <= 9; d++) probabilities[String(d)] = String(d) === digit ? 0.6 : 0.05;
+      list.forEach(function (d) { probabilities[d] = d === digit ? 0.6 : 0.05; });
       answer[k] = { choice: digit, probabilities: probabilities, confidence: 0.4 };
     });
     return {
@@ -4071,8 +4083,9 @@ test("Z8: 一括モードの Claude 経路で全マスが確定し、記録の m
     return af.pending.length === 1;
   }, "Z8: fetch 待ち");
   var entry = af.pending.shift();
+  var entryBody = JSON.parse(entry.init.body);
   var keys = Array.prototype.slice.call(ctx.selectionKeys()).map(String);
-  entry.resolve(claudeAllResponse(ctx, keys, false));
+  entry.resolve(claudeAllResponse(ctx, keys, false, entryBody.output_config.format.schema.properties));
   await waitFor(function () {
     return ctx.state.done === true;
   }, "Z8: 完了待ち");
@@ -4568,4 +4581,342 @@ test("AA10: 一時的な失敗の停止でも計時が止まる。reset() で計
   await waitFor(function () { return ctx2.state.done === true; }, "AA10c: 完了待ち");
   assert.equal(ctx2.state.roundLog[1].ms, 300, "2周目の ms に周またぎの待ちが入っている: " + ctx2.state.roundLog[1].ms);
   assert.equal(ctx2.totalElapsedMs, 5500, "全体の ms が 200 + 5000 + 300 でない: " + ctx2.totalElapsedMs);
+});
+
+// ---------------------------------------------------------------------------
+// 消去法(履歴 Issue #61・ルール候補 Issue #63)と統計カード(Issue #60)。
+// S/T/W/Y/Z/AA 系と同じ runScript / makeAbortAwareFetch / waitFor / blankCells を使う。
+// ---------------------------------------------------------------------------
+
+test("AB1: ruleExclusions は固定問題の r0c2 で行・列・ブロックの数字を返す", async () => {
+  var ctx = runScript(await getPageHtml());
+  // GIVEN の r0c2 は空マス。行(5,3,7)・列(8)・ブロック(5,3,6,9,8)の和集合。
+  var result = hostRows(ctx.ruleExclusions(0, 2));
+  assert.deepEqual(result, ["3", "5", "6", "7", "8", "9"], "r0c2 のルール候補が期待どおりでない: " + result);
+
+  // 与えられたマス(GIVEN が "." でない)は元々聞かれないが、関数自体は同じ規則で動く
+  var r1 = hostRows(ctx.ruleExclusions(1, 1)); // row1 col1 は "." (6..195...)
+  // row1: 6,.,.,1,9,5,.,.,. → {6,1,9,5} / col1: row0=3,row2=9,row3=.,row4=.,row5=.,row6=6,row7=.,row8=. → {3,9,6}
+  // block(rows0-2,cols0-2) excluding self: (0,0)=5,(0,1)=3,(0,2)=.,(1,0)=6,(2,0)=.,(2,1)=9,(2,2)=8 → {5,3,6,9,8}
+  assert.deepEqual(r1, ["1", "3", "5", "6", "8", "9"], "r1c1 のルール候補が期待どおりでない: " + r1);
+});
+
+test("AB2: excludeFor は1周目がルール由来だけ、2周目は不正解マスの履歴が足される(fetch ボディで確認)", async () => {
+  var capturedBody = null;
+  var ctx = runScript(await getPageHtml(), {
+    fetch: function (url, init) {
+      capturedBody = JSON.parse(init.body);
+      return Promise.resolve({
+        ok: true,
+        json: async function () {
+          return { probabilities: { "4": 0.9 }, choice: "4", confidence: 0.5, request: {} };
+        },
+      });
+    },
+  });
+
+  // 1周目相当: まだ何も判定していないので wrongDigits は空 → exclude はルール由来だけ
+  var round1Exclude = ctx.excludeFor(0, 2);
+  assert.deepEqual(hostRows(round1Exclude), ["3", "5", "6", "7", "8", "9"]);
+  await ctx.judgeCellJev(ctx.GIVEN, 0, 2, round1Exclude, null);
+  assert.deepEqual(hostRows(capturedBody.exclude).sort(), ["3", "5", "6", "7", "8", "9"], "1周目の exclude がルール由来と一致しない");
+
+  // 2周目相当: 前の周に (0,2) を "1" で外した(履歴)ことにする
+  ctx.wrongDigits["0-2"] = ["1"];
+  var round2Exclude = ctx.excludeFor(0, 2);
+  var round2Sorted = hostRows(round2Exclude).slice().sort();
+  assert.deepEqual(round2Sorted, ["1", "3", "5", "6", "7", "8", "9"], "2周目の exclude に履歴の数字が足されていない");
+  await ctx.judgeCellJev(ctx.GIVEN, 0, 2, round2Exclude, null);
+  assert.deepEqual(hostRows(capturedBody.exclude).sort(), round2Sorted, "2周目の fetch ボディの exclude が履歴込みになっていない");
+});
+
+test("AB3: 一括の exclude はマスごとのマップで、外す数字が無いマスは省く", async () => {
+  var capturedBody = null;
+  var ctx = runScript(await getPageHtml(), {
+    fetch: function (url, init) {
+      capturedBody = JSON.parse(init.body);
+      return Promise.resolve({ ok: true, json: async function () { return { cells: {}, request: {} }; } });
+    },
+  });
+  // ルール候補を切っておくと、履歴の無いマスは excludeFor が空配列になり判定しやすい(S1)
+  ctx.setRuleMode(false);
+  ctx.queue.push({ r: 0, c: 2 }, { r: 0, c: 3 });
+  ctx.wrongDigits["0-2"] = ["1", "5"];
+
+  var map = ctx.excludeMapForQueue();
+  assert.deepEqual(Object.keys(map), ["r0c2"], "空マス(r0c3)が省かれていない、または r0c2 が無い");
+  assert.deepEqual(hostRows(map.r0c2).sort(), ["1", "5"]);
+
+  await ctx.askAll(null);
+  assert.deepEqual(Object.keys(capturedBody.exclude), ["r0c2"], "一括の fetch ボディの exclude マップに空マスが残っている");
+  assert.deepEqual(hostRows(capturedBody.exclude.r0c2).sort(), ["1", "5"]);
+});
+
+test("AB4: 履歴・ルール候補ともに「なし」なら exclude が付かない(従来どおり)", async () => {
+  var capturedBody = null;
+  var ctx = runScript(await getPageHtml(), {
+    fetch: function (url, init) {
+      capturedBody = JSON.parse(init.body);
+      return Promise.resolve({
+        ok: true,
+        json: async function () {
+          return { probabilities: { "4": 0.9 }, choice: "4", confidence: 0.5, request: {} };
+        },
+      });
+    },
+  });
+  ctx.setHistoryMode(false);
+  ctx.setRuleMode(false);
+  assert.deepEqual(hostRows(ctx.excludeFor(0, 2)), [], "両トグルなしで excludeFor が空にならない");
+
+  await ctx.judgeCellJev(ctx.GIVEN, 0, 2, ctx.excludeFor(0, 2), null);
+  assert.equal(capturedBody.exclude, undefined, "両トグルなしなのに exclude が付いている");
+  assert.deepEqual(Object.keys(capturedBody).sort(), ["puzzle", "target"], "従来どおりの payload と形が違う");
+
+  // Claude 経路も従来どおり(9択のまま、EXCLUDE_NOTE も付かない)
+  var body = ctx.buildClaudeRequest(ctx.GIVEN, 0, 2, ctx.excludeFor(0, 2));
+  var schema = body.output_config.format.schema;
+  assert.deepEqual(hostRows(schema.properties.choice.enum).sort(), ["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
+  assert.equal(body.system.indexOf("Digits already ruled out"), -1, "exclude が無いのに system に注記が付いている");
+
+  // 一括モードも exclude マップが空なら付かない
+  var capturedAllBody = null;
+  var ctxAll = runScript(await getPageHtml(), {
+    fetch: function (url, init) {
+      capturedAllBody = JSON.parse(init.body);
+      return Promise.resolve({ ok: true, json: async function () { return { cells: {}, request: {} }; } });
+    },
+  });
+  ctxAll.setHistoryMode(false);
+  ctxAll.setRuleMode(false);
+  ctxAll.queue.push({ r: 0, c: 2 });
+  await ctxAll.askAll(null);
+  assert.equal(capturedAllBody.exclude, undefined, "一括で両トグルなしなのに exclude が付いている");
+});
+
+test("AB5: Claude のスキーマは残りの数字だけ、system に1文、応答検証も残りの数字で行う", async () => {
+  var ctx = runScript(await getPageHtml());
+  var exclude = ["3", "5", "6", "7", "8", "9"]; // r0c2 のルール由来(正解は "4")
+  var remaining = ["1", "2", "4"];
+
+  // digit 判定(Issue #61・#63)
+  var body = ctx.buildClaudeRequest(ctx.GIVEN, 0, 2, exclude);
+  var schema = body.output_config.format.schema;
+  assert.deepEqual(hostRows(schema.properties.choice.enum).sort(), remaining);
+  assert.deepEqual(hostRows(schema.properties.probabilities.required).sort(), remaining);
+  assert.deepEqual(Object.keys(schema.properties.probabilities.properties).sort(), remaining);
+  assert.ok(body.system.indexOf("Digits already ruled out") !== -1, "system に EXCLUDE_NOTE が無い");
+
+  // 応答検証: 残りの数字だけを満たす応答は OK
+  var goodData = {
+    content: [{ type: "text", text: JSON.stringify({ choice: "4", probabilities: { "1": 0.1, "2": 0.1, "4": 0.8 }, confidence: 0.5 }) }],
+  };
+  var goodParsed = ctx.parseClaudeDigitAnswer(goodData, remaining);
+  assert.equal(goodParsed.error, undefined, "残りの数字だけの正しい応答が検証に落ちた: " + goodParsed.error);
+
+  // 除外した数字(exclude 後は候補にない "3")を choice にすると 502 相当のエラーになる
+  var badData = {
+    content: [{ type: "text", text: JSON.stringify({ choice: "3", probabilities: { "1": 0.1, "2": 0.1, "3": 0.8 }, confidence: 0.5 }) }],
+  };
+  var badParsed = ctx.parseClaudeDigitAnswer(badData, remaining);
+  assert.ok(badParsed.error && badParsed.error.indexOf("exclude後") !== -1, "除外した数字を choice にした応答が検証を通ってしまった");
+
+  // 一括モード(Issue #48)のスキーマ・system・応答検証
+  var keys = ["r0c2", "r0c3"];
+  var excludeByKey = { "r0c2": exclude };
+  var allBody = ctx.buildClaudeAllRequest(ctx.GIVEN, keys, excludeByKey);
+  var allSchema = allBody.output_config.format.schema;
+  assert.deepEqual(hostRows(allSchema.properties.r0c2.properties.choice.enum).sort(), remaining, "一括の r0c2 の enum が残りの数字だけでない");
+  assert.deepEqual(
+    hostRows(allSchema.properties.r0c3.properties.choice.enum).sort(),
+    ["1", "2", "3", "4", "5", "6", "7", "8", "9"],
+    "exclude の無い r0c3 まで絞られている"
+  );
+  assert.ok(allBody.system.indexOf("Digits already ruled out") !== -1, "一括の system に EXCLUDE_NOTE が無い");
+
+  var allGoodAnswer = {
+    r0c2: { choice: "4", probabilities: { "1": 0.1, "2": 0.1, "4": 0.8 }, confidence: 0.5 },
+    r0c3: { choice: "9", probabilities: (function () {
+      var p = {};
+      ["1", "2", "3", "4", "5", "6", "7", "8", "9"].forEach(function (d) { p[d] = d === "9" ? 0.9 : 0.0125; });
+      return p;
+    })(), confidence: 0.5 },
+  };
+  assert.equal(ctx.validateClaudeAllAnswer(allGoodAnswer, keys, excludeByKey), null, "一括の正しい応答が検証に落ちた");
+
+  var allBadAnswer = {
+    r0c2: { choice: "3", probabilities: { "1": 0.1, "2": 0.1, "3": 0.8 }, confidence: 0.5 },
+    r0c3: allGoodAnswer.r0c3,
+  };
+  var allBad = ctx.validateClaudeAllAnswer(allBadAnswer, keys, excludeByKey);
+  assert.ok(allBad && allBad.indexOf("r0c2") !== -1 && allBad.indexOf("exclude後") !== -1, "一括で除外した数字を choice にした応答が検証を通ってしまった");
+});
+
+test("AB6: 記録に n(候補数)・e(履歴トグル)・rc(ルール候補トグル)が付く", async () => {
+  var ctx = runScript(await getPageHtml());
+
+  // 両トグルありで候補3個の判定(SOLUTION[0][2] === "4")
+  ctx.state.focusedKey = "0-2";
+  ctx.pendingCommit = {
+    r: 0,
+    c: 2,
+    choice: "4",
+    confidence: 0.5,
+    probabilities: { "1": 0.05, "2": 0.05, "4": 0.9 },
+  };
+  ctx.commitFocused();
+  var rec1 = ctx.getRecords()[0];
+  assert.equal(rec1.ok, true);
+  assert.equal(rec1.n, 3, "候補3個の記録の n が3でない: " + rec1.n);
+  assert.equal(rec1.e, true, "履歴トグルの記録が true でない");
+  assert.equal(rec1.rc, true, "ルール候補トグルの記録が true でない");
+
+  // 両トグルなしで候補9個の判定(SOLUTION[0][3] === "6")
+  ctx.setHistoryMode(false);
+  ctx.setRuleMode(false);
+  ctx.state.focusedKey = "0-3";
+  ctx.pendingCommit = {
+    r: 0,
+    c: 3,
+    choice: "6",
+    confidence: 0.5,
+    probabilities: (function () {
+      var p = {};
+      ["1", "2", "3", "4", "5", "6", "7", "8", "9"].forEach(function (d) { p[d] = d === "6" ? 0.9 : 0.0125; });
+      return p;
+    })(),
+  };
+  ctx.commitFocused();
+  var rec2 = ctx.getRecords()[1];
+  assert.equal(rec2.n, 9, "候補9個の記録の n が9でない: " + rec2.n);
+  assert.equal(rec2.e, false);
+  assert.equal(rec2.rc, false);
+});
+
+test("AB7: reset() / newPuzzle() で wrongDigits が消え、停止/再開では保たれる", { timeout: 10000 }, async () => {
+  var ctx = runScript(await getPageHtml());
+
+  ctx.wrongDigits["0-2"] = ["1"];
+  ctx.reset();
+  assert.deepEqual(Object.keys(ctx.wrongDigits), [], "reset() で wrongDigits が消えていない");
+
+  // 停止(stop())では保たれる
+  ctx.wrongDigits["0-2"] = ["1"];
+  ctx.state.running = true;
+  ctx.started = true;
+  ctx.stop();
+  assert.deepEqual(hostRows(ctx.wrongDigits["0-2"]), ["1"], "停止で wrongDigits が消えてしまった");
+
+  // newPuzzle() でも消える
+  ctx.newPuzzle();
+  assert.deepEqual(Object.keys(ctx.wrongDigits), [], "newPuzzle() で wrongDigits が消えていない");
+  await waitFor(function () { return ctx.generating === false; }, "AB7: 新しい問題の生成完了待ち");
+});
+
+test("AB8: URL パラメータ history=0|1 / rules=0|1(不正値は無視)。比較シェルにも同じトグルがある", async () => {
+  var html = await getPageHtml();
+
+  var ctxOff = runScript(html, { location: { pathname: "/", search: "?history=0&rules=0", origin: "https://example.com" } });
+  assert.equal(ctxOff.state.historyMode, false, "history=0 が反映されていない");
+  assert.equal(ctxOff.state.ruleMode, false, "rules=0 が反映されていない");
+
+  var ctxOn = runScript(html, { location: { pathname: "/", search: "?history=1&rules=1", origin: "https://example.com" } });
+  assert.equal(ctxOn.state.historyMode, true);
+  assert.equal(ctxOn.state.ruleMode, true);
+
+  // 不正値(0/1以外)は無視され、既定(あり)のまま
+  var ctxBad = runScript(html, { location: { pathname: "/", search: "?history=yes&rules=nope", origin: "https://example.com" } });
+  assert.equal(ctxBad.state.historyMode, true, "不正な history パラメータが既定を上書きしてしまった");
+  assert.equal(ctxBad.state.ruleMode, true, "不正な rules パラメータが既定を上書きしてしまった");
+
+  // 比較シェル(/compare)の上部バーにも同じ2トグルがあり、両 iframe に postMessage する
+  var fakeDoc = makeCompareDocument();
+  var messageHandlers = [];
+  var fakeWindow = {
+    parent: null,
+    addEventListener: function (type, handler) {
+      if (type === "message") messageHandlers.push(handler);
+    },
+    postMessage: function () {},
+  };
+  fakeWindow.parent = fakeWindow;
+  var ctxCompare = runScript(html, {
+    location: { pathname: "/compare", search: "", origin: "https://example.com" },
+    document: fakeDoc,
+    window: fakeWindow,
+  });
+  var out = ctxCompare.appElement.innerHTML;
+  assert.ok(out.indexOf('id="history-toggle"') !== -1, "比較シェルに履歴トグルが無い");
+  assert.ok(out.indexOf('id="rules-toggle"') !== -1, "比較シェルにルール候補トグルが無い");
+
+  ctxCompare.compareSetHistoryMode(false);
+  assert.equal(ctxCompare.state.historyMode, false);
+  assert.equal(ctxCompare.compareFrames.jev.postMessageCalls[0].msg.type, "setHistoryMode");
+  assert.equal(ctxCompare.compareFrames.jev.postMessageCalls[0].msg.on, false);
+  assert.equal(ctxCompare.compareFrames.claude.postMessageCalls[0].msg.type, "setHistoryMode");
+
+  ctxCompare.compareSetRuleMode(false);
+  assert.equal(ctxCompare.state.ruleMode, false);
+  assert.equal(ctxCompare.compareFrames.jev.postMessageCalls[1].msg.type, "setRuleMode");
+  assert.equal(ctxCompare.compareFrames.jev.postMessageCalls[1].msg.on, false);
+});
+
+test("AB9: 統計カードは「この周の判定済み」「この周の正解」の2枚に分かれ、強制終了時は周回ログに専用の行が出る", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  // 消去法は無関係にするため両トグルを切り、候補が枯渇しないようにする
+  ctx.setHistoryMode(false);
+  ctx.setRuleMode(false);
+  var puzzleStr = blankCells(ANSWER_KEY, [[0, 0]]);
+  assert.ok(ctx.applyPuzzleFromString(puzzleStr), "1マス盤面の適用に失敗した(一意解でない?)");
+  assert.equal(ctx.TOTAL_EMPTY, 1);
+  ctx.MAX_ROUNDS = 2; // 2周とも不正解にして、2周で強制終了させる
+
+  ctx.run();
+  for (var i = 0; i < 1000 && !ctx.state.done; i++) {
+    while (af.pending.length) {
+      var item = af.pending.shift();
+      if (item.settled) continue;
+      var body = JSON.parse(item.init.body);
+      assert.equal(body.exclude, undefined, "AB9: 両トグルなしで exclude が付いている");
+      var correctDigit = ctx.SOLUTION[body.target.row][body.target.col];
+      var wrongDigit = correctDigit === "1" ? "2" : "1";
+      var probabilities = {};
+      ["1", "2", "3", "4", "5", "6", "7", "8", "9"].forEach(function (d) { probabilities[d] = d === wrongDigit ? 0.9 : 0.0125; });
+      item.resolve({
+        ok: true,
+        json: async function () {
+          return { probabilities: probabilities, choice: wrongDigit, confidence: 0.5, request: {} };
+        },
+      });
+    }
+    await tick();
+  }
+  assert.equal(ctx.state.done, true, "AB9: 2周で完了しなかった");
+  assert.equal(ctx.state.stoppedAtLimit, true, "AB9: 強制終了扱いになっていない");
+
+  ctx.render();
+  var html = ctx.appElement.innerHTML;
+  assert.ok(html.indexOf("この周の判定済み") !== -1, "「この周の判定済み」カードが無い");
+  assert.ok(html.indexOf("この周の正解") !== -1, "「この周の正解」カードが無い");
+  assert.equal(html.indexOf("この周の進捗"), -1, "旧ラベル「この周の進捗」が残っている");
+
+  var limitEntry = ctx.state.roundLog[ctx.state.roundLog.length - 1];
+  assert.equal(limitEntry.limit, true, "roundLog の末尾が強制終了の行になっていない");
+  assert.equal(limitEntry.wrong, 1, "強制終了の行の不正解数が1でない: " + limitEntry.wrong);
+  assert.ok(html.indexOf("2周で強制終了(最終周の不正解 1 マス)") !== -1, "強制終了の行の文言が周回ログに出ていない");
+});
+
+test("AB10: 現在の判定のバーは除外した数字を0%でなく「×」(bar excluded)で表示する", async () => {
+  var ctx = runScript(await getPageHtml());
+  var probs = ctx.buildDigitBars({ "1": 0.1, "2": 0.1, "4": 0.8 }, "4");
+  assert.equal(probs.length, 9, "buildDigitBars が1〜9ぶん返していない");
+  var excludedDigits = hostRows(probs.filter(function (p) { return p.excluded; }).map(function (p) { return p.digit; }));
+  assert.deepEqual(excludedDigits.sort(), ["3", "5", "6", "7", "8", "9"]);
+
+  var html = ctx.renderBars(probs);
+  var excludedCount = (html.match(/class="bar excluded"/g) || []).length;
+  assert.equal(excludedCount, 6, "除外バーの数が6個でない: " + excludedCount);
+  assert.ok(html.indexOf("×") !== -1, "除外したバーに × が出ていない");
+  assert.ok(html.indexOf("80%") !== -1, "choice(4)のバーが80%になっていない");
 });
