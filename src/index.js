@@ -1366,6 +1366,12 @@ var PAGE_HTML = `<!doctype html>
   input[type="password"] { min-width: 220px; }
   select option { background: var(--panel-bg); color: var(--text); }
   .claude-notice { font-size: 12px; color: var(--incorrect); }
+  /* APIキー設定は既定で折りたたんでおく(オーナー要望 2026-09-23)。モデル選択とは
+     見た目でも分け、普段は見えないようにする。 */
+  .claude-key-details { margin-top: 4px; }
+  .claude-key-details summary { color: var(--accent); font-size: 13px; cursor: pointer; margin: 4px 0; }
+  .claude-key-details[open] summary { margin-bottom: 8px; }
+  .claude-key-details .claude-row { margin-top: 8px; }
   #calib-model-filter { font-size: 12px; padding: 3px 6px; }
 
   .usage-row { margin: 0 0 4px; font-size: 14px; font-weight: 600; }
@@ -2354,6 +2360,42 @@ var PAGE_HTML = `<!doctype html>
     return roundElapsedMs + (runningSince !== null && roundStarted ? nowMs() - runningSince : 0);
   }
 
+  // 「現在の判定」パネルの経過時間をリアルタイムに更新する(オーナー要望 2026-09-23、Issue #84)。
+  // 以前は render() のたびにしか更新されず、一括モードの fetch 待ち中(数秒〜数十秒
+  // render() が挟まらない)は止まって見えていた。render() を丸ごと呼ぶ代わりに
+  // #current-elapsed の textContent だけを書き換えるので、top-controls の <select> に
+  // フォーカスがある間 render() を止めるガード(4.4)や、一括モードの演出省略
+  // (commitAllInstant()、Issue #80)の「render() を挟まない」設計とも無関係に、常に動く。
+  var elapsedTimer = null;
+  var ELAPSED_TICK_MS = 100; // 「ミリ秒単位で」に対して見た目が滑らかに動く程度の間隔
+  var elapsedTickCount = 0;
+  // 埋め込みモード(比較シェルの iframe)では、この iframe の postStatus() を何 tick に
+  // 1回送るか。postStatus() は一括モードの lastAllRequest 等も含みやや重いので、
+  // 100msごとではなく1000ms(10 tick)に1回にする(Opus レビュー S3、Issue #84)。
+  var ELAPSED_TICK_POST_EVERY = 10;
+  function tickElapsedDisplay() {
+    var el = document.getElementById("current-elapsed");
+    if (el) el.textContent = formatMs(currentTotalElapsedMs());
+    // 比較シェルの見出しの「経過 X ms」は子(iframe)が postStatus() で申告した値を
+    // そのまま表示するだけなので(DESIGN 4.2)、render() を待たずにこの tick からも
+    // 定期的に申告しないと、一括モードの応答待ち中はシェル側の数字だけ止まって見える
+    // (「Claude が動いているか分からない」に似た「止まって見える」問題。Issue #84 追加)。
+    if (embedMode) {
+      elapsedTickCount++;
+      if (elapsedTickCount % ELAPSED_TICK_POST_EVERY === 0) postStatus();
+    }
+  }
+  function startElapsedTicker() {
+    stopElapsedTicker();
+    elapsedTimer = setInterval(tickElapsedDisplay, ELAPSED_TICK_MS);
+  }
+  function stopElapsedTicker() {
+    if (elapsedTimer !== null) {
+      clearInterval(elapsedTimer);
+      elapsedTimer = null;
+    }
+  }
+
   // 較正図のモデルフィルタと同じ考え方で、一括モード(Issue #48)は "/all" を足した識別子を使う
   // (commitFocused() の記録の m と同じ組み立て方)。
   function activeModelIdForPricing() {
@@ -2736,13 +2778,6 @@ var PAGE_HTML = `<!doctype html>
     render();
   }
 
-  // 画面に出すのは末尾 4 文字だけ。キー全体は DOM にも state にも置かない。
-  function anthropicKeyHint() {
-    var key = loadAnthropicKey();
-    if (!key) return "未設定";
-    return "保存済み(末尾 …" + key.slice(-4) + ")";
-  }
-
   function loadClaudeSettings() {
     try {
       var raw = localStorage.getItem(CLAUDE_SETTINGS_STORAGE_KEY);
@@ -3079,7 +3114,7 @@ var PAGE_HTML = `<!doctype html>
   // 戻り値は judgeCellJev と同じ形 { probabilities, choice, confidence, request }。
   async function judgeCellClaude(puzzle, r, c, exclude, signal) {
     var key = loadAnthropicKey();
-    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」でキーを保存してください)");
+    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」の「API キー(未設定)」を開いて保存してください)");
     var body = buildClaudeRequest(puzzle, r, c, exclude);
     var res;
     try {
@@ -3136,7 +3171,7 @@ var PAGE_HTML = `<!doctype html>
   // 戻り値は askCellJev と同じ形 { probabilities, choice, confidence, request, cell }。
   async function askCellClaude(puzzle, signal) {
     var key = loadAnthropicKey();
-    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」でキーを保存してください)");
+    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」の「API キー(未設定)」を開いて保存してください)");
     var keys = selectionKeys();
     var body = buildClaudeCellRequest(puzzle, keys);
     var res;
@@ -3270,7 +3305,7 @@ var PAGE_HTML = `<!doctype html>
   // docs/DESIGN.md 3.6)
   async function askAllClaude(puzzle, excludeByKey, signal) {
     var key = loadAnthropicKey();
-    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」でキーを保存してください)");
+    if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」の「API キー(未設定)」を開いて保存してください)");
     var keys = selectionKeys();
     var chunks = chunkArray(keys, CLAUDE_ALL_CHUNK_SIZE);
     var settled = await Promise.allSettled(chunks.map(function (chunkKeys) {
@@ -3436,6 +3471,7 @@ var PAGE_HTML = `<!doctype html>
     }
     // running=false → true になった区間の開始(停止中は数えない。DESIGN 4.1)
     runningSince = nowMs();
+    startElapsedTicker(); // 「現在の判定」の経過時間をリアルタイム更新(オーナー追加要望)
     render();
     focusNext();
   }
@@ -3908,6 +3944,7 @@ var PAGE_HTML = `<!doctype html>
     if (decision === "solved") {
       state.done = true;
       state.running = false;
+      stopElapsedTicker(); // 完了したら更新を止める(最後の値で固定。オーナー追加要望)
       state.roundsToSolve = state.round;
       render();
       return;
@@ -3915,6 +3952,7 @@ var PAGE_HTML = `<!doctype html>
     if (decision === "limit") {
       state.done = true;
       state.running = false;
+      stopElapsedTicker(); // 強制終了でも同様
       state.stoppedAtLimit = true;
       // 強制終了(Issue #60)。統計カードの「この周の進捗」だけでは全部正解したように
       // 見える問題があったので、周回ログの末尾にも「N周で強制終了(最終周の不正解 M マス)」を
@@ -3974,6 +4012,7 @@ var PAGE_HTML = `<!doctype html>
    */
   function haltRun(reason) {
     if (!state.running) return;
+    stopElapsedTicker(); // 停止中は経過時間を数えない(オーナー追加要望)ので更新も止める
     // 計時を止める(周・全体とも。停止中は数えない。Issue #55)。
     pauseClock();
     // 応答は届いていたが確定前に捨てる呼び出しぶんの usage は持ち越す(PR #67 レビュー S2)。
@@ -4038,6 +4077,7 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function showError(message) {
+    stopElapsedTicker(); // エラー停止も更新を止める(オーナー追加要望)
     // 計時を止める(エラー停止も「走っている時間」には数えない。Issue #55)。
     pauseClock();
     // 世代を進めて、進行中の fetch / setTimeout のコールバックを無効化する
@@ -4076,6 +4116,8 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function reset() {
+    // 実行中でも押せる(SPEC F5)ので、走っていた場合は経過時間の更新も止める
+    stopElapsedTicker();
     // 世代を進める。進行中の fetch / setTimeout はこれで続きを実行しなくなる
     runToken += 1;
     // in-flight の /api/judge があれば打ち切る。newPuzzle() は内部で reset() を
@@ -4787,7 +4829,10 @@ var PAGE_HTML = `<!doctype html>
   }
 
   // Claude の設定パネル(Issue #37)。モデルトグルが Claude のときだけ出す。
-  // キーの値そのものは DOM に出さない(末尾 4 文字のヒントだけ)。
+  // モデル選択(いつも見える)と API キー入力(オーナー要望 2026-09-23: 普段は見なくて
+  // よいので既定で折りたたむ)を分けた。キーの値そのものは DOM に出さない。以前は
+  // 末尾4文字のヒント(「保存済み(末尾 …xxxx)」)を出していたが、不要という要望で削除し、
+  // 折りたたみの見出し(<summary>)に「設定済み/未設定」の状態だけ残した。
   function renderClaudeSettings() {
     if (state.modelMode !== "claude") return "";
     var locked = modelSettingsLocked() ? "disabled" : "";
@@ -4799,16 +4844,7 @@ var PAGE_HTML = `<!doctype html>
     var thinkOn = state.claudeThinking ? " active" : "";
     var thinkOff = state.claudeThinking ? "" : " active";
     return "<div id=\\"claude-settings\\" class=\\"panel\\">" +
-      "<p class=\\"panel-title\\">Claude の設定(BYOK)</p>" +
-      "<div class=\\"claude-row\\">" +
-      "<label for=\\"anthropic-key-input\\">API キー</label>" +
-      "<input id=\\"anthropic-key-input\\" type=\\"password\\" placeholder=\\"sk-ant-…\\" autocomplete=\\"off\\" spellcheck=\\"false\\">" +
-      "<button id=\\"save-key-btn\\" onclick=\\"saveAnthropicKeyFromInput()\\">保存</button>" +
-      "<button id=\\"clear-key-btn\\" onclick=\\"clearAnthropicKey()\\" " + (hasKey && !modelSettingsLocked() ? "" : "disabled") + ">キーを消す</button>" +
-      "<span class=\\"muted\\">" + escapeHtml(anthropicKeyHint()) + "</span>" +
-      (claudeKeyNotice ? "<span class=\\"claude-notice\\">" + escapeHtml(claudeKeyNotice) + "</span>" : "") +
-      "</div>" +
-      "<p class=\\"muted\\">キーはこのブラウザの localStorage にだけ保存し、api.anthropic.com への呼び出し以外には送りません(この Worker には渡りません)。利用料は自分の Anthropic アカウントに課金されます(1 問あたり約 78 回、確信度順ではその倍呼びます。この経路にレート制限はありません)。</p>" +
+      "<p class=\\"panel-title\\">Claude の設定</p>" +
       "<div class=\\"claude-row\\">" +
       "<label for=\\"claude-model\\">モデル</label>" +
       "<select id=\\"claude-model\\" onchange=\\"setClaudeModel(this.value)\\" " + locked + ">" + options + "</select>" +
@@ -4817,6 +4853,17 @@ var PAGE_HTML = `<!doctype html>
       "<button class=\\"thinking-btn" + thinkOff + "\\" aria-pressed=\\"" + !state.claudeThinking + "\\" onclick=\\"setClaudeThinking(false)\\" " + locked + ">思考なし</button>" +
       "</div>" +
       "</div>" +
+      "<details class=\\"claude-key-details\\">" +
+      "<summary>API キー(" + (hasKey ? "設定済み" : "未設定") + ")</summary>" +
+      "<div class=\\"claude-row\\">" +
+      "<label for=\\"anthropic-key-input\\">API キー</label>" +
+      "<input id=\\"anthropic-key-input\\" type=\\"password\\" placeholder=\\"sk-ant-…\\" autocomplete=\\"off\\" spellcheck=\\"false\\">" +
+      "<button id=\\"save-key-btn\\" onclick=\\"saveAnthropicKeyFromInput()\\">保存</button>" +
+      "<button id=\\"clear-key-btn\\" onclick=\\"clearAnthropicKey()\\" " + (hasKey && !modelSettingsLocked() ? "" : "disabled") + ">キーを消す</button>" +
+      (claudeKeyNotice ? "<span class=\\"claude-notice\\">" + escapeHtml(claudeKeyNotice) + "</span>" : "") +
+      "</div>" +
+      "<p class=\\"muted\\">キーはこのブラウザの localStorage にだけ保存し、api.anthropic.com への呼び出し以外には送りません(この Worker には渡りません)。利用料は自分の Anthropic アカウントに課金されます(1 問あたり約 78 回、確信度順ではその倍呼びます。この経路にレート制限はありません)。</p>" +
+      "</details>" +
       "</div>";
   }
 
@@ -4900,10 +4947,13 @@ var PAGE_HTML = `<!doctype html>
     // 開始から終了までの経過時間(ミリ秒。Issue #80)を見出し行の右の空きスペースに
     // 常時出す。currentTotalElapsedMs() は走っていないとき最後の値のまま(DESIGN 4.4)
     // なので、未実行時は 0 ms、実行中はライブ更新、停止/完了後は最後の値で止まる。
-    // 累計コストは「この実行の消費」パネルと重複していたので、こちらからは削除した(Issue #80)。
+    // 実行中のライブ更新は render() 任せではなく startElapsedTicker() が id="current-elapsed"
+    // を直接書き換えて行う(一括モードの fetch 待ち中など render() が挟まらない間も
+    // 止まらないように。オーナー追加要望 2026-09-23)。累計コストは「この実行の消費」
+    // パネルと重複していたので、こちらからは削除した(Issue #80)。
     var head = "<div id=\\"current-panel\\" class=\\"panel\\">" +
       "<div class=\\"panel-title-row\\"><p class=\\"panel-title\\">現在の判定</p>" +
-      "<span class=\\"panel-title-elapsed\\">" + formatMs(currentTotalElapsedMs()) + "</span></div>";
+      "<span id=\\"current-elapsed\\" class=\\"panel-title-elapsed\\">" + formatMs(currentTotalElapsedMs()) + "</span></div>";
     var tail = "</div>";
 
     // 停止中(Issue #32): 残りマス数を示し、フォーカスの枠線は消える
@@ -5303,6 +5353,12 @@ var PAGE_HTML = `<!doctype html>
     // 1マスごとに render() が走るので、引き継がないと開いた直後に閉じてしまう。
     var oldDetails = document.querySelector("details.prompt-details");
     var detailsWasOpen = oldDetails ? oldDetails.open === true : false;
+    // API キー設定の折りたたみ(Issue #80 の追加要望、#84)も同じ理由で引き継ぐ。既定で
+    // 閉じているが、保存/削除のボタンは render() を呼ぶので、開いたまま操作した直後に
+    // 閉じてしまうとエラー表示(claudeKeyNotice)が見えなくなる。別クラスにしてあるので
+    // 上の「一括モードのプロンプト枠」の追跡とは独立に動く。
+    var oldKeyDetails = document.querySelector("details.claude-key-details");
+    var keyDetailsWasOpen = oldKeyDetails ? oldKeyDetails.open === true : false;
     if (embedMode) {
       // 埋め込みモード(比較シェルの iframe、Issue #46)。コントロール・Claude設定・
       // 較正図・プロンプト枠・見出しは描かず、グリッド・凡例・この実行の消費・
@@ -5353,6 +5409,8 @@ var PAGE_HTML = `<!doctype html>
     if (newLog) newLog.scrollTop = wasAtBottom ? newLog.scrollHeight : savedScroll;
     var newDetails = document.querySelector("details.prompt-details");
     if (newDetails && detailsWasOpen) newDetails.open = true;
+    var newKeyDetails = document.querySelector("details.claude-key-details");
+    if (newKeyDetails && keyDetailsWasOpen) newKeyDetails.open = true;
 
     if (embedMode) postStatus();
   }
