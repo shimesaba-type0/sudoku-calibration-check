@@ -667,12 +667,19 @@ async function runProductionMode(chromium, executablePath, targetUrl) {
       await page.locator("#speed-toggle").selectOption("fast");
       await page.click("#run-btn");
 
+      // waitForFunction(pageFunction, arg, options) の第2引数は options ではなく
+      // ページ関数に渡す arg なので、options を渡すときは arg に undefined を明示する
+      // (省略して2引数で呼ぶと { timeout: 60000 } が arg 扱いになり、options が
+      // 無いものとして Playwright の既定タイムアウト(30秒)にフォールバックしてしまう。
+      // 本番の Jev 呼び出しは1回あたり最大20秒台になることがあり、3マスの確定に
+      // 30秒を超えることがあるため実際にタイムアウトしていた)
       await page.waitForFunction(
         function () {
           return document.querySelectorAll(
             '#grid .cell[style*="--correct-bg"], #grid .cell[style*="--incorrect-bg"]'
           ).length >= 3;
         },
+        undefined,
         { timeout: 60000 }
       );
       await page.screenshot({ path: path.join(outDir, "prod-02-three-cells.png") });
