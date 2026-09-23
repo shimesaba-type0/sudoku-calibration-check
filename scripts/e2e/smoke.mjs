@@ -158,12 +158,14 @@ async function startMockServer(mode) {
             questions: { cell: { type: "choice", instructions: "Which empty cell of this Sudoku grid can be filled in with the most certainty?", criteria: cellCriteria } },
           };
           res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
+          // usage(トークン使用量、Issue #55・#56)。本番の Worker が 200 に添えるのと同じ形。
           res.end(JSON.stringify({
             probabilities: cellProbabilities,
             choice: chosenCell.key,
             confidence: 0.4,
             cell: { row: chosenCell.row, col: chosenCell.col },
             request: cellRequest,
+            usage: { input_tokens: 700, output_tokens: 90 },
           }));
           return;
         }
@@ -209,7 +211,8 @@ async function startMockServer(mode) {
             questions: allQuestions,
           };
           res.writeHead(200, { "content-type": "application/json; charset=utf-8" });
-          res.end(JSON.stringify({ cells: allCells, request: allRequest }));
+          // usage(Issue #55・#56)。一括は1回で全マスぶんなので、実測(docs/DESIGN.md 3.4)に近い規模で固定値を返す。
+          res.end(JSON.stringify({ cells: allCells, request: allRequest, usage: { input_tokens: 9000, output_tokens: 4000 } }));
           return;
         }
 
@@ -242,7 +245,14 @@ async function startMockServer(mode) {
           state: { puzzle: body.puzzle, target: body.target, note: "puzzle is a 9x9 Sudoku grid (mock)" },
           questions: { digit: { type: "choice", instructions: "Which digit from 1 to 9 belongs in the target cell of this Sudoku grid?", criteria: criteria } },
         };
-        res.end(JSON.stringify({ probabilities: probabilities, choice: choice, confidence: 0.5, request: request }));
+        // usage(トークン使用量、Issue #55・#56)。本番の Worker が 200 に添えるのと同じ形。
+        res.end(JSON.stringify({
+          probabilities: probabilities,
+          choice: choice,
+          confidence: 0.5,
+          request: request,
+          usage: { input_tokens: 700, output_tokens: 90 },
+        }));
         return;
       }
 
@@ -365,6 +375,8 @@ async function runMockMode(chromium, executablePath, mode) {
       await logItem.waitFor({ state: "visible", timeout: 30000 });
       var text = await logItem.textContent();
       assert.match(text, /^1周目:/, "1行目が「1周目:」で始まらない: " + text);
+      // 処理時間・コスト(Issue #55・#56)。"— 1,234 ms / $0.0004" のような書式で出る。
+      assert.match(text, /— [\d,]+ ms \/ \$/, "周回ログの行に ms / $ が出ていない: " + text);
       await page.screenshot({ path: path.join(outDir, mode + "-02-round-log.png") });
       return text;
     });
@@ -471,6 +483,7 @@ async function runMockMode(chromium, executablePath, mode) {
         var countedCell = cellCalls;
         var countedDigit = digitCalls;
         assert.match(text, /^1周目:/, "1行目が「1周目:」で始まらない: " + text);
+        assert.match(text, /— [\d,]+ ms \/ \$/, "周回ログの行に ms / $ が出ていない: " + text);
         assert.ok(countedDigit >= TOTAL_EMPTY, "数字の判定が空マス数に満たない: " + countedDigit);
         assert.ok(
           countedCell === countedDigit || countedCell === countedDigit + 1,
@@ -518,6 +531,7 @@ async function runMockMode(chromium, executablePath, mode) {
         var text = await logItem.textContent();
         var counted = judgeCalls;
         assert.match(text, /^1周目:/, "1行目が「1周目:」で始まらない: " + text);
+        assert.match(text, /— [\d,]+ ms \/ \$/, "周回ログの行に ms / $ が出ていない: " + text);
         // mixed モードは1周目に不正解が出ることがあり、その場合は1周目のログが表示された
         // 直後には既に2周目ぶんの呼び出し(1回)が始まっていることがある(between-round の
         // 待ちが80msと短いため)。「1マスごとに呼んでいない(空マス数51より遥かに少ない)」
@@ -583,6 +597,7 @@ async function runMockMode(chromium, executablePath, mode) {
       await jevLog.waitFor({ state: "visible", timeout: 30000 });
       var jevText = await jevLog.textContent();
       assert.match(jevText, /^1周目:/, "左(Jev)の1行目が「1周目:」で始まらない: " + jevText);
+      assert.match(jevText, /— [\d,]+ ms \/ \$/, "左(Jev)の周回ログの行に ms / $ が出ていない: " + jevText);
 
       var claudeFrame = page.frameLocator("iframe.compare-frame").nth(1);
       var claudeError = claudeFrame.locator("#error-box.error");
