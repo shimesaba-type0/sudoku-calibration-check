@@ -623,13 +623,16 @@ var compareGenerating = false;  // 「新しい問題」(比較シェル版)で�
 | `loadClaudeSettings()` / `saveClaudeSettings()` / `setModelMode(mode)` / `setClaudeModel(model)` / `setClaudeThinking(on)` / `modelSettingsLocked()` / `currentModelId()` | モデル設定(`scc.claude_settings.v1`)。実行中・停止中(`isPaused()`)はロックして切り替えない。`currentModelId()` は記録の `m` に入れる識別子 |
 | `setOrderMode(mode)` | 順番トグル(Issue #38・#48)。`"scan"` / `"confidence"` / `"all"` のいずれか。`modelSettingsLocked()` と同じ条件でロックする(周の途中でマスの選び方が混ざらないように)。`localStorage` には保存しない |
 | `setHistoryMode(on)` / `setRuleMode(on)` | 消去法の2トグル(履歴 Issue #61 / ルール候補 Issue #63)。`setOrderMode` と同じ条件(`modelSettingsLocked()`)でロックし、`localStorage` には保存しない |
+| `setInstantMode(on)` | 描画省略トグル(Issue #80)。`setOrderMode` と同じ条件(`modelSettingsLocked()`)でロックし、`localStorage` には保存しない(`reset()` / 「新しい問題」をまたいでは `state` として保持する)。`renderControls()` 側で `orderMode !== "all"` または `speedMode !== "fast"` のとき `<select>` 自体を無効化するが、`setInstantMode()` 自体は呼ばれても安全(`focusNextAll()` 側で `speedMode` を再確認する) |
 | `focusNext()` | 先頭で `runToken` を捕まえ、`queue` が空なら `finalizeRound()`。`state.orderMode === "confidence"` なら `selectNextCell(token)`、`"all"` なら `focusNextAll(token)` に委譲して `return`。そうでなければ(scan)`queue` から1つ取り出して `focusCellForDigit(cell, token)` を呼ぶ |
 | `selectNextCell(token)` | 確信度順モード(Issue #38)のマス選び。周の最初の呼び出しなら `markRoundStarted()`(Issue #55)。`state.selecting=true` にして描画 →(リクエストごとに新しい `AbortController` を `inflightController` に作って)`askCell` → `result.request` があれば先に `state.lastCellRequest` に保存(失敗しても「マス選び」のプロンプトを表示できるように)→ `result.cell` が `queue` に無ければ `showError("選ばれたマスが候補にありません: …")` して `return` → `result.probabilities`(`"r0c2"` 形式)を `"r-c"` 形式に変換して `state.cellProbs`(と最大値 `state.cellProbsMax`。ヒートマップ用)に、`state.lastSelection` に `{ r, c, confidence, candidates: probabilities のキー数, p: probabilities[choice] }` を保存 → `queue.splice(idx,1)` で選ばれたマスを取り除き `state.selecting=false` → `toRecordUsage(result.usage)` / `result._t` を `{ usage, latencyMs }` にまとめ(Issue #56)、`focusCellForDigit(cell, token, priorUsage)` に渡す(この中で描画)。`AbortError` は無視、それ以外の失敗は `err.request` があれば `state.lastCellRequest` に保存し、`err.transient`(Issue #43)なら `pauseForTransientError(err)` に分岐して `return`、そうでなければ従来どおり `showError` |
 | `focusCellForDigit(cell,token,priorUsage?)` | 1マスの数字判定本体(従来の `focusNext()` の中身そのもの。Issue #38 で `focusNext` / `selectNextCell` の両方から呼べるように抽出した)。周の最初の呼び出しなら `markRoundStarted()`(Issue #55)。フォーカス→(新しい `AbortController` で)`judgeCell`→バー表示・`result.request` があれば `state.lastRequest` に保存(Issue #34)→ `combineRecordUsage(priorUsage.usage, toRecordUsage(result.usage))` と `(priorUsage.latencyMs || 0) + result._t` を `pendingCommit.usage` / `.latencyMs` に持たせる(`priorUsage` は確信度順のマス選びぶん。scan/all からの呼び出しでは `undefined`。Issue #55・#56)→(待ち)→`commitFocused`→(待ち)→`focusNext()` で次へ。`judgeCell` が `AbortError` で reject したときは(世代トークンの判定と同じ扱いで)無視して `return` し、`showError` には流さない(4.3、Issue #19)。それ以外の失敗で `err.request` があれば(`judgeCell` が 502 の `request` を載せる)`state.lastRequest` に保存して `lastRequestFailed=true` にしてから、`err.transient`(Issue #43)なら `pauseForTransientError(err)` に分岐して `return`、そうでなければ従来どおり `showError`(Issue #34) |
-| `focusNextAll(token)` | 一括モード(Issue #48)の周の入口。`allResults`(この周のキャッシュ)が `null`(= まだ `askAll()` していない)なら `askAllRound(token)` を呼ぶ。既にあれば(応答済み、または停止/再開で戻ってきた)`queue` から1つ取り出して `focusCellFromCache(cell, token)` に渡す |
+| `focusNextAll(token)` | 一括モード(Issue #48)の周の入口。`allResults`(この周のキャッシュ)が `null`(= まだ `askAll()` していない)なら `askAllRound(token)` を呼ぶ。既にあれば、`state.instantMode && state.speedMode==="fast"`(Issue #80)のときは `commitAllInstant()` に委譲し、そうでなければ `queue` から1つ取り出して `focusCellFromCache(cell, token)` に渡す |
+| `commitAllInstant()` | 一括+最速の描画省略(Issue #80)。`queue` が空になるまで `commitJudgment()` を同期ループで呼び、1マスずつの `render()`(フォーカス→バー表示→確定→次へ)を挟まない。ループを抜けたら `finalizeRound()` を呼ぶ(そこでの `render()` 1回だけで反映される)。`allResults` に対象マスが無ければ `showError()` して打ち切る |
 | `askAllRound(token)` | 一括モードの周ぶんの呼び出し。周の最初(で唯一)のリクエストなので `markRoundStarted()`(Issue #55)。`state.allFetching=true` にして描画 →(新しい `AbortController` で)`askAll` → `result.request` があれば `state.lastAllRequest = { request, failed:false, count }`(`count` は呼び出し時点の `queue.length`)を保存 → `pendingAllUsage = { usage: toRecordUsage(result.usage), latencyMs: result._t }` を立てる(周の先頭1件にだけ付けるための一時置き場。Issue #56)→ `result.cells`(`"r0c2"` 形式のキー)を `"r-c"` 形式に変換して `allResults` に持ち `state.allFetching=false` → `focusNextAll(token)` で1マス目へ。失敗は `err.request` があれば `state.lastAllRequest = { request, failed:true, count }`、`err.transient`(Issue #43)なら `pauseForTransientError(err)`、それ以外は従来どおり `showError`(`queue` は変えていないので、いずれの再開も同じ周のまま `askAllRound()` をやり直す) |
 | `focusCellFromCache(cell,token)` | 一括モードの1マスぶん。`focusCellForDigit` と同じ「フォーカス→バー表示→確定→次へ」の流れだが、`judgeCell()` を呼ばず `allResults[key]` から読むだけなので `fetch` は発生しない(1周1回の呼び出しで済ませるのが目的)。`pendingAllUsage` が立っていれば(= この周でまだどの記録にも usage を付けていない)`pendingCommit.usage` / `.latencyMs` に写して `null` に戻す(2件目以降は付かない = 二重計上しない。Issue #56)。`SLOW_BEFORE_COMMIT_MS` 等の速度モードの待ちは共通(スロー/最速の見え方も既存どおり) |
-| `commitFocused()` | `pendingCommit` を `state.values` に反映し、`roundTally`/`roundWrong`/`state.lastJudgment` を更新。`pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない。不正解なら `addWrongDigit(key, pendingCommit.choice)`(消去法・履歴。Issue #61)を呼ぶ。正誤が確定するこの時点で `appendRecord()` を呼び、集計ビュー用の1件を記録する。`m` は `activeModelIdForPricing()`(= `currentModelId()`。一括モードは `"typesafe/jev/all"` または `currentModelId() + "/all"`。`o` も `"all"` を添える。Issue #48)。`n`(候補数。`probabilities` のキー数)・`e`(`state.historyMode`)・`rc`(`state.ruleMode`)も添える(Issue #61・#63)。`pendingCommit.usage` があれば `record.u = { i, o }`(`ci` があれば添える)、`pendingCommit.latencyMs` が数値なら `record.t` を付ける(Issue #55・#56)。続けて `costOf(record)` を `roundCostUsd` / `totalCostUsd` の両方に足し込む。`state.cellProbs` もここで `null` に戻す(Issue #38。次のマス選びまでヒートマップを出さない) |
+| `commitFocused()` | `pendingCommit` が無い、または `state.focusedKey` と一致しないときは何もしない。一致すれば `commitJudgment(r,c,pendingCommit.choice,...)` を呼んだあと `state.focusedKey`/`state.currentProbs`/`state.cellProbs`/`pendingCommit` を片付けて `render()` する |
+| `commitJudgment(r,c,choice,confidence,probabilities,usage,latencyMs)` | `commitFocused()` の本体(記録の作成・統計・usage/コストの積み上げ・`state.lastJudgment` の更新)を、呼び出し元の `pendingCommit`/`state.focusedKey` から独立させたもの(Issue #80。`commitAllInstant()` が同じロジックを `render()` を挟まずループで呼べるようにする切り出し。`render()` はここでは呼ばない)。`state.values` に反映し、`roundTally`/`roundWrong` を更新。不正解なら `addWrongDigit(key, choice)`(消去法・履歴。Issue #61)を呼ぶ。正誤が確定するこの時点で `appendRecord()` を呼び、集計ビュー用の1件を記録する。`m` は `activeModelIdForPricing()`(= `currentModelId()`。一括モードは `"typesafe/jev/all"` または `currentModelId() + "/all"`。`o` も `"all"` を添える。Issue #48)。`n`(候補数。`probabilities` のキー数)・`e`(`state.historyMode`)・`rc`(`state.ruleMode`)も添える(Issue #61・#63)。`usage` があれば `record.u = { i, o }`(`ci` があれば添える)、`latencyMs` が数値なら `record.t` を付ける(Issue #55・#56)。続けて `costOf(record)` を `roundCostUsd` / `totalCostUsd` の両方に足し込み、`state.lastJudgment` を `buildDigitBars(probabilities, choice)` で組み立てた `probs` 付きで更新する |
 | `finalizeRound()` | 冒頭で一括モード(Issue #48)のこの周のキャッシュ(`allResults` / `pendingAllUsage`)を `null` に戻す(次の周は改めて1回聞く)。`decision = shouldStop(...)` を先に決め、`closeRoundClock(decision === "continue")`(4.1)でこの周の `ms` を確定・`roundCostUsd` を取り出してから、`state.roundLog` に `{ round, correct, total, ms, cost, m: activeModelIdForPricing() }` を積む(Issue #55・#56。以前は文字列1本を積んでいた)。`decision === "limit"` のときは続けてもう1件、`{ round, limit: true, wrong: roundWrong.length }` を積む(Issue #60。`renderRoundLog()` が `formatLimitLogLine()` で「N周で強制終了(最終周の不正解 M マス)」として描く。`countRoundLogEntries()` はこの行を「周」として数えない)。そのあと `shouldStop` の結果で完了 / 強制終了 / 次の周(`queue = nextQueue(roundWrong)`)。「次の周」のときは、between-round の `setTimeout` を張る**前**に `state.round` / `queue` / `roundSize` / `roundTally` を更新する。この順序のおかげで、待ち時間中に `stop()` されても次の周の状態が既に確定している(下記 `stop()`、Issue #32) |
 | `stop()` | 実行中の停止(SPEC F1、Issue #32)。`reset()` と同じく `runToken` を進めて in-flight の `/api/judge`(`inflightController.abort()`)と予約済みの `setTimeout` を無効化するが、`reset()` と違って **`state.values` / `state.round` / `state.roundLog` / `roundTally` / `roundSize` / `queue` / `started` は捨てない**。`state.focusedKey` があれば(= 判定中のマスがまだ `commitFocused()` されていない)、その結果を破棄して記録(`appendRecord`)にも残さず、`queue.unshift({r,c})` で queue の先頭に戻す(再開したら同じマスをもう一度聞く。SPEC F2)。周をまたぐ待ち時間中(`finalizeRound()` の between-round の `setTimeout` 待ち)に呼ばれた場合は、その時点で `focusedKey` は既に `null`(`commitFocused()` で消えている)なので何もすることがなく、次の周の先頭から再開する(`finalizeRound()` の更新順序による。SPEC F3)。`state.done` / `state.errorMessage` のときは何もしない(両者は常に `running=false` とセットで立つので `state.running` を見るだけで判定できる)。**確信度順モード中の停止(Issue #38)**: `state.selecting`(マス選び中)なら無条件で `state.selecting=false` / `state.cellProbs=null` にする。選ばれたマスはまだ `queue` から取り除いていない(選び終わって `splice` して初めて取り除く)ので、`focusedKey` が無い限り再キューは不要。再開(`run()`)はマス選びからやり直す。手動停止には理由が無いので `state.pauseReason=null` にする(下記 `pauseForTransientError()` と区別する。Issue #43)。実体は `haltRun(null)` |
 | `haltRun(reason)` | `stop()` と `pauseForTransientError()` の共通処理。`state.running` でなければ何もしない。まず `pauseClock()`(4.1、Issue #55)で計時を止め、`runToken` を進めて in-flight を abort、`running=false`、判定中のマスは `queue` の先頭に戻し `pendingCommit` を破棄、`selecting=false` / `cellProbs=null` / `state.allFetching=false` にし(一括モードのキャッシュ `allResults` はここでは **保つ**。Issue #48)、`state.pauseReason=reason`(手動停止は `null`)にして描画する。`state.errorMessage` は立てない(= `isPaused()` は true になる) |
@@ -640,9 +643,9 @@ var compareGenerating = false;  // 「新しい問題」(比較シェル版)で�
 | `setSpeed(mode)` | `state.speedMode` を切り替えて再描画。実行中でも切り替えられる(4.4) |
 | `setDifficulty(mode)` | `state.difficulty`(`"easy"` / `"normal"` / `"hard"`)を切り替えて再描画。変えただけでは盤面は変わらず、次の `newPuzzle()` の目標ヒント数に効く(Issue #21) |
 | `render()` | `state` から DOM(グリッド・統計・バー・ログ・集計パネル・バナー・ボタン)を **全部 innerHTML で再生成**。周回ログのスクロール位置だけは引き継ぐ |
-| `render*()` | `renderGrid` / `renderLegend`(確信度順のときだけヒートマップの凡例を1項目足す。Issue #38)/ `renderControls`(速度・難易度・モデル・順番・消去法の2トグル(履歴・ルール候補。Issue #61・#63)を含む6つの `<select>`。Issue #76 でボタン群からプルダウンに変更)/ `renderClaudeSettings`(Claude のときだけ)/ `renderErrorBox` / `renderStats`(+`statCard`。「この周の判定済み」「この周の正解」の2項目を含む5項目を1行で表示。Issue #60・#76)/ `renderCurrentPanel`(+`coordLabel` / `renderBars` / `renderSelectionLine`)/ `renderPromptPanel`(+`renderRequestBlock` / `renderAllRequestBlock`)/ `renderRoundLog`(+`formatLimitLogLine`。強制終了の行。Issue #60)/ `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`(完了/強制終了時に所要時間を添える。Issue #76)。それぞれHTML文字列を返すだけで、DOMには触らない |
+| `render*()` | `renderGrid` / `renderLegend`(確信度順のときだけヒートマップの凡例を1項目足す。Issue #38)/ `renderControls`(速度・難易度・モデル・順番・描画・消去法の2トグル(履歴・ルール候補。Issue #61・#63)を含む7つの `<select>`。Issue #76 でボタン群からプルダウンに変更、Issue #80 で描画トグルを追加)/ `renderClaudeSettings`(Claude のときだけ)/ `renderErrorBox` / `renderStats`(+`statCard`。「この周の判定済み」「この周の正解」の2項目を含む5項目を1行で表示。Issue #60・#76)/ `renderCurrentPanel`(+`coordLabel` / `renderBars` / `renderSelectionLine`。見出し行の右に経過時間を表示。Issue #80)/ `renderPromptPanel`(+`renderPromptPanelBody` / `renderRequestBlock` / `renderAllRequestBlock`)/ `renderRoundLog`(+`formatLimitLogLine`。強制終了の行。Issue #60)/ `renderCalibration`(+`renderCalibrationChart`)/ `renderBanner`(完了/強制終了時に所要時間を添える。Issue #76)。それぞれHTML文字列を返すだけで、DOMには触らない |
 | `renderSelectionLine()` | 確信度順モード(Issue #38)の「マス選び: N 候補中 r行目c列目(p%)/ confidence q%」行。`state.lastSelection` が無ければ空文字列。`renderCurrentPanel()` が `state.focusedKey` があるとき(= マス選びが終わって数字判定中)にだけ先頭に差し込む |
-| `renderPromptPanel()` / `renderRequestBlock(req,failed,heading)` / `renderAllRequestBlock(allReq)` | 「現在の判定」パネルの直下の「モデルに送ったプロンプト」枠(SPEC F1、Issue #34、#38、#48)。`renderRequestBlock` が1件ぶんの表示(座標・失敗注記・見出し・`<pre>` の JSON)を組み立てる下請け。左上からモード(`orderMode` が `"confidence"` でも `"all"` でもないとき)は従来どおり `state.lastRequest` 1件だけを `heading=null` で表示。**確信度順モード**は `state.lastCellRequest`(見出し「マス選び」)→ `state.lastRequest`(見出し「数字」)の順で2段に並べる(どちらも無ければ従来と同じ「まだ判定していません」)。座標(`req.state.target`)・`lastRequestFailed` なら「(このプロンプトで失敗)」を添える処理は共通。**一括モード**は `state.lastAllRequest`(`{ request, failed, count }`)を `renderAllRequestBlock` に渡し、「一括: 質問 N 問」の要約行 + `<details>` の折りたたみで表示する(1周ぶんの `request` は空マスの数だけ質問を含み大きいため)。Jev 経路では Worker の `handleJudge` が返す `request`、Claude 経路ではブラウザが送ったリクエストボディをそのまま表示し、フロント側で組み立て直さない(二重管理を避けるため) |
+| `renderPromptPanel()` / `renderPromptPanelBody(info)` / `renderRequestBlock(req,failed,heading)` / `renderAllRequestBlock(allReq)` | 「現在の判定」パネルの直下の「モデルに送ったプロンプト」枠(SPEC F1、Issue #34、#38、#48)。中身の組み立ては `renderPromptPanelBody(info)`(`info = { orderMode, lastRequest, lastRequestFailed, lastCellRequest, lastAllRequest }`)に切り出してあり、`renderPromptPanel()` は `state` から `info` を作って呼び、見出し・panel の外枠を足すだけ(比較シェルの `renderCompareStatusHtml()` も同じ `renderPromptPanelBody()` を呼ぶ。Issue #80)。`renderRequestBlock` が1件ぶんの表示(座標・失敗注記・見出し・`<pre>` の JSON)を組み立てる下請け。左上からモード(`info.orderMode` が `"confidence"` でも `"all"` でもないとき)は従来どおり `info.lastRequest` 1件だけを `heading=null` で表示。**確信度順モード**は `info.lastCellRequest`(見出し「マス選び」)→ `info.lastRequest`(見出し「数字」)の順で2段に並べる(どちらも無ければ従来と同じ「まだ判定していません」)。座標(`req.state.target`)・`lastRequestFailed` なら「(このプロンプトで失敗)」を添える処理は共通。**一括モード**は `info.lastAllRequest`(`{ request, failed, count }`)を `renderAllRequestBlock` に渡し、「一括: 質問 N 問」の要約行 + `<details>` の折りたたみで表示する(1周ぶんの `request` は空マスの数だけ質問を含み大きいため)。Jev 経路では Worker の `handleJudge` が返す `request`、Claude 経路ではブラウザが送ったリクエストボディをそのまま表示し、フロント側で組み立て直さない(二重管理を避けるため) |
 | `buildCellStyle()` | マスの状態(given/pending/correct/incorrect + focused)からインラインstyle文字列を返す。確信度順モード(Issue #38)では、`state.cellProbs` にそのマスの確率があり(未判定・非フォーカス)、`α = 0.08 + 0.6 * p / pmax`(`pmax` は `cellProbs` の最大値)の `rgba(125, 211, 252, α)` を背景にする(ヒートマップ) |
 | `escapeHtml(text)` | `innerHTML` に入れる前に `& < > " '` を実体参照にする |
 | `fnv1a32(text)` / `puzzleId()` | 集計ビュー(SPEC F1 拡張2)の問題ID用の簡易ハッシュ。32bit FNV-1a を8桁16進で返す。`puzzleId()` は `GIVEN` の9行を結合した文字列をハッシュ化する |
@@ -656,9 +659,9 @@ var compareGenerating = false;  // 「新しい問題」(比較シェル版)で�
 | `clearRecords()` | `confirm()` で確認したうえで `saveRecords([])` し、再描画する |
 | `readUrlOptions()` / `applyUrlOptions(opts)` / `parseQueryString(search)` / `parsePuzzleString(str)` / `applyPuzzleFromString(str)` | URL パラメータ(Issue #46、SPEC F1')。`readUrlOptions()` は `location.search` を1回読んでパースするだけ(副作用なし)。`applyUrlOptions()` がそれを `state.modelMode` / `state.orderMode` / `state.speedMode` / `state.historyMode` / `state.ruleMode`(`history=0|1` / `rules=0|1`、Issue #61・#63)/ `embedMode` に反映し、`puzzle` があれば `applyPuzzleFromString()` に渡す。`applyPuzzleFromString()` は `newPuzzle()` の「盤面差し替え」部分(`GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize`)をジェネレーターの代わりに一意解チェック(`solveCount(rows, 2, solutions)`)だけで行う共通処理で、埋め込みモードの `message` の `newPuzzle` からも呼ぶ |
 | `countCorrectValues()` | `state.values` で `status === "correct"` の件数。`renderStats()` と `postStatus()` の両方が使う(重複計算を避ける) |
-| `postStatus()` | 埋め込みモード(`embedMode`)の `render()` のたびに呼ばれる。`window.parent === window`(iframe でない)なら何もしない。`{ type:"status", model, round, correct, total, remaining, running, paused, pauseReason, done, roundsToSolve, stoppedAtLimit, errorMessage, elapsedMs, costUsd }` を `window.parent.postMessage(payload, location.origin)` する(SPEC F1'、`pauseReason` は Issue #43、`elapsedMs`/`costUsd` は Issue #55・#56。`elapsedMs` は `currentTotalElapsedMs()`)。比較シェルの `compareStatusText()` はこれを見て `paused && pauseReason` なら「停止中(一時的な失敗)」を出し、`renderCompareStatusHtml()` が `elapsedMs`/`costUsd` をそのまま `formatMs()`/`formatUsd()` で見出しに表示する(親側では経過時間を計測し直さない) |
+| `postStatus()` | 埋め込みモード(`embedMode`)の `render()` のたびに呼ばれる。`window.parent === window`(iframe でない)なら何もしない。`{ type:"status", model, round, correct, total, remaining, running, paused, pauseReason, done, roundsToSolve, stoppedAtLimit, errorMessage, elapsedMs, costUsd, orderMode, lastRequest, lastRequestFailed, lastCellRequest, lastAllRequest }` を `window.parent.postMessage(payload, location.origin)` する(SPEC F1'、`pauseReason` は Issue #43、`elapsedMs`/`costUsd` は Issue #55・#56。`elapsedMs` は `currentTotalElapsedMs()`。`orderMode`/`lastRequest` 系は Issue #80、「比較モードのプロンプト可視化」参照)。比較シェルの `compareStatusText()` はこれを見て `paused && pauseReason` なら「停止中(一時的な失敗)」を出し、`renderCompareStatusHtml()` が `elapsedMs`/`costUsd` をそのまま `formatMs()`/`formatUsd()` で見出しに表示し(親側では経過時間を計測し直さない)、`orderMode`/`lastRequest` 系は `renderPromptPanelBody()` にそのまま渡して「モデルに送ったプロンプト」と同じ内容を表示する |
 | `setupEmbedMessageListener()` | 埋め込みモードの起動時に1回呼ぶ。`window.addEventListener("message", ...)` で親からの操作を受け、`event.origin === location.origin` のときだけ `run()` / `stop()` / `reset()` / (`newPuzzle` なら `applyPuzzleFromString()` → `reset()`) / `setSpeed()` / `setOrderMode()` / `setHistoryMode()` / `setRuleMode()`(Issue #61・#63)を呼ぶ |
-| `renderCompareShell()` / `compareRun()` / `compareStop()` / `compareReset()` / `compareNewPuzzle()` / `compareSetSpeed()` / `compareSetOrderMode()` / `compareSetHistoryMode()` / `compareSetRuleMode()` / `compareSetDifficulty()` / `updateCompareStatus()` / `setupCompareMessageListener()` | 比較シェル(`GET /compare`、Issue #46、8章)。`compareSetHistoryMode()` / `compareSetRuleMode()`(Issue #61・#63)は `compareSetOrderMode()` と同じロック条件(`compareEitherRunning() || compareEitherPaused()`)で `state.historyMode` / `state.ruleMode` を切り替え、両 iframe に `{ type: "setHistoryMode", on }` / `{ type: "setRuleMode", on }` を `postMessage` する。`renderCompareShell()` は `app.innerHTML` を**最初の1回だけ**組み立て(上部バー・2つの `<iframe class="compare-frame">`・各ステータス欄)、直後に `document.querySelectorAll(".compare-topbar" / ".compare-status" / ".compare-frame")` で要素を拾って `compareEls` / `compareFrames` に保持する。以後の更新(`compareRun()` 等)は `app.innerHTML` を触らず、`compareEls.topbar.innerHTML` / `compareEls.statusJev.innerHTML` / `compareEls.statusClaude.innerHTML` だけを差し替える(iframe の再読み込みを避けるため)。`comparePostToFrames(message)` が両 `iframe.contentWindow` に同じメッセージを `postMessage(message, location.origin)` する。`setupCompareMessageListener()` は子からの `status` メッセージ(`event.origin` と `event.source`(どちらの `contentWindow` か)を確認)を `updateCompareStatus()` に振り分ける。経過時間・コストの見出し(`renderCompareStatusHtml()`)は子が申告する `elapsedMs`/`costUsd` をそのまま使い、親側の計測(旧 `compareStartedAt` / `compareElapsedSeconds()`。Issue #55 で廃止)は持たない |
+| `renderCompareShell()` / `compareRun()` / `compareStop()` / `compareReset()` / `compareNewPuzzle()` / `compareSetSpeed()` / `compareSetOrderMode()` / `compareSetHistoryMode()` / `compareSetRuleMode()` / `compareSetDifficulty()` / `updateCompareStatus()` / `setupCompareMessageListener()` | 比較シェル(`GET /compare`、Issue #46、8章)。`compareSetHistoryMode()` / `compareSetRuleMode()`(Issue #61・#63)は `compareSetOrderMode()` と同じロック条件(`compareEitherRunning() || compareEitherPaused()`)で `state.historyMode` / `state.ruleMode` を切り替え、両 iframe に `{ type: "setHistoryMode", on }` / `{ type: "setRuleMode", on }` を `postMessage` する。`renderCompareShell()` は `app.innerHTML` を**最初の1回だけ**組み立て(上部バー・2つの `<iframe class="compare-frame">`・各ステータス欄)、直後に `document.querySelectorAll(".compare-topbar" / ".compare-status" / ".compare-frame")` で要素を拾って `compareEls` / `compareFrames` に保持する。以後の更新(`compareRun()` 等)は `app.innerHTML` を触らず、`compareEls.topbar.innerHTML` / `compareEls.statusJev.innerHTML` / `compareEls.statusClaude.innerHTML` だけを差し替える(iframe の再読み込みを避けるため)。`comparePostToFrames(message)` が両 `iframe.contentWindow` に同じメッセージを `postMessage(message, location.origin)` する。`setupCompareMessageListener()` は子からの `status` メッセージ(`event.origin` と `event.source`(どちらの `contentWindow` か)を確認)を `updateCompareStatus()` に振り分ける。経過時間・コストの見出し(`renderCompareStatusHtml()`)は子が申告する `elapsedMs`/`costUsd` をそのまま使い、親側の計測(旧 `compareStartedAt` / `compareElapsedSeconds()`。Issue #55 で廃止)は持たない。`renderCompareStatusHtml()` は見出しの下に `renderPromptPanelBody()`(4.2「モデルに送ったプロンプト」)を呼んで直近のリクエストも表示する(Issue #80) |
 
 **計時・コスト(Issue #55・#56)の関数。**
 
@@ -826,8 +829,8 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
   `renderLegend()` + `renderUsagePanel()`、`side-panel`: `renderStats()` + `renderCurrentPanel()`
   + `renderRoundLog()` + `renderPromptPanel()` + `renderCalibration()`)の順に組み立てる。
   以前は実行系ボタン+各トグルが `side-panel` の先頭にあったが、完了バナーの下・盤面の上の
-  横並びバー(`top-controls`)に外に出した。速度・難易度・モデル・順番・履歴・ルール候補の
-  6トグルは、選択中のものだけ見えればよいのでボタン群でなく `<select>` にした(id は
+  横並びバー(`top-controls`)に外に出した。速度・難易度・モデル・順番・描画(Issue #80)・
+  履歴・ルール候補の7トグルは、選択中のものだけ見えればよいのでボタン群でなく `<select>` にした(id は
   `speed-toggle` 等、ボタン群のときと同じものを流用。CSS の `#speed-toggle { display:
   inline-flex; border: … }` 等は比較シェル(`renderCompareShellControls()`。同じ id を使う
   ボタン群のまま、Issue #76 の対象外)と共有しているが、`<select>` に適用しても見た目を
@@ -842,16 +845,25 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
   を丸ごと作り直すため、実行中に高頻度で呼ばれる(一括モードの確定ごとなど)と、開いている
   `<select>` のプルダウンやキーボードフォーカスが一瞬で失われて選べなくなる**(PR #78 の
   Opus レビュー S1)。`isControlSelectFocused()` が `document.activeElement` を見て、
-  `.top-controls` 内の6つの `<select>` のいずれかにフォーカスがあるあいだは `render()` を
+  `.top-controls` 内の7つの `<select>`(`TOP_CONTROLS_SELECT_IDS`。Issue #80 で
+  `instant-toggle` を追加)のいずれかにフォーカスがあるあいだは `render()` を
   丸ごとスキップする(state 自体は更新されるので、フォーカスが外れた次の `render()` でまとめて
-  反映される)。実行中でも切り替えられるのは速度・難易度の2つだけ(他の4つはロックされ、
-  無効化された `<select>` はそもそもフォーカスできない)だが、ガードは6つの id 全部を見る
-  (ロック中の4つは実質到達しない安全側の実装)
+  反映される)。実行中でも切り替えられるのは速度・難易度の2つだけ(他の5つはロックされ、
+  無効化された `<select>` はそもそもフォーカスできない)だが、ガードは7つの id 全部を見る
+  (ロック中の5つは実質到達しない安全側の実装)
 - 状態が変わるたびに `render()` で該当領域を丸ごと再生成する。81マス+9本のバー程度なので差分更新は不要
 - 色や枠線は `buildCellStyle` が返すインラインstyleで指定(クラス切り替えではなく、状態から毎回組み立てる)
 - 「現在の判定」パネルは、結果が届いているマスについては座標とバーを出し、結果待ち・確定直後は
   「いま聞いているマス」と **直前に確定した判定**(`state.lastJudgment`: 座標・選んだ数字・正誤・
   `confidence`・バー)を並べる。最速モードだと結果が一瞬で消えてしまうため
+- **見出し行の経過時間(Issue #80、オーナー要望 2026-09-23)**: 「現在の判定」の見出し
+  (`panel-title`)を `panel-title-row`(flex、`justify-content: space-between`)で包み、
+  右側に `panel-title-elapsed`(`currentTotalElapsedMs()` を `formatMs()` でミリ秒表示)を
+  常時出す。以前はパネル本文の先頭に「経過 X ms / $Y」という行(`elapsedLine`)を実行中だけ
+  出していたが、コストは「この実行の消費」パネル(`renderUsagePanel()`)と重複していたため、
+  経過時間だけを見出し行に移してコストの重複表示を削除した(`head` の組み立て1か所に
+  まとめたので、`isPaused()`/`allFetching`/フォーカス中/待機中の各分岐で個別に
+  `elapsedLine` を差し込む必要も無くなった)
 - `innerHTML` を作り直すと周回ログのスクロールが先頭に戻るので、`render()` は置き換えの前に
   `#round-log ul` の `scrollTop` を保存し、置き換えの後に戻す。末尾に居たときは末尾のままにする
 - 速度モード(`setSpeed`)は実行中でも切り替えられる。**予約済みの `setTimeout` の残り時間は
@@ -875,6 +887,18 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
   失敗、Issue #43。`judgeCellClaude` の非 2xx を除き通常 `request` が無い)では直前の値が
   残る。`<pre>` は `white-space: pre-wrap` で長い `note` を折り返す(1 判定あたりレスポンスは
   約 1KB 増える。定数 `NOTE` が大半)
+- **比較モードのプロンプト可視化(Issue #80、オーナー要望 2026-09-23)**: 埋め込みモードは
+  `renderPromptPanel()` 自体を描かない(SPEC F1')ので、比較シェルで「Claude が動いているか
+  分からない」問題があった。`renderPromptPanel()` の中身組み立てを
+  `renderPromptPanelBody(info)`(`info = { orderMode, lastRequest, lastRequestFailed,
+  lastCellRequest, lastAllRequest }`)として切り出し、通常ページの `renderPromptPanel()` は
+  `state` から `info` を組み立てて呼ぶだけにした。`postStatus()` の payload にも同じ5項目を
+  足し、`renderCompareStatusHtml(which)` が `compareStatus[which]` からそのまま `info` を
+  組み立てて `renderPromptPanelBody()` を呼ぶ(通常ページと二重管理にしない)。比較シェルの
+  `.compare-status` は `updateCompareStatus()` のたびに `innerHTML` を丸ごと差し替えるので、
+  折りたたみ(`<details class="prompt-details">`。一括モードのときだけ)の開閉状態は
+  引き継がない(通常ページの `render()` にある `oldDetails`/`detailsWasOpen` の仕組みは
+  1個の `<details>` しか想定しておらず、2カラム分への拡張は今回のスコープ外。Issue #80)
 - **確信度順モード(Issue #38)** は `state.orderMode` だけで分岐し、`buildCellStyle` /
   `renderCurrentPanel` / `renderPromptPanel` / `renderLegend` / `renderControls` の既存の
   関数にロジックを足す形にしてある(専用のコンポーネントを新設しない)。ヒートマップは
@@ -891,6 +915,24 @@ Jev への問い合わせそのものは止めない。リセット/新しい問
   `focusCellForDigit` と同じ描画経路(`state.focusedKey` / `state.currentProbs` /
   `pendingCommit`)を使うので、`renderGrid` / `renderCurrentPanel` の本体側は
   モードを意識しない
+- **描画省略トグル(Issue #80、オーナー要望 2026-09-23)**: 一括モードでも「フォーカス→
+  バー表示→確定→次へ」を1マスずつ `render()` する演出が入るため、最速モードでも51マスの
+  完走に約1秒+51回の `innerHTML` 再構築がかかる問題への対応。`commitFocused()` の本体
+  (記録の作成・統計・usage/コストの積み上げ・`state.lastJudgment` の更新)を
+  `commitJudgment(r, c, choice, confidence, probabilities, usage, latencyMs)` として
+  切り出し(`commitFocused()` はガードと呼び出しだけになる)、`state.instantMode` が
+  立っていて `orderMode==="all"` かつ `speedMode==="fast"` のときだけ、`focusNextAll()`
+  が1マスずつの `focusCellFromCache()` の代わりに `commitAllInstant()` を呼ぶ。これは
+  `queue` が空になるまで `commitJudgment()` を同期ループで呼ぶだけで、`render()` は
+  一度も挟まない(`judgeCell` を呼ばず `allResults` から読むだけの一括モードの性質上、
+  ループの途中で fetch や `setTimeout` による割り込みは起きないので、1マスごとの
+  `isCurrent(token)` 再チェックは不要)。ループが終わったら通常どおり `finalizeRound()`
+  を呼び、そこでの `render()` 1回だけで周の完了(または次周開始)が反映される。周またぎの
+  待ち時間(`FAST_BETWEEN_ROUNDS_MS`)もこのモードでは0にする。`orderMode`/`speedMode` の
+  組み合わせが合わないときは `renderControls()` が `instant-toggle` を無効化するが、
+  `focusNextAll()` 側でも `speedMode==="fast"` を再確認する(直接 `setInstantMode(true)`
+  を呼んでも安全なように)。`TOP_CONTROLS_SELECT_IDS`(4.4 冒頭)に `instant-toggle` を
+  追加している
 
 ## 5. データ
 
@@ -1108,5 +1150,11 @@ new_sqlite_classes = ["RateLimitCounter"]
   - **UI レイアウト刷新(Issue #76)**(`test/page.test.js` AC1・AC2)
     - AC1: `renderBanner()` の完了バナーに `formatMs(totalElapsedMs)` の所要時間が「(所要 X ms)」として添えられること、強制終了バナーにも同様に出ること、未完了(`state.done===false`)のときはバナー自体が空(`<div id="completion-banner"></div>`)のままなこと
     - AC2(PR #78 の Opus レビュー S1): `document.activeElement` が `.top-controls` 内の `<select>`(`isControlSelectFocused()` が見る6つの id のいずれか)のとき `render()` が `app.innerHTML` を書き換えずに早期リターンすること(state 自体は更新される)。`<select>` 以外の要素にフォーカスがあるときはガードされないこと。フォーカスが外れたあとの次の `render()` で最新の state が反映されること(`git stash` でガード導入前のコードに戻すと落ちることを確認済み)
+  - **一括+最速の描画省略・現在の判定の経過時間・比較モードのプロンプト可視化(Issue #80、オーナー要望 2026-09-23)**(`test/page.test.js` AD1〜AD5)
+    - AD1: 一括+最速+`instantMode` で応答が届いたあと、`document.getElementById("app").innerHTML` への書き込み回数(render 回数)が1マスずつのときと比べて少数(2回以下)で完了まで至ること。全マスが確定し、記録の `m`/`o` が通常の一括モードと同じで、usage(`makeAllResponse().json()` に `usage` を足したもの)が周の先頭レコードだけに付くこと(`git stash` で `commitAllInstant()` 導入前のコードに戻すと落ちることを確認済み)
+    - AD2: `renderControls()` の `instant-toggle` が「左上から+じっくり」「一括+じっくり」では無効化され、「一括+最速」でだけ有効になること。実行中(`state.running=true`)はロックされ、`setInstantMode()` を直接呼んでも `modelSettingsLocked()` で無視されること。選択肢のラベル(「毎回表示」/「省略(最速)」)が出ること
+    - AD3: `state.instantMode=true` のまま `orderMode="all"`・`speedMode="slow"` で `run()` すると(UI 上は無効化される組み合わせを直接 state で立てても)、`commitAllInstant()` ではなく従来どおり `focusCellFromCache()` の1マスずつのフローに入ること(応答直後に即完了せず、1マス目がフォーカスされるまで `state.done===false` のままであることを確認する)
+    - AD4: `renderCurrentPanel()` の見出し行(`class="panel-title-row"`)に `class="panel-title-elapsed"` の経過時間(ミリ秒)が常に出ること。未実行時は `0 ms`、`runningSince`/`nowMs` を差し替えるとライブに反映されること、停止後(`runningSince=null`)は最後の値が残ること。累計コスト($)の重複表示が消えていること
+    - AD5: 埋め込みモードの `postStatus()` の payload に `orderMode`/`lastAllRequest` などが乗ること。比較シェルの `renderCompareStatusHtml()` に `compareStatus[which]` を直接差し込み、status 未着時は「まだ判定していません」、一括モードの `lastAllRequest` は「質問 N 問」の要約とチャンク分割の注記(Issue #74)付きで `<details>` に、左上からモードの `lastRequest` は座標付きの要約でそれぞれ出ること
 - E2E モック(`scripts/e2e/smoke.mjs`)の `/api/judge` 応答(`digit` / `cell` / `all` すべて)に固定の `usage`(`{ input_tokens, output_tokens }`)を足し、周回ログの1行目(`[2]` `[7]` `[9]` `[8]`)に `— <N,NNN> ms / $<...>` の形が出ることをチェックに追加した(Issue #55・#56)。`digit` / `all` は `body.exclude`(消去法。Issue #61・#63)を読み、残りの数字だけを `probabilities` / `choice` の候補にする(`remainingDigitsMock()`)。統計カードが5枚になった(Issue #60)ため `[1]` の `statValues` の件数・添字を更新した
 - CI(`.github/workflows/ci.yml`)は push と PR で `npm ci` → `npm test` → `npm run check` を実行する。`check` は `wrangler deploy --dry-run` で、認証なしで動く
