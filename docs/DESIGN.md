@@ -583,7 +583,7 @@ var compareGenerating = false;  // 「新しい問題」(比較シェル版)で�
 | `generateSolvedGrid()` | 空盤面に対し、各マスの候補をシャッフルしながらバックトラッキングして完成盤を1つ作る純粋関数(乱数のみ外部依存) |
 | `generatePuzzle(targetGivens)` | 完成盤からマスをランダム順に消し、消すたびに `solveCount(grid, 2) === 1` を確認する(2 になるなら戻す)。与えられた数字が `targetGivens`(既定 `DEFAULT_TARGET_GIVENS` = 30、下限 `MIN_TARGET_GIVENS` = 17)になったら打ち切る。戻り値 `{ given, solution }`(どちらも9行の文字列配列)。ランダム順の都合で `targetGivens` ちょうどに届かず、それより多いヒント数で止まることがある(下は `generatePuzzleWithRetry`) |
 | `generatePuzzleWithRetry(targetGivens)` | `generatePuzzle(targetGivens)` をランダム順を変えて最大 `GENERATE_RETRIES`(既定20。Issue #87 で3から引き上げ)回試し、ちょうど `targetGivens` に届いた時点で打ち切って返す。「むずかしい」(`DIFFICULTY_GIVENS.hard` = 25)・「上級」(`DIFFICULTY_GIVENS.expert` = 22)は1回の `generatePuzzle()` では目標ちょうどに届かないことがある(既知。PR #15 の補足、Issue #87 でアルゴリズムの到達限界を再計測)ため、`GENERATE_RETRIES` 回とも届かなければ、そのうち最もヒント数が少ない結果を返す(無限ループにしない)。`newPuzzle()` が呼ぶ |
-| `newPuzzle()` | 「新しい問題」ボタン。`generating` を立てて `reset()`(= 世代トークンを進めて進行中のループを無効化し、in-flight の `/api/judge` も `abort()` する。Issue #19)し、`reset()` で維持される `state.difficulty` から目標ヒント数(`DIFFICULTY_GIVENS[state.difficulty]`)を決めてから `setTimeout(…, 0)` で `generatePuzzleWithRetry()` を呼んで生成し、`GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize` を差し替えて再描画。生成は同期で「やさしい」「ふつう」「むずかしい」は概ね数十 ms 以下(実測: 10回で 200ms 未満)だが、「上級」は `GENERATE_RETRIES`(20)回試行の分だけ時間がかかりやすく、実測で10回の生成に2.5〜3.6秒程度かかる(Issue #87) |
+| `newPuzzle()` | 「新しい問題」ボタン。`generating` を立てて `reset()`(= 世代トークンを進めて進行中のループを無効化し、in-flight の `/api/judge` も `abort()` する。Issue #19)し、`reset()` で維持される `state.difficulty` から目標ヒント数(`DIFFICULTY_GIVENS[state.difficulty]`)を決めてから `setTimeout(…, 0)` で `generatePuzzleWithRetry()` を呼んで生成し、`GIVEN` / `SOLUTION` / `TOTAL_EMPTY` / `roundSize` を差し替えて再描画。生成は同期で「やさしい」「ふつう」「むずかしい」はブラウザ実測で1回あたり数ms程度だが、「上級」は `GENERATE_RETRIES`(20)回試行することがあり1回あたり平均60ms・最悪でも150ms程度(Issue #87。`test/page.test.js` の `node:vm` ハーネス経由の計測は実行系のオーバーヘッドでこれより5〜10倍遅く出る点に注意) |
 | `countEmpty(grid)` / `boxIndex` / `gridToCells` / `cellsToGrid` / `shuffled` | 上記の下請け。盤面の2つの表現(9行の文字列配列 ⇔ 81要素の数値配列。0 が空)の変換と、Fisher-Yates シャッフル |
 | `buildSnapshot()` | `GIVEN` + `state.values`(正誤問わず)から9行の文字列配列を作る。未確定は `.`。**判定対象のマスだけは `.` にして送る(他のマスの過去の推測は正誤問わず残す)**。Worker 側も 3.3 でこれを検証する |
 | `buildSelectionSnapshot()` | 確信度順モード(Issue #38)のマス選びに送る盤面。`buildSnapshot()` と同じ組み立て方だが、`state.focusedKey` ではなく **`queue` に入っている全マス** を `.` にする。こうすると Worker(`/api/judge` の `ask:"cell"`)/ Claude が列挙する「空マス」が、その周でまだ確定していないマスとちょうど一致する(2周目以降は前の周の不正解の推測が残ったままだと空マスとして数えられないため) |
@@ -992,7 +992,7 @@ var SOLUTION = [ "534678912", "672195348", "198342567", "859761423", "426853791"
 var DIFFICULTY_GIVENS = { easy: 36, normal: 30, hard: 25, expert: 22 };
 ````
 
-`generatePuzzle()` 単体は下限 `MIN_TARGET_GIVENS`(17。一意解が理論上成立する最小のヒント数。Issue #87 以前は24だったが、このアルゴリズムの実際の到達限界(後述)を反映しない恣意的な値だったため理論値に変更した)までしか削らない。「やさしい」「ふつう」はほぼ常に目標ちょうどに届くが、「むずかしい」(25)・「上級」(22)は1回の `generatePuzzle()` 呼び出しではランダムに消す順序の都合でちょうどに届かず、実測では概ね22〜28あたりで止まる(目標をさらに下げても、このアルゴリズム単体の到達限界は変わらずおおむね同じ範囲に留まる。ベンチマークは Issue #87)。`newPuzzle()` はこれを `generatePuzzleWithRetry()`(4.2)でランダム順を変えて最大 `GENERATE_RETRIES`(20。Issue #87 で3から引き上げ。むずかしいが25ちょうどに、上級が22〜23に収束しやすくなる副作用も確認済み)回まで再試行し、目標ちょうどに届いた結果があればそれを、届かなければ最もヒント数が少ない結果を採用する形で吸収する。`SOLUTION` は採点表示にだけ使う。
+`generatePuzzle()` 単体は下限 `MIN_TARGET_GIVENS`(17。一意解が理論上成立する最小のヒント数。Issue #87 以前は24だったが、このアルゴリズムの実際の到達限界(後述)を反映しない恣意的な値だったため理論値に変更した)までしか削らない。「やさしい」「ふつう」はほぼ常に目標ちょうどに届くが、「むずかしい」(25)・「上級」(22)は1回の `generatePuzzle()` 呼び出しではランダムに消す順序の都合でちょうどに届かないことがある(目標をさらに下げても、このアルゴリズム単体の到達限界は変わらずおおむね22〜29あたりに留まる。ベンチマークは Issue #87)。ただし「むずかしい」は1回の呼び出しでも約85%の確率でちょうど25に届く。`newPuzzle()` はこれを `generatePuzzleWithRetry()`(4.2)でランダム順を変えて最大 `GENERATE_RETRIES`(20。Issue #87 で3から引き上げ)回まで再試行し、目標ちょうどに届いた結果があればそれを、届かなければ最もヒント数が少ない結果を採用する形で吸収する。20への引き上げは主に「上級」(1回では届きにくい)の収束率を上げるためで、「むずかしい」への影響は小さい。`SOLUTION` は採点表示にだけ使う。
 
 ## 6. 設定・デプロイ
 
@@ -1093,8 +1093,8 @@ new_sqlite_classes = ["RateLimitCounter"]
     - 「新しい問題」の後に `run()` すると、**新しい `GIVEN` の空マスだけを行優先の順で** `/api/judge` に問い合わせること(回数と座標の両方を見る。空マスの「数」は固定問題と同じ51になりうるため)
     - vm のコンテキストで作った配列は host とは別レルムなので、`deepStrictEqual` の前に host 側の配列へ移し替える(`hostRows`)。オブジェクト(`DIFFICULTY_GIVENS` など)も同じ理由で `deepStrictEqual` はプロトタイプ違いで落ちるので、値だけを個別に比較する
   - **難易度(ヒント数)**(`test/page.test.js`、Issue #21)。ジェネレーター系と同じ `runScript` harness を使う
-    - 難易度ごとの `generatePuzzle(DIFFICULTY_GIVENS[difficulty])` を各10回: 常に一意解、解が `solution` と一致、ヒント数がやさしい36/ふつう30は**ちょうど**、むずかしいは25〜28・上級は22〜27(下限17以上、5章のとおりジェネレーター単体では時々ちょうどに届かないことがある契約を検証する。Issue #87)
-    - `newPuzzle()` は state.difficulty に応じたヒント数で生成する(hard: 25〜28 / expert: 22〜27 / easy: 36 それぞれ一意解であることも確認)。生成時間はむずかしいを10回で2秒以内、上級を10回で8秒以内(実測2.5〜3.6秒程度に余裕を持たせた上限。Issue #87)
+    - 難易度ごとの `generatePuzzle(DIFFICULTY_GIVENS[difficulty])` を各10回: 常に一意解、解が `solution` と一致、ヒント数がやさしい36/ふつう30は**ちょうど**、むずかしいは25〜28・上級は22以上(下限17以上、5章のとおりジェネレーター単体では時々ちょうどに届かないことがある契約を検証する。上級の上限は緩め(35)に取っている。5000回のベンチマークで最大29まで観測されており、27を上限にすると10回中で約5%の確率で flaky になるため。Issue #87、PR #88 の Opus レビューで指摘)
+    - `newPuzzle()` は state.difficulty に応じたヒント数で生成する(hard: 25〜28 / expert: 22〜27 / easy: 36 それぞれ一意解であることも確認。再試行込みなので expert もこの範囲に収まる)。生成時間はむずかしいを10回で2秒以内、上級を10回で12秒以内(この `node:vm` ハーネス経由の実測は2.5〜3.6秒程度だが、CI ランナーの遅さや並行実行を見込んで余裕を持たせた上限。Issue #87)
     - 難易度トグルの描画(`renderControls()`。Issue #76 でプルダウン化): 選択中の `<option>` だけに `selected` が付くこと。`setDifficulty("hard")` で `state.difficulty` が変わり、`reset()` 後も維持されること
     - `setDifficulty()` だけを呼んでも `GIVEN` は変わらない(次の `newPuzzle()` から効く)こと
     - `newPuzzle()` が `state.difficulty` に応じたヒント数で生成すること(`hard` で25〜28、`easy` で36ちょうど)

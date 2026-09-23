@@ -2176,14 +2176,13 @@ var PAGE_HTML = `<!doctype html>
   // 難易度(SPEC F1/F4)ごとの目標ヒント数。「新しい問題」を押した時点の
   // state.difficulty に応じて newPuzzle() が generatePuzzleWithRetry() に渡す。
   // expert(上級、Issue #87、オーナー要望 2026-09-23。にこりさんの数独でいう上級相当)は
-  // 目標22だが、実際に安定して収束するのは22〜23(下記 GENERATE_RETRIES とセット)。
+  // 目標22だが、実際に収束するのはほぼ22〜23(まれに24。下記 GENERATE_RETRIES とセット)。
   var DIFFICULTY_GIVENS = { easy: 36, normal: 30, hard: 25, expert: 22 };
   var DEFAULT_DIFFICULTY = "normal";
   // generatePuzzleWithRetry() が目標ヒント数に届かないとき再試行する回数の上限。
   // 3→20(Issue #87)。expert(目標22)を数百ms以内で22〜23ヒントに収束させるために
-  // 増やした。副次効果として、既存の hard(目標25)も以前は26〜28で止まることが
-  // 多かったのが、20回の再試行でほぼ毎回25ちょうどに届くようになった(easy/normal は
-  // 初回で目標にちょうど届くので生成時間への影響はほぼ無い)。
+  // 増やした(hard(目標25)は1回の generatePuzzle() でも約85%の確率で届くので、この
+  // 変更による収束率への影響はほぼ無い。easy/normal も同様に初回でちょうど届く)。
   var GENERATE_RETRIES = 20;
 
   // 初期表示は Wikipedia の固定問題(docs/DESIGN.md 5章)。
