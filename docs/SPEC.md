@@ -197,7 +197,7 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
   - 省略・空配列 `[]` は「1つも外さない」で、省略時とまったく同じ payload になる
   - 400: 配列でない(`null` を含む)/ 要素が `"1"`〜`"9"` の文字列でない(数値の `5`、`"0"`、`"10"` など)→ `"excludeは\"1\"〜\"9\"の文字列の配列である必要があります"`。同じ数字が2回 → `"excludeに同じ数字が重複しています"`。9個全部 → `"excludeで全部の数字を外すことはできません"`(少なくとも1つは残す。8個外して1つだけ残すのは可)
   - 検証の順番は `ask` → `puzzle` が9要素の配列 → `target` → 各行の形式 → **`exclude`** → `target` の範囲とマスが空 → 17個以上
-  - 200 の形は変わらない。`probabilities` のキーは **残りの数字とちょうど一致**、`choice` は残りの数字のいずれか(外した数字を返してきたら、9キー全部を返してきた場合も含めて 502。文言は従来どおり)。`request` の `criteria` にも残りの数字だけが載る
+  - 200 の形は変わらない。`probabilities` のキーは **残りの数字とちょうど一致**、`choice` は残りの数字のいずれか(外した数字を返してきたら、9キー全部を返してきた場合も含めて 502。文言は `exclude` があるときだけ「候補の数字(exclude後)とちょうど一致していません」/「候補の数字(exclude後)のいずれかではありません」になる。`exclude` が無いときは従来どおり)。`request` の `criteria` にも残りの数字だけが載る
   - レート制限は変わらない(1呼び出し = 1カウント)
 
 レスポンス(200):
@@ -332,7 +332,7 @@ Workers AI の利用コストが青天井にならないよう、`/api/judge` �
   - `exclude` のあるマスの質問だけ、`criteria` が残りの数字だけの別オブジェクトになる。それ以外のマスは従来どおり共通の 1〜9
   - 応答の検証もマスごと: `exclude` のあるマスは `probabilities` が残りの数字とちょうど一致・`choice` がそのいずれか、それ以外のマスは 1〜9(不一致なら 502。文言はマスのキー付きの従来の文言)
 - 検証の順番は `ask` → `puzzle` が9要素の配列 → `target` 禁止 → `digit` 禁止 → 各行の形式 → `exclude` → 17個以上 → 空マスあり(`cell` / `where` に揃えてある)
-- Jev に渡す `questions` は **空マス1つにつき1問**(`type: "choice"`)。キーは `ask:"cell"` / `ask:"where"` と同じ `"r" + row + "c" + col` で、並びは行優先。各問の `instructions` は `ALL_INSTRUCTIONS_TEMPLATE`(`"Which digit from 1 to 9 belongs in the empty cell at row {row}, column {col} (zero-based)?"`)に座標を埋めたもの、`criteria` は `ask:"digit"` と同じ `{ "1": "the digit 1", …, "9": "the digit 9" }`
+- Jev に渡す `questions` は **空マス1つにつき1問**(`type: "choice"`)。キーは `ask:"cell"` / `ask:"where"` と同じ `"r" + row + "c" + col` で、並びは行優先。各問の `instructions` は `ALL_INSTRUCTIONS_TEMPLATE`(`"Which digit from 1 to 9 belongs in the empty cell at row {row}, column {col} (zero-based)?"`)に座標を埋めたもの、`criteria` は `ask:"digit"` と同じ `{ "1": "the digit 1", …, "9": "the digit 9" }`(`exclude` のあるマスは残りの数字だけ。上記)
 - `state` は `{ puzzle, note }` のみ(`target` も `digit` も無く、`note` は専用の文面 `ALL_NOTE`)
 - 1回の呼び出しに入る質問は空マスの数だけ(埋まっているマスが17個以上という共通条件から **最大64問**、1問あたり criteria は9個)。実環境で確認済みなのは51問まで(2026-09-22、`docs/DESIGN.md` 3.4)で、64問は未検証
 - レート制限は `ask` によらず **1呼び出し = 1カウント**。1 周ぶんを1回で聞くので、周1つあたり1カウントで済む

@@ -127,7 +127,7 @@ Durable Object は同じ名前のインスタンスが世界に1つしか存在�
      - 検証の順番は `ask` → `puzzle` が9要素の配列 → `target` 禁止 → `digit` 禁止 → 各行の形式 → `exclude` → 17個以上 → 空マスあり(`cell` / `where` に揃えてある)
    - `readExcludeList` / `readExcludeMap` は副作用の無い純粋関数で、`validateInput`(400 の判定)と手順4(criteria の組み立て。検証済みなので必ず成功する)の両方から呼ぶ。`validateInput` の戻り値の形(文字列か `null`)は変えていない
 4. `criteria` と「期待するキー集合」(`expectedKeys`)を `ask` ごとに生成する
-   - `ask:"digit"`: `{ "1": "the digit 1", ..., "9": "the digit 9" }`。`expectedKeys` は `DIGITS`。**`exclude` があれば、残りの数字(昇順)だけ**(`fillDigitCriteria(criteria, digits)`。第2引数を省略すると 1〜9)で、`expectedKeys` も同じ残りの数字になる。したがって応答の `probabilities` は残りの数字とちょうど一致、`choice` はそのいずれかでなければ 502(文言は従来どおり)
+   - `ask:"digit"`: `{ "1": "the digit 1", ..., "9": "the digit 9" }`。`expectedKeys` は `DIGITS`。**`exclude` があれば、残りの数字(昇順)だけ**(`fillDigitCriteria(criteria, digits)`。第2引数を省略すると 1〜9)で、`expectedKeys` も同じ残りの数字になる。したがって応答の `probabilities` は残りの数字とちょうど一致、`choice` はそのいずれかでなければ 502(`exclude` があるときだけ `ANSWER_MESSAGES.digitExcluded` / `all.cellExcluded` の「候補の数字(exclude後)」の文言。無いときは従来どおり)
    - `ask:"cell"`: `emptyCells(puzzle)` が返す空マスを **行優先の順** に並べ、`{ "r0c2": "row 0, column 2 (zero-based)", ... }`。キーは `"r" + row + "c" + col`。`expectedKeys` はそのキー配列。Jev の `choice` は選択肢を255個まで取れるので、空マスは最大64個(埋まっているマスが17個以上という共通条件のため)なので1回で聞ける
    - `ask:"all"`: criteria は `ask:"digit"` と同じ 1〜9。`emptyCells(puzzle)` の各マスを **そのまま質問キー** にして `{ "r0c2": { type: "choice", instructions: ..., criteria: ... }, ... }` を組み立てる(行優先)。`expectedKeys` はそのキー配列(= `answers` に期待するキー集合。各マスの `probabilities` / `choice` に期待するのは `DIGITS` のほう)。`instructions` は `ALL_INSTRUCTIONS_TEMPLATE` に座標を埋めた文(`allInstructions(row, col)`)。`criteria` は質問ごとに **同じオブジェクトを使い回す**(`request` にそのまま載るので JSON 化できる形のまま。9個 × 空マス数を作り直す意味が無い)。**`exclude`(Issue #61)のあるマスだけ** は残りの数字だけの別オブジェクト(`fillDigitCriteria({}, digits)`)にし、そのマスの残りの数字を `digitsByKey`(`{ "r0c2": ["1", ...] }`)に記録する(手順6の検証で使う)
    - `ask:"where"`: criteria は使わない。`emptyCells(puzzle)` の各マスを **そのまま質問キー** にして `{ "r0c2": { type: "noul", instructions: ... }, ... }` を組み立てる(行優先)。`expectedKeys` はそのキー配列。`instructions` は `WHERE_INSTRUCTIONS_TEMPLATE` に座標と `digit` を埋めた文(`whereInstructions(row, col, digit)`)。テンプレートを定数として持つのは、フロント(Claude 経路)が同じ文言を組み立てられるようにするため
@@ -812,7 +812,7 @@ new_sqlite_classes = ["RateLimitCounter"]
 
 ## 9. 変更時の不変条件
 
-1. Jev に渡す `state`、および Claude に渡すリクエストボディに `SOLUTION` 由来の情報を入れない(`judgeCell()` が作る同じスナップショット。確信度順モードのマス選び(`askCell()`)も `buildSelectionSnapshot()` を使い、同じく `SOLUTION` を渡さない。Issue #38)
+1. Jev に渡す `state`、および Claude に渡すリクエストボディに `SOLUTION` 由来の情報を入れない(`judgeCell()` が作る同じスナップショット。確信度順モードのマス選び(`askCell()`)も `buildSelectionSnapshot()` を使い、同じく `SOLUTION` を渡さない。Issue #38) **例外: `exclude`(Issue #61、オーナー判断済み)で「前の周でそのマスに入れて不正解だった数字」を criteria から外すことだけは許す(正誤判定は `SOLUTION` から来るが、渡すのは「外れた」という事実だけ)。正解そのもの・正解を一意に絞る目的の除外(正解から逆算して 8 個外す等)は送らない**
 2. 正解したマスは以後の周で再判定しない
 3. `probabilities` は必ず `"1"`〜`"9"` の順で表示する(確率順に並べ替えない。見比べやすさ優先)
 4. エラー時は必ず `running=false` にして止める(無限ループ・無駄な課金を防ぐ)

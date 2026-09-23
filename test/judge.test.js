@@ -1641,7 +1641,7 @@ test("exclude(digit): probabilities が残りのキーとちょうど一致し�
   // 9キー全部を返してきた(外した数字まで答えた)
   var all9 = await judge(validBody({ exclude: ["5", "3"] }));
   assert.equal(all9.res.status, 502);
-  assert.equal(all9.body.error, "AIの応答のprobabilitiesが1〜9の9キーになっていません");
+  assert.equal(all9.body.error, "AIの応答のprobabilitiesが候補の数字(exclude後)とちょうど一致していません");
   assert.deepStrictEqual(all9.body.request, all9.env.aiCalls[0].payload);
 
   // 1キー欠け
@@ -1662,7 +1662,7 @@ test("exclude(digit): choice が外した数字なら 502", async () => {
   response.result.answers.digit.choice = "5";
   var out = await judge(validBody({ exclude: ["5", "3"] }), { aiResult: response });
   assert.equal(out.res.status, 502);
-  assert.equal(out.body.error, "AIの応答のchoiceが1〜9のいずれかではありません");
+  assert.equal(out.body.error, "AIの応答のchoiceが候補の数字(exclude後)のいずれかではありません");
 });
 
 test("exclude(digit): 400(配列でない・不正な要素・重複・9個全部)", async () => {
@@ -1686,6 +1686,24 @@ test("exclude(digit): 400(配列でない・不正な要素・重複・9個全�
     assert.equal(out.env.aiCalls.length, 0, cases[i][0]);
     assert.equal("request" in out.body, false, cases[i][0]);
   }
+});
+
+test("exclude(digit): exclude の不正と target の範囲外が同時にあれば exclude の 400 が先(検証順の固定)", async () => {
+  var out = await judge(validBody({ exclude: "x", target: { row: 9, col: 0 } }));
+  assert.equal(out.res.status, 400);
+  assert.ok(out.body.error.indexOf("exclude") !== -1, "exclude の文言でない: " + out.body.error);
+  assert.equal(out.env.aiCalls.length, 0);
+});
+
+test("exclude(all): __proto__ / constructor をキーにしても 400(空マスのキーではない)", async () => {
+  var protoBody = JSON.parse('{"puzzle":' + JSON.stringify(validAllBody().puzzle) + ',"ask":"all","exclude":{"__proto__":["4"]}}');
+  var out = await judge(protoBody);
+  assert.equal(out.res.status, 400);
+  assert.ok(out.body.error.indexOf("exclude") !== -1, out.body.error);
+  var out2 = await judge(validAllBody({ exclude: { constructor: ["4"] } }));
+  assert.equal(out2.res.status, 400);
+  assert.ok(out2.body.error.indexOf("exclude") !== -1, out2.body.error);
+  assert.equal(out.env.aiCalls.length + out2.env.aiCalls.length, 0);
 });
 
 test("exclude(digit): 8個外して1つだけ残すのは可(criteria 1件)", async () => {
@@ -1741,14 +1759,14 @@ test("exclude(all): 応答の検証はマスごとの残りキーで行う", asy
   // exclude したマスが 9キー全部で答えてきた → 502(どのマスか分かる)
   var all9 = await postAll(jevAllResponse(GIVEN_CELL_KEYS), body);
   assert.equal(all9.res.status, 502);
-  assert.equal(all9.body.error, "r1c1 の応答のprobabilitiesが1〜9の9キーになっていません");
+  assert.equal(all9.body.error, "r1c1 の応答のprobabilitiesが候補の数字(exclude後)とちょうど一致していません");
 
   // 残りキーで答えたが choice が外した数字 → 502
   var badChoice = allResponseWithExclude({ r1c1: DIGITS_WITHOUT_3_5 });
   badChoice.result.answers.r1c1.choice = "3";
   var choiceOut = await postAll(badChoice, body);
   assert.equal(choiceOut.res.status, 502);
-  assert.equal(choiceOut.body.error, "r1c1 の応答のchoiceが1〜9のいずれかではありません");
+  assert.equal(choiceOut.body.error, "r1c1 の応答のchoiceが候補の数字(exclude後)のいずれかではありません");
 
   // exclude していないマスを7キーで答えてきた → 502(他のマスの基準は 1〜9 のまま)
   var other = allResponseWithExclude({ r1c1: DIGITS_WITHOUT_3_5, r0c3: DIGITS_WITHOUT_3_5 });

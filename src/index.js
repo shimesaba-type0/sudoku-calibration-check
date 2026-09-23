@@ -147,6 +147,12 @@ var ANSWER_MESSAGES = {
     values: "AIの応答のprobabilitiesに数値でない値が含まれています",
     choice: "AIの応答のchoiceが1〜9のいずれかではありません",
   },
+  // exclude(Issue #61)で候補を絞ったときだけ使う digit の文言(絞っていないときは従来のまま)
+  digitExcluded: {
+    keys: "AIの応答のprobabilitiesが候補の数字(exclude後)とちょうど一致していません",
+    values: "AIの応答のprobabilitiesに数値でない値が含まれています",
+    choice: "AIの応答のchoiceが候補の数字(exclude後)のいずれかではありません",
+  },
   cell: {
     keys: "AIの応答のprobabilitiesが候補マスのキーと一致していません",
     values: "AIの応答のprobabilitiesに数値でない値が含まれています",
@@ -169,6 +175,15 @@ var ANSWER_MESSAGES = {
       keys: "{key} の応答のprobabilitiesが1〜9の9キーになっていません",
       values: "{key} の応答のprobabilitiesに数値でない値が含まれています",
       choice: "{key} の応答のchoiceが1〜9のいずれかではありません",
+      confidence: "{key} の応答のconfidenceが数値ではありません",
+    },
+    // exclude(Issue #61)で候補を絞ったマスだけに使う(keys / choice の文言だけ違う)
+    cellExcluded: {
+      answer: "{key} の応答が予期しない形式です",
+      missing: "{key} の応答にprobabilitiesがありません",
+      keys: "{key} の応答のprobabilitiesが候補の数字(exclude後)とちょうど一致していません",
+      values: "{key} の応答のprobabilitiesに数値でない値が含まれています",
+      choice: "{key} の応答のchoiceが候補の数字(exclude後)のいずれかではありません",
       confidence: "{key} の応答のconfidenceが数値ではありません",
     },
   },
@@ -775,10 +790,13 @@ function validateAllAnswers(answers, expectedKeys, digitsByKey, messages) {
   if (badKeys !== null) return badKeys;
   for (var i = 0; i < expectedKeys.length; i++) {
     var expected = expectedKeys[i];
-    var digits = Object.prototype.hasOwnProperty.call(digitsByKey, expected)
-      ? digitsByKey[expected]
-      : DIGITS;
-    var bad = validateAnswer(answers[expected], digits, allCellMessages(messages.cell, expected));
+    var narrowed = Object.prototype.hasOwnProperty.call(digitsByKey, expected);
+    var digits = narrowed ? digitsByKey[expected] : DIGITS;
+    var bad = validateAnswer(
+      answers[expected],
+      digits,
+      allCellMessages(narrowed ? messages.cellExcluded : messages.cell, expected)
+    );
     if (bad !== null) return bad;
   }
   return null;
@@ -958,8 +976,9 @@ async function handleJudge(request, env) {
   var expectedKeys = [];
   var payload;
   var cellsByKey = null;
-  // ask:"all" で exclude(Issue #61)により候補を絞ったマスだけの「残りの数字」。
-  var digitsByKey = {};
+  // ask:"all" で exclude(Issue #61)により候補を絞ったマスだけの「残りの数字」
+  // (readExcludeMap の byKey。validateAllAnswers にそのまま渡す)。
+  var excludeByKey = {};
 
   if (ask === ASK_ALL) {
     // 一括: 空マスごとに choice の質問を1つ作り、「そのマスに入る数字」を1回でまとめて
@@ -969,7 +988,7 @@ async function handleJudge(request, env) {
     // exclude(Issue #61)で数字を外したマスだけは、残りの数字だけの別の criteria にする
     // (validateInput が通っているので readExcludeMap はここでは必ず成功する)。
     fillDigitCriteria(criteria);
-    var excludeByKey = readExcludeMap(body.exclude, body.puzzle).byKey;
+    excludeByKey = readExcludeMap(body.exclude, body.puzzle).byKey;
     var allCells = emptyCells(body.puzzle);
     var allQuestions = {};
     for (var k = 0; k < allCells.length; k++) {
@@ -977,7 +996,6 @@ async function handleJudge(request, env) {
       var cellDigits = Object.prototype.hasOwnProperty.call(excludeByKey, allCell.key)
         ? excludeByKey[allCell.key]
         : undefined;
-      if (cellDigits !== undefined) digitsByKey[allCell.key] = cellDigits;
       allQuestions[allCell.key] = {
         type: "choice",
         instructions: allInstructions(allCell.row, allCell.col),
@@ -1094,7 +1112,7 @@ async function handleJudge(request, env) {
       badAnswer = extractedAll.error;
     } else {
       answers = extractedAll.answers;
-      badAnswer = validateAllAnswers(answers, expectedKeys, digitsByKey, ANSWER_MESSAGES[ask]);
+      badAnswer = validateAllAnswers(answers, expectedKeys, excludeByKey, ANSWER_MESSAGES[ask]);
     }
   } else if (ask === ASK_WHERE) {
     var extractedWhere = extractAnswers(result);
@@ -1110,7 +1128,11 @@ async function handleJudge(request, env) {
       badAnswer = extracted.error;
     } else {
       answer = extracted.answer;
-      badAnswer = validateAnswer(answer, expectedKeys, ANSWER_MESSAGES[ask]);
+      // exclude(Issue #61)で候補を絞った digit だけ、文言を「候補の数字(exclude後)」にする
+      var messages = ask === ASK_DIGIT && expectedKeys.length < DIGITS.length
+        ? ANSWER_MESSAGES.digitExcluded
+        : ANSWER_MESSAGES[ask];
+      badAnswer = validateAnswer(answer, expectedKeys, messages);
     }
   }
   if (badAnswer !== null) {
