@@ -443,8 +443,8 @@ var roundStarted = false;       // 今の周でまだ最初のリクエストを
 var totalCostUsd = 0;           // この実行(reset() されるまで)の累計コスト
 var roundCostUsd = 0;           // 今の周の累計コスト
 var pendingAllUsage = null;     // 一括モード(#48)の周の先頭1件に usage/レイテンシを付けるための
-                                 // 一時置き場(askAllRound() が立て、focusCellFromCache() の
-                                 // 最初の確定で消費して null に戻す)
+                                 // 一時置き場(askAllRound() が立て、commitFocused() が周の
+                                 // 先頭1件の確定時に消費して null に戻す)
 // 比較シェル(GET /compare)専用のモジュール変数(Issue #46)。8章参照
 var compareStatus = { jev: null, claude: null };  // 直近の status メッセージ(iframe ごと)
 var compareFrames = { jev: null, claude: null };  // <iframe> 要素への参照
@@ -494,10 +494,12 @@ var compareGenerating = false;  // 「新しい問題」(比較シェル版)で�
 **記録1件の形(Issue #55・#56)。** `{ at, p, r, c, round, choice, pc, conf, ok, m, o?, u?, ci?, t? }`。
 `at`(記録した時刻、`nowMs()`)は較正図のキャッシュ無効化にだけ使う内部用の値で、以前は
 `t` という名前だった(#55 で `t` を「呼び出しのレイテンシ(ミリ秒)」に転用したため `at` に
-古い記録(`at` が無く `t` がエポックミリ秒(1e11 以上)のもの)は `loadRecords()` の `migrateLegacyRecordTimestamps()` が読み込み時に `t` → `at` に付け替える(レイテンシと取り違えない)。
-改名した。混同しないよう注意)。`u`(`{ i, o }`。入力/出力トークン数)・`ci`(キャッシュ読み
-込みトークン数、あれば)・`t`(その判定のレイテンシ、ミリ秒)は `usage` が取れたときだけ付く
-(一括モードは周の先頭1件だけ、確信度順はマス選び+数字の合算。3.6・4.3 参照)。`costOf(rec)`
+改名した。混同しないよう注意)。古い記録(`at` が無く `t` がエポックミリ秒(1e11 以上)のもの)は
+`loadRecords()` の `migrateLegacyRecordTimestamps()` が読み込み時に `t` → `at` に付け替える(冪等。
+次の `appendRecord()` の保存で永続化される)。`u`(`{ i, o }`。入力/出力トークン数)・`ci`(キャッシュ読み
+込みトークン数、あれば)は `usage` が取れたときだけ、`t`(その判定のレイテンシ、ミリ秒)も `u` と同時にだけ付く
+(一括モードは周の先頭1件だけ、確信度順はマス選び+数字の合算。停止で捨てた応答済みぶんは `carryUsage` で
+次の記録に持ち越す。3.6・4.3 参照)。`costOf(rec)`
 (4.2)がこれらから表示用のコストを計算する。
 
 ### 4.2 関数と責務
@@ -959,12 +961,16 @@ new_sqlite_classes = ["RateLimitCounter"]
     - Z6: 2周目の一括は不正解マスだけを候補にする(`buildSelectionSnapshot()` で空マスがその1マスだけになる)こと。周回ログの形式は従来どおり
     - Z7: URL `order=all` で `state.orderMode` が `"all"` になること、`setOrderMode("all")` が効き順番トグルに「一括」ボタン(`onclick="setOrderMode('all')"`)が出ること。比較シェル(`/compare`)の順番トグルにも「一括」があり、`compareSetOrderMode("all")` で `state.orderMode` が変わり `compareIframeSrc()` の組み立てに `order=all` が反映されること
     - Z8: Claude 経路の一括で全マスが確定し、記録の `m` が `claude-opus-5+think/all`・`o` が `"all"` になること、キーが DOM に出ないこと。Jev 経路で `cells` に対象マスが欠けた応答は、1 マスも確定・記録せず `queue` も減らさずにエラー停止すること(`askAllRound` がキャッシュに入れる前に queue の全キーを確かめる)
-  - **計時・コスト**(`test/page.test.js` AA1〜AA6、Issue #55・#56)。S/T/W/Y/Z 系と同じ `runScript` / `makeAbortAwareFetch` / `waitFor` を使う。`ctx.nowMs = function(){...}` で `Date.now()` を差し替え(`RECORDS_MAX` の上書きと同じパターン)、実時間を待たずに確定値で検証する。`blankCells(solved, cells)` を新設(`ANSWER_KEY` の指定セルだけを `"."` にした81文字の盤面を作り、`applyPuzzleFromString()` で空マス数の少ない盤面に差し替えて周を短く終わらせる)
+  - **計時・コスト**(`test/page.test.js` AA1〜AA10、Issue #55・#56)。S/T/W/Y/Z 系と同じ `runScript` / `makeAbortAwareFetch` / `waitFor` を使う。`ctx.nowMs = function(){...}` で `Date.now()` を差し替え(`RECORDS_MAX` の上書きと同じパターン)、実時間を待たずに確定値で検証する。`blankCells(solved, cells)` を新設(`ANSWER_KEY` の指定セルだけを `"."` にした81文字の盤面を作り、`applyPuzzleFromString()` で空マス数の少ない盤面に差し替えて周を短く終わらせる)
     - AA1: 空マス2つの盤面で `run()` → 1マス目確定 → 2マス目 in-flight のまま `nowMs` を進めて `stop()`(この時点で `totalElapsedMs` / `roundElapsedMs` が期待どおりの値になること、`runningSince` が `null` になること)→ 停止中にさらに `nowMs` を進める(3600ms 相当)→ `run()` で再開(`runningSince` が再開時刻に付け替わること)→ 2マス目を確定して完了。`state.roundLog[0].ms` と `totalElapsedMs` が、停止中の分を除いた合計(400ms + 200ms = 600ms)になること、`roundElapsedMs` が完了後に0へ戻っていること
     - AA2: `formatMs` / `formatUsd` の書式(3桁区切り、`$0.01` 未満は有効数字2桁程度、負値・0の扱い)。`formatRoundLogLine(entry)` が「N周目: M中K正解 (P%) — 3,214 ms / $0.0004」、`formatTotalSummary()` が `state.roundLog.length` を使って「合計 12,345 ms / $0.0012(3周)」になること
     - AA3: (a) 左上から(Jev)は応答の `usage` がそのまま記録の `u` に載り、`t`(数値のレイテンシ)も付くこと。(b) 確信度順(Jev)はマス選び+数字それぞれに別の `usage` を返し、記録1件の `u` が合算(`i`/`o` それぞれの和)になること。(c) 一括(Jev、空マス2つ)は周の先頭の記録だけに `u`/`t` が付き、2件目には付かない(`undefined`)こと。vm レルムの違いにより `deepEqual` は使わず `.i`/`.o` を個別に比較する(hostRows と同じ理由)
     - AA4: `costOf(rec)` が Jev(出力無料)・`/all` と `+think` を剥がした Claude の単価(`priceModelKey`)・`ci`(入力単価の10%)・単価未設定モデル(0)・`u` の無い記録(0)を正しく計算すること(浮動小数点誤差を許容する `approxEqual` ヘルパーで比較)。`formatUsd` / `formatUsdForModel`(単価未設定に「(単価未設定)」を足す)の書式
     - AA5: `getPrices()` の既定値(`defaultPrices()` と一致)、`setPrice()` が正の数値だけ反映し `localStorage`(`scc.prices.v1`)に保存されること、負値・非数値・未知のモデル/フィールドは無視されること、`resetPrices()` で既定値に戻ること、壊れた `localStorage`(JSON でない・配列)や不正なエントリ(負値)が既定値にフォールバックすること
     - AA6: 埋め込みモード(`embed=1`)の `render()` が `postStatus()` で `elapsedMs` / `costUsd`(いずれも数値)を `window.parent.postMessage` すること。比較シェルの `renderCompareStatusHtml("jev")` が `compareStatus.jev.elapsedMs` / `.costUsd` を `formatMs()` / `formatUsd()` で見出しに表示すること(親側では計測し直さない)
+    - AA7: #55 より前の記録(`at` が無く `t` がエポックミリ秒)を読み込むと `t` → `at` に付け替わり、新しい記録の `t`(レイテンシ)はそのままであること
+    - AA8: 一括モードで周の先頭マスの確定待ち中に停止 → 再開しても、先頭の記録に `u`/`t` が付くこと(`pendingAllUsage` は `commitFocused()` で消費する)
+    - AA9: 確信度順で数字判定の in-flight 中に停止 → 再開すると、届いていたマス選びぶんの `usage` が持ち越され、記録 1 件の `u` が「マス選び 2 回 + 数字 1 回」の和になること
+    - AA10: 一時的な失敗(429)の停止でも計時が止まり `runningSince` が `null` になること、`reset()` で計時とコストが 0 に戻ること、周をまたぐ待ち時間は全体にだけ入り次の周の `ms` に入らないこと
 - E2E モック(`scripts/e2e/smoke.mjs`)の `/api/judge` 応答(`digit` / `cell` / `all` すべて)に固定の `usage`(`{ input_tokens, output_tokens }`)を足し、周回ログの1行目(`[2]` `[7]` `[9]` `[8]`)に `— <N,NNN> ms / $<...>` の形が出ることをチェックに追加した(Issue #55・#56)
 - CI(`.github/workflows/ci.yml`)は push と PR で `npm ci` → `npm test` → `npm run check` を実行する。`check` は `wrangler deploy --dry-run` で、認証なしで動く

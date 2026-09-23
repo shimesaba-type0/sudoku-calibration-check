@@ -2099,6 +2099,11 @@ var PAGE_HTML = `<!doctype html>
   // 一括モード(Issue #48)の周の先頭1件にだけ usage/レイテンシを付けるための一時置き場
   // (askAllRound() の応答で立て、focusCellFromCache() の最初の確定で消費して null に戻す)。
   var pendingAllUsage = null;
+  // 停止で捨てた呼び出しぶんの { usage, latencyMs }(応答は届いていたが確定前に停止したもの)。
+  // 次に確定する記録に足す(reset() で捨てる)。inflightPriorUsage は確信度順の数字判定が
+  // in-flight の間だけ「マス選びぶん」を覚えておく置き場(停止時に carryUsage へ移す)。
+  var carryUsage = null;
+  var inflightPriorUsage = null;
 
   // 周の最初のリクエストを送る直前に呼ぶ(focusCellForDigit / selectNextCell /
   // askAllRound の先頭)。二度目以降は roundStarted で弾かれるので無条件に呼んでよい。
@@ -2106,8 +2111,9 @@ var PAGE_HTML = `<!doctype html>
   function markRoundStarted() {
     if (roundStarted) return;
     if (runningSince !== null) {
-      totalElapsedMs += nowMs() - runningSince;
-      runningSince = nowMs();
+      var now = nowMs();
+      totalElapsedMs += now - runningSince;
+      runningSince = now;
     }
     roundStarted = true;
   }
@@ -2127,10 +2133,11 @@ var PAGE_HTML = `<!doctype html>
   // true(次の周へ続く)なら時計は動かしたまま(再アンカー)、false(完了/強制終了)なら止める。
   function closeRoundClock(keepRunning) {
     if (runningSince !== null) {
-      var delta = nowMs() - runningSince;
+      var now = nowMs();
+      var delta = now - runningSince;
       totalElapsedMs += delta;
       if (roundStarted) roundElapsedMs += delta;
-      runningSince = keepRunning ? nowMs() : null;
+      runningSince = keepRunning ? now : null;
     }
     var ms = roundElapsedMs;
     roundElapsedMs = 0;
@@ -2206,7 +2213,7 @@ var PAGE_HTML = `<!doctype html>
     return {
       "typesafe/jev": { in: 0.042, out: 0 },
       "claude-opus-5": { in: 5, out: 25 },
-      "claude-sonnet-5": { in: 3, out: 15 },
+      "claude-sonnet-5": { in: 2, out: 10 },
       "claude-haiku-4-5": { in: 1, out: 5 }
     };
   }
@@ -3223,6 +3230,7 @@ var PAGE_HTML = `<!doctype html>
   // 確信度順モード(Issue #38)のマス選びぶんの { usage, latencyMs }(scan/all からの
   // 呼び出しでは undefined)。
   function focusCellForDigit(cell, token, priorUsage) {
+    inflightPriorUsage = priorUsage || null;
     // 先にフォーカスを立てる。buildSnapshot() は state.focusedKey のマスを "." に
     // するので、この順序が「対象マスを空にして送る」不変条件そのもの(SPEC F3)。
     state.focusedKey = cell.r + "-" + cell.c;
@@ -3252,6 +3260,7 @@ var PAGE_HTML = `<!doctype html>
       // usage/レイテンシ(Issue #55・#56)。確信度順はマス選びぶんと合算する。
       var usage = combineRecordUsage(priorUsage && priorUsage.usage, toRecordUsage(result.usage));
       var latencyMs = (priorUsage && typeof priorUsage.latencyMs === "number" ? priorUsage.latencyMs : 0) + result._t;
+      inflightPriorUsage = null; // マス選びぶんは pendingCommit に畳み込んだ
       pendingCommit = {
         r: cell.r,
         c: cell.c,
@@ -3400,18 +3409,15 @@ var PAGE_HTML = `<!doctype html>
       return { digit: d, pct: Math.round((typeof p === "number" ? p : 0) * 100), isPick: d === result.choice };
     });
     state.currentProbs = probs;
-    // 一括の usage/レイテンシは周の先頭1件だけ(Issue #55・#56、SPEC 5章)。
-    // pendingAllUsage は消費したら null に戻し、この周の2件目以降には付けない。
+    // 一括の usage/レイテンシ(pendingAllUsage)はここでは付けず、commitFocused() が確定時に
+    // 周の先頭1件へ消費する(確定待ち中に停止 → 再開しても消えないように。PR #67 レビュー M1)。
     pendingCommit = {
       r: cell.r,
       c: cell.c,
       choice: result.choice,
       confidence: result.confidence,
-      probabilities: result.probabilities,
-      usage: pendingAllUsage ? pendingAllUsage.usage : null,
-      latencyMs: pendingAllUsage ? pendingAllUsage.latencyMs : undefined
+      probabilities: result.probabilities
     };
-    pendingAllUsage = null;
     render();
     var beforeCommitMs = state.speedMode === "slow" ? SLOW_BEFORE_COMMIT_MS : FAST_BEFORE_COMMIT_MS;
     setTimeout(function () {
@@ -3464,12 +3470,28 @@ var PAGE_HTML = `<!doctype html>
     if (isAll) record.o = "all";
     // usage(トークン使用量)とレイテンシ(Issue #55・#56、SPEC 5章)。u/t が無い記録は
     // 較正には使うがコスト計算からは自然に除外される(costOf() が u の無い記録を 0 とする)。
-    if (pendingCommit.usage) {
-      record.u = { i: pendingCommit.usage.i, o: pendingCommit.usage.o };
-      if (typeof pendingCommit.usage.ci === "number") record.ci = pendingCommit.usage.ci;
+    var usage = pendingCommit.usage || null;
+    var latencyMs = typeof pendingCommit.latencyMs === "number" ? pendingCommit.latencyMs : 0;
+    // 一括モード: 周の先頭1件の確定時に pendingAllUsage を消費する(2件目以降には付かない)
+    if (isAll && pendingAllUsage) {
+      usage = pendingAllUsage.usage;
+      latencyMs = typeof pendingAllUsage.latencyMs === "number" ? pendingAllUsage.latencyMs : 0;
+      pendingAllUsage = null;
     }
-    if (typeof pendingCommit.latencyMs === "number" && isFinite(pendingCommit.latencyMs)) {
-      record.t = Math.round(pendingCommit.latencyMs);
+    // 停止で捨てた(応答済みだが未確定だった)呼び出しぶんの usage/レイテンシを持ち越して足す
+    // (PR #67 レビュー S2。中断された in-flight の呼び出しぶんは測れないので含まれない)
+    if (carryUsage) {
+      usage = combineRecordUsage(carryUsage.usage, usage);
+      latencyMs += typeof carryUsage.latencyMs === "number" ? carryUsage.latencyMs : 0;
+      carryUsage = null;
+    }
+    inflightPriorUsage = null;
+    if (usage) {
+      record.u = { i: usage.i, o: usage.o };
+      if (typeof usage.ci === "number") record.ci = usage.ci;
+    }
+    if (usage && isFinite(latencyMs)) {
+      record.t = Math.round(latencyMs);
     }
     appendRecord(record);
     var cost = costOf(record);
@@ -3577,6 +3599,17 @@ var PAGE_HTML = `<!doctype html>
     if (!state.running) return;
     // 計時を止める(周・全体とも。停止中は数えない。Issue #55)。
     pauseClock();
+    // 応答は届いていたが確定前に捨てる呼び出しぶんの usage は持ち越す(PR #67 レビュー S2)。
+    // pendingCommit があればその usage(確信度順ならマス選びぶん込み)、無ければ in-flight の
+    // 数字判定の手前で届いていたマス選びぶん。一括の pendingAllUsage はキャッシュと一緒に残る。
+    if (pendingCommit && pendingCommit.usage) {
+      carryUsage = { usage: combineRecordUsage(carryUsage && carryUsage.usage, pendingCommit.usage),
+        latencyMs: (carryUsage ? carryUsage.latencyMs : 0) + (typeof pendingCommit.latencyMs === "number" ? pendingCommit.latencyMs : 0) };
+    } else if (inflightPriorUsage) {
+      carryUsage = { usage: combineRecordUsage(carryUsage && carryUsage.usage, inflightPriorUsage.usage),
+        latencyMs: (carryUsage ? carryUsage.latencyMs : 0) + (typeof inflightPriorUsage.latencyMs === "number" ? inflightPriorUsage.latencyMs : 0) };
+    }
+    inflightPriorUsage = null;
     // 世代を進めて、進行中の fetch / setTimeout のコールバックを無効化する
     runToken += 1;
     // in-flight の /api/judge があれば打ち切る(reset() / showError() と同じ、Issue #19)
@@ -3718,6 +3751,8 @@ var PAGE_HTML = `<!doctype html>
     pendingCommit = null;
     allResults = null; // 一括モード(Issue #48)のキャッシュもリセット/新しい問題で捨てる
     pendingAllUsage = null;
+    carryUsage = null;
+    inflightPriorUsage = null;
     // 計時・コスト(Issue #55・#56)もリセット/新しい問題で0に戻す。
     runningSince = null;
     totalElapsedMs = 0;
@@ -4308,22 +4343,24 @@ var PAGE_HTML = `<!doctype html>
   function renderPricesPanel() {
     var current = getPrices();
     var order = [JEV_MODEL_ID, "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"];
+    // 実行中・停止中は render() のたびに入力欄が作り直されて編集が消えるので、ロック中は無効化する
+    var disabled = modelSettingsLocked() ? " disabled" : "";
     var rows = "";
     for (var i = 0; i < order.length; i++) {
-      var id = order[i];
-      var entry = current[id] || { in: 0, out: 0 };
+      var id = escapeHtml(order[i]);
+      var entry = current[order[i]] || { in: 0, out: 0 };
       rows += "<div class=\\"price-row\\">" +
-        "<span class=\\"price-model\\">" + escapeHtml(id) + "</span>" +
+        "<span class=\\"price-model\\">" + id + "</span>" +
         "<label>入力 <input type=\\"number\\" min=\\"0\\" step=\\"any\\" value=\\"" + entry.in +
-        "\\" onchange=\\"setPrice('" + id + "','in',this.value)\\"></label>" +
+        "\\" onchange=\\"setPrice('" + id + "','in',this.value)\\"" + disabled + "></label>" +
         "<label>出力 <input type=\\"number\\" min=\\"0\\" step=\\"any\\" value=\\"" + entry.out +
-        "\\" onchange=\\"setPrice('" + id + "','out',this.value)\\"></label>" +
+        "\\" onchange=\\"setPrice('" + id + "','out',this.value)\\"" + disabled + "></label>" +
         "</div>";
     }
     return "<div id=\\"prices-panel\\" class=\\"panel\\">" +
       "<p class=\\"panel-title\\">単価(100万トークンあたり USD)</p>" +
       rows +
-      "<button id=\\"reset-prices-btn\\" onclick=\\"resetPrices()\\">既定値に戻す</button>" +
+      "<button id=\\"reset-prices-btn\\" onclick=\\"resetPrices()\\"" + disabled + ">既定値に戻す</button>" +
       "</div>";
   }
 

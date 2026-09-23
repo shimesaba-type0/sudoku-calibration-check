@@ -1408,6 +1408,25 @@ function makeCorrectResponse(ctx, row, col, puzzle) {
   };
 }
 
+/** makeCorrectResponse の不正解版(正解が "1" なら "2"、それ以外は "1" を choice にする)。 */
+function makeWrongResponse(ctx, row, col, puzzle) {
+  var correctDigit = ctx.SOLUTION[row][col];
+  var wrongDigit = correctDigit === "1" ? "2" : "1";
+  var probabilities = {};
+  for (var d = 1; d <= 9; d++) probabilities[String(d)] = String(d) === wrongDigit ? 0.9 : 0.0125;
+  return {
+    ok: true,
+    json: async function () {
+      return {
+        probabilities: probabilities,
+        choice: wrongDigit,
+        confidence: 0.5,
+        request: makeRequestPayload(puzzle || [], row, col),
+      };
+    },
+  };
+}
+
 /**
  * pending にたまった fetch を順に「正解」で解決し、state.done になるまで流し切る。
  * すでに settled(= abort 済み)のものは resolve/reject を呼ばず、calls にも積まない
@@ -4287,7 +4306,7 @@ test("AA4: costOf() と formatUsd()(Jev出力無料・Claudeの入力/出力単�
   // "+think" と "/all" の両方を剥がす
   approxEqual(ctx.costOf({ m: "claude-opus-5+think/all", u: { i: 1000000, o: 0 } }), 5, "claude-opus-5+think/all");
   // cache_read_input_tokens(ci)は入力単価の10%
-  approxEqual(ctx.costOf({ m: "claude-sonnet-5", u: { i: 0, o: 0 }, ci: 1000000 }), 0.3, "ci(キャッシュ読み)は入力単価の10%");
+  approxEqual(ctx.costOf({ m: "claude-sonnet-5", u: { i: 0, o: 0 }, ci: 1000000 }), 0.2, "ci(キャッシュ読み)は入力単価の10%");
 
   // 単価未設定のモデルは 0 扱い
   assert.equal(ctx.costOf({ m: "some-unknown-model", u: { i: 1000000, o: 1000000 } }), 0);
@@ -4401,4 +4420,152 @@ test("AA7: #55 より前の記録(t がエポックミリ秒)は読み込み時�
   assert.equal(recs[0].t, undefined, "古い記録の t(時刻)がレイテンシとして残っている");
   assert.equal(recs[1].at, 1758500001000);
   assert.equal(recs[1].t, 1234, "新しい記録の t(レイテンシ)が変わった");
+});
+
+test("AA8: 一括モードで周の先頭マスの確定待ち中に stop() → run() しても、先頭の記録に u/t が付く(PR #67 レビュー M1)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var timers = makeManualTimers();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch, setTimeout: timers.setTimeout });
+  ctx.applyPuzzleFromString(blankCells(ANSWER_KEY, [[0, 0], [4, 4]]));
+  ctx.setOrderMode("all");
+  ctx.run();
+  await waitFor(function () { return af.pending.length === 1; }, "AA8: 一括の fetch 待ち");
+  var entry = af.pending.shift();
+  var body = JSON.parse(entry.init.body);
+  var res = await makeAllResponse(ctx, body.puzzle, ctx.selectionKeys(), []).json();
+  res.usage = { input_tokens: 9000, output_tokens: 4000 };
+  entry.resolve({ ok: true, json: function () { return Promise.resolve(res); } });
+  // 先頭マスがフォーカスされ、確定のタイマーが積まれた状態で停止する
+  await waitFor(function () { return ctx.state.focusedKey !== null && timers.length() > 0; }, "AA8: 先頭マスの確定待ち");
+  ctx.stop();
+  assert.equal(ctx.state.running, false);
+  assert.equal(ctx.getRecords().length, 0, "停止で確定していないのに記録がある");
+  // 再開: キャッシュから同じマスを確定する(fetch は飛ばない)
+  ctx.run();
+  while (!ctx.state.done) {
+    await waitFor(function () { return ctx.state.done || timers.length() > 0; }, "AA8: タイマー待ち");
+    if (!ctx.state.done) timers.fireNext();
+  }
+  assert.equal(af.pending.length, 0, "再開で一括を呼び直している");
+  var records = ctx.getRecords();
+  assert.equal(records.length, 2);
+  assert.equal(records[0].u && records[0].u.i, 9000, "停止 → 再開で先頭の記録の usage が消えた: " + JSON.stringify(records[0].u));
+  assert.equal(records[0].u.o, 4000);
+  assert.equal(typeof records[0].t, "number");
+  assert.equal(records[1].u, undefined, "2件目にも usage が付いている");
+  assert.ok(ctx.totalCostUsd > 0, "累計コストが 0 のまま");
+});
+
+test("AA9: 確信度順で数字判定の in-flight 中に stop() → run() すると、届いていたマス選びぶんの usage が持ち越される(PR #67 レビュー S2)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  ctx.applyPuzzleFromString(blankCells(ANSWER_KEY, [[0, 0], [4, 4]]));
+  ctx.setOrderMode("confidence");
+  ctx.setSpeed("fast");
+  ctx.run();
+
+  // 1回目のマス選び(usage 100/10)
+  await waitFor(function () { return af.pending.length === 1; }, "AA9: マス選び1の fetch 待ち");
+  var sel1 = af.pending.shift();
+  var selBody1 = JSON.parse(sel1.init.body);
+  var keys = ctx.selectionKeys();
+  var selRes1 = await makeCellResponse(selBody1.puzzle, keys, keys[0]).json();
+  selRes1.usage = { input_tokens: 100, output_tokens: 10 };
+  sel1.resolve({ ok: true, json: function () { return Promise.resolve(selRes1); } });
+
+  // 数字判定が in-flight のまま停止(この呼び出しぶんは測れない)
+  await waitFor(function () { return af.pending.length === 1 && ctx.state.focusedKey !== null; }, "AA9: 数字判定の fetch 待ち");
+  ctx.stop();
+  af.pending.shift();
+  assert.equal(ctx.getRecords().length, 0);
+
+  // 再開: マス選びからやり直す(usage 200/20)→ 数字(usage 700/80)
+  ctx.run();
+  await waitFor(function () { return af.pending.length === 1; }, "AA9: マス選び2の fetch 待ち");
+  var sel2 = af.pending.shift();
+  var selBody2 = JSON.parse(sel2.init.body);
+  assert.equal(selBody2.ask, "cell");
+  var selRes2 = await makeCellResponse(selBody2.puzzle, keys, keys[0]).json();
+  selRes2.usage = { input_tokens: 200, output_tokens: 20 };
+  sel2.resolve({ ok: true, json: function () { return Promise.resolve(selRes2); } });
+  await waitFor(function () { return af.pending.length === 1 && ctx.state.focusedKey !== null; }, "AA9: 数字判定2の fetch 待ち");
+  var dig = af.pending.shift();
+  var digBody = JSON.parse(dig.init.body);
+  var digRes = await makeCorrectResponse(ctx, digBody.target.row, digBody.target.col, digBody.puzzle).json();
+  digRes.usage = { input_tokens: 700, output_tokens: 80 };
+  dig.resolve({ ok: true, json: function () { return Promise.resolve(digRes); } });
+  await waitFor(function () { return ctx.getRecords().length === 1; }, "AA9: 確定待ち");
+  var rec = ctx.getRecords()[0];
+  assert.equal(rec.u.i, 1000, "マス選び2回 + 数字1回の入力トークンが合算されていない: " + JSON.stringify(rec.u));
+  assert.equal(rec.u.o, 110);
+});
+
+test("AA10: 一時的な失敗の停止でも計時が止まる。reset() で計時とコストが 0 に戻る。周をまたぐ待ちは次の周の ms に入らない", { timeout: 10000 }, async () => {
+  // (a) 429 の停止で時計が止まる
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  var fakeNow = 1000;
+  ctx.nowMs = function () { return fakeNow; };
+  ctx.run();
+  await waitFor(function () { return af.pending.length === 1; }, "AA10a: fetch 待ち");
+  fakeNow = 1100;
+  af.pending.shift().resolve({
+    ok: false,
+    status: 429,
+    headers: { get: function (name) { return name === "Retry-After" ? "30" : null; } },
+    json: function () { return Promise.resolve({ error: "レート制限(モック)" }); },
+  });
+  await waitFor(function () { return ctx.isPaused(); }, "AA10a: 停止待ち");
+  assert.equal(ctx.runningSince, null, "一時的な失敗の停止で時計が止まっていない");
+  assert.equal(ctx.totalElapsedMs, 100);
+  assert.equal(ctx.roundElapsedMs, 100);
+  // (b) reset() で 0 に戻る
+  ctx.reset();
+  assert.equal(ctx.totalElapsedMs, 0);
+  assert.equal(ctx.roundElapsedMs, 0);
+  assert.equal(ctx.totalCostUsd, 0);
+  assert.equal(ctx.roundCostUsd, 0);
+  assert.equal(ctx.runningSince, null);
+
+  // (c) 周をまたぐ待ち時間は全体にだけ入り、次の周の ms には入らない
+  var af2 = makeAbortAwareFetch();
+  var timers = makeManualTimers();
+  var ctx2 = runScript(await getPageHtml(), { fetch: af2.fetch, setTimeout: timers.setTimeout });
+  ctx2.applyPuzzleFromString(blankCells(ANSWER_KEY, [[0, 0], [4, 4]]));
+  ctx2.setSpeed("fast");
+  var now2 = 10000;
+  ctx2.nowMs = function () { return now2; };
+  ctx2.run();
+  // 1周目: 1マス目は正解、2マス目は不正解(2周目が要る)
+  for (var i = 0; i < 2; i++) {
+    await waitFor(function () { return af2.pending.length === 1; }, "AA10c: 1周目 " + (i + 1) + "マス目の fetch 待ち");
+    var e = af2.pending.shift();
+    var b = JSON.parse(e.init.body);
+    now2 += 100;
+    if (i === 0) e.resolve(makeCorrectResponse(ctx2, b.target.row, b.target.col, b.puzzle));
+    else e.resolve(makeWrongResponse(ctx2, b.target.row, b.target.col, b.puzzle));
+    // バー表示 → 確定 → 次へ のタイマーを進める
+    await waitFor(function () { return timers.length() > 0; }, "AA10c: 確定タイマー待ち");
+    timers.fireNext(); // 確定
+    await waitFor(function () { return timers.length() > 0; }, "AA10c: 次へタイマー待ち");
+    timers.fireNext(); // 次へ(2マス目の fetch、または finalizeRound)
+  }
+  await waitFor(function () { return ctx2.state.roundLog.length === 1; }, "AA10c: 1周目の周回ログ待ち");
+  assert.equal(ctx2.state.roundLog[0].ms, 200, "1周目の ms が 200 でない: " + ctx2.state.roundLog[0].ms);
+  // 周をまたぐ待ち(between-round のタイマー)中に 5000ms 経過
+  now2 += 5000;
+  await waitFor(function () { return timers.length() > 0; }, "AA10c: 周またぎタイマー待ち");
+  timers.fireNext(); // 2周目の最初の fetch
+  await waitFor(function () { return af2.pending.length === 1; }, "AA10c: 2周目の fetch 待ち");
+  var e2 = af2.pending.shift();
+  var b2 = JSON.parse(e2.init.body);
+  now2 += 300;
+  e2.resolve(makeCorrectResponse(ctx2, b2.target.row, b2.target.col, b2.puzzle));
+  await waitFor(function () { return timers.length() > 0; }, "AA10c: 2周目の確定タイマー待ち");
+  timers.fireNext();
+  await waitFor(function () { return timers.length() > 0; }, "AA10c: 2周目の次へタイマー待ち");
+  timers.fireNext();
+  await waitFor(function () { return ctx2.state.done === true; }, "AA10c: 完了待ち");
+  assert.equal(ctx2.state.roundLog[1].ms, 300, "2周目の ms に周またぎの待ちが入っている: " + ctx2.state.roundLog[1].ms);
+  assert.equal(ctx2.totalElapsedMs, 5500, "全体の ms が 200 + 5000 + 300 でない: " + ctx2.totalElapsedMs);
 });
