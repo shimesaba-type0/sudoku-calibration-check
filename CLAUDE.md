@@ -79,10 +79,10 @@ npm run dev                 # ローカル起動。AIバインディングはリ
 ## 現在の状態(2026-09-22)
 
 - v0.1 と SPEC 7 章の拡張 1・2・3・5(5 は最小版)まで **すべてマージ・デプロイ済み**。進捗は GitHub の Issues / PR を参照(`docs/HANDOFF.md` の「現在地」も併せて更新する)
-- デプロイ済み: https://sudoku-calibration-check.takashi-kono-rb.workers.dev (2026-09-23 時点の Version は `66b9572b`。以後は `docs/HANDOFF.md` 6 章の最新の Version 記載を参照)。`npm run e2e -- --url <URL>` の本番モード(ヘッダー 3 つ + 最速で 3 判定)が PASS
+- デプロイ済み: https://sudoku-calibration-check.takashi-kono-rb.workers.dev (2026-09-23 時点の Version は `741300db`。以後は `docs/HANDOFF.md` 6 章の最新の Version 記載を参照)。`npm run e2e -- --url <URL>` の本番モード(ヘッダー 3 つ + 最速で 3 判定)が PASS
 - **Jev は 2026-09-21 に Worker 経由で実環境検証済み**(Issue #4)。レスポンスは AI Gateway のラッパー付き(`docs/DESIGN.md` 3.4)。`confidence` は `probabilities[choice]` と一致せず、同じ入力でも `choice` が揺れる
 - レート制限のカウンタは Durable Object(`RATE_LIMITER` / `RateLimitCounter`)。`wrangler deploy` が `[[migrations]]` から作るので、ネームスペース作成のような手作業は不要(Issue #10 で Workers KV から移行。KV は結果整合で全体上限が分散アクセスに効かなかった)。`GET /api/status` で残数を読める(#18)
-- マージ済み PR: #7(Worker 本体)、#9(Jev 実レスポンス形式 + KV id)、#11(#7/#9 のレビュー指摘)、#13(フロントエンド)、#14(DO レート制限)、#15(ジェネレーター/ソルバー)、#22(モデル方針)、#23(`/api/status`)、#24(E2E スモーク)、#25(集計ビュー)、#26(README)、#27(AbortController + 振る舞いテスト)、#28(難易度)、#33(停止/再開)、#35(Jev に送ったプロンプトの表示枠)、#39(Claude API、BYOK)、#40(`/api/judge` の `ask:"cell"`)、#41(確信度順モードのフロント)、#47(`ask:"where"`)、#49(比較モード)、#50(E2E の CSP 追随)、#51(一時的な失敗の停止扱い)、#52(`ask:"all"`)、#57(`usage`)、#58(一括モードのフロント)、#62(バナーを最上部へ)、#65(`exclude`)、#67(処理時間・コスト)
+- マージ済み PR: #7(Worker 本体)、#9(Jev 実レスポンス形式 + KV id)、#11(#7/#9 のレビュー指摘)、#13(フロントエンド)、#14(DO レート制限)、#15(ジェネレーター/ソルバー)、#22(モデル方針)、#23(`/api/status`)、#24(E2E スモーク)、#25(集計ビュー)、#26(README)、#27(AbortController + 振る舞いテスト)、#28(難易度)、#33(停止/再開)、#35(Jev に送ったプロンプトの表示枠)、#39(Claude API、BYOK)、#40(`/api/judge` の `ask:"cell"`)、#41(確信度順モードのフロント)、#47(`ask:"where"`)、#49(比較モード)、#50(E2E の CSP 追随)、#51(一時的な失敗の停止扱い)、#52(`ask:"all"`)、#57(`usage`)、#58(一括モードのフロント)、#62(バナーを最上部へ)、#65(`exclude`)、#67(処理時間・コスト)、#70(この実行の消費パネル)
 - 数独ジェネレーター/ソルバー(#5)と難易度トグル(#21、やさしい 36 / ふつう 30 / むずかしい 25 ヒント)。Worker 側の入力検証から固定問題(`GIVEN`)前提の項目は外れている(`docs/DESIGN.md` 3.3)
 - 集計ビュー(信頼度較正図)(#6): 判定結果を `localStorage`(`scc.records.v1`)に蓄積し、`pc` / `conf` それぞれの帯ごとの正解率を較正図として表示。JSON エクスポート・記録の消去あり
 - リセット/新しい問題/エラー時に in-flight の `/api/judge` を `AbortController` で中断する(#19)。周回ロジックの振る舞いテスト(S1〜S4)あり
