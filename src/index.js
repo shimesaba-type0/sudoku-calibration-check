@@ -3341,12 +3341,21 @@ var PAGE_HTML = `<!doctype html>
           for (var j = 0; j < cellKeys.length; j++) cells[cellKeys[j]] = entry.value.cells[cellKeys[j]];
           usage = combineClaudeUsage(usage, entry.value.usage);
           if (request === null) request = entry.value.request;
-        } else if (!failure) {
-          failure = entry.reason;
+        } else {
+          // 半分に割った両方が失敗することもある(例: 片方がさらに超過して分割し、その中で
+          // 一部だけ成功してから失敗する)。最初の失敗だけでなく、失敗した側すべての
+          // innerPartialUsage を拾わないと、2つ目以降の失敗が持っていた成功ぶんの usage を
+          // 取りこぼす(PR #94 の Opus レビューで発見)。
+          if (entry.reason && entry.reason.innerPartialUsage) usage = combineClaudeUsage(usage, entry.reason.innerPartialUsage);
+          if (!failure) failure = entry.reason;
         }
       }
       if (failure) {
-        failure.innerPartialUsage = combineClaudeUsage(usage, failure.innerPartialUsage);
+        // usage はこの時点で「成功した側の usage」+「失敗した側それぞれの innerPartialUsage」を
+        // すべて合算済みなので、そのまま failure.innerPartialUsage に上書きする(failure 自身の
+        // 分もループ中に取り込み済みなので、ここでさらに failure.innerPartialUsage と合算すると
+        // 二重計上になる)。
+        failure.innerPartialUsage = usage;
         throw failure;
       }
       return { cells: cells, request: request, usage: usage };
@@ -3388,11 +3397,14 @@ var PAGE_HTML = `<!doctype html>
         for (var j = 0; j < cellKeys.length; j++) cells[cellKeys[j]] = entry.value.cells[cellKeys[j]];
         usage = combineClaudeUsage(usage, entry.value.usage);
         if (request === null) request = entry.value.request;
-      } else if (!failure) {
-        failure = entry.reason;
-        // 失敗したチャンク自身が内部で分割再試行していた場合、その中で成功していた
-        // 半分ぶんの usage(実際に課金されたトークン)を捨てない(Issue #93)。
-        if (failure && failure.innerPartialUsage) usage = combineClaudeUsage(usage, failure.innerPartialUsage);
+      } else {
+        // 失敗したチャンクが2つ以上あっても、それぞれが内部で分割再試行していた場合、
+        // その中で成功していた半分ぶんの usage(実際に課金されたトークン)を取りこぼさない
+        // よう、最初の失敗だけでなく全ての失敗から innerPartialUsage を拾う
+        // (PR #94 の Opus レビューで発見。複数チャンクが同時にレート制限に引っかかる場合など
+        // 現実に起こりうる)。
+        if (entry.reason && entry.reason.innerPartialUsage) usage = combineClaudeUsage(usage, entry.reason.innerPartialUsage);
+        if (!failure) failure = entry.reason;
       }
     }
     if (failure) {
