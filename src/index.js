@@ -3305,11 +3305,61 @@ var PAGE_HTML = `<!doctype html>
     return { cells: parsed.answer, request: body, usage: extractClaudeUsage(data) };
   }
 
+  // Anthropic API の実際のエラー文言(実機確認、Issue #74)。CLAUDE_ALL_CHUNK_SIZE で
+  // チャンクに区切ってもなお、消去法で候補を絞っていても、モデルによっては超過することが
+  // 実キーで確認された(2026-09-25、Issue #93。「むずかしい」・履歴あり・ルールあり・
+  // claude-haiku-4-5 の56マスを10件ずつ6チャンクに分割してもなお1チャンクで発生)。
+  function isGrammarTooLargeClaudeError(err) {
+    return !!(err && typeof err.message === "string" && err.message.indexOf("compiled grammar is too large") !== -1);
+  }
+
+  // askAllClaudeChunk() を、「compiled grammar is too large」のときだけそのチャンクを半分に
+  // 割って再帰的に再試行するようラップする(Issue #93)。固定のチャンクサイズをこれ以上
+  // 小さく決め打ちするのではなく、実際に超過が起きたときだけ分割することで、無駄な追加
+  // 呼び出しを避けつつ頑健にする(1マスまで割ってもまだ起きる場合は通常起きないはずだが、
+  // そのまま諦めて投げる)。分割した片方だけ失敗したときも、成功した片方の usage(実際に
+  // 課金されたトークン)を失敗オブジェクトに innerPartialUsage として持たせ、
+  // askAllClaude() の carryUsage の仕組みに乗せて捨てないようにする(PR #75 と同じ考え方)。
+  async function askAllClaudeChunkWithRetry(puzzle, chunkKeys, excludeByKey, key, signal) {
+    try {
+      return await askAllClaudeChunk(puzzle, chunkKeys, excludeByKey, key, signal);
+    } catch (e) {
+      if (!isGrammarTooLargeClaudeError(e) || chunkKeys.length <= 1) throw e;
+      var mid = Math.ceil(chunkKeys.length / 2);
+      var halves = [chunkKeys.slice(0, mid), chunkKeys.slice(mid)];
+      var settled = await Promise.allSettled(halves.map(function (half) {
+        return askAllClaudeChunkWithRetry(puzzle, half, excludeByKey, key, signal);
+      }));
+      var cells = {};
+      var usage;
+      var request = null;
+      var failure = null;
+      for (var i = 0; i < settled.length; i++) {
+        var entry = settled[i];
+        if (entry.status === "fulfilled") {
+          var cellKeys = Object.keys(entry.value.cells);
+          for (var j = 0; j < cellKeys.length; j++) cells[cellKeys[j]] = entry.value.cells[cellKeys[j]];
+          usage = combineClaudeUsage(usage, entry.value.usage);
+          if (request === null) request = entry.value.request;
+        } else if (!failure) {
+          failure = entry.reason;
+        }
+      }
+      if (failure) {
+        failure.innerPartialUsage = combineClaudeUsage(usage, failure.innerPartialUsage);
+        throw failure;
+      }
+      return { cells: cells, request: request, usage: usage };
+    }
+  }
+
   // 一括モード(Issue #48)の1周ぶん(Claude 経路)。excludeByKey(消去法。Issue #61・#63)は
   // excludeMapForQueue() の結果をそのまま渡す。マス数が多いとスキーマが大きくなりすぎて
   // Anthropic の構造化出力が 400(compiled grammar is too large)を返すため(Issue #74)、
   // CLAUDE_ALL_CHUNK_SIZE 件ずつのチャンクに分けて並列に呼び、結果をマージする
   // (どのチャンクも同じ AbortController を共有するので、停止すればまとめて中断される)。
+  // 各チャンクは askAllClaudeChunkWithRetry() 経由で呼ぶ(それでもなお超過したチャンクは
+  // 自動的にさらに半分に割って再試行する。Issue #93)。
   // 戻り値は askAllJev と同じ形 { cells, request, usage } + chunkCount(成功した先頭チャンクの
   // request だけを返す。プロンプト枠は renderAllRequestBlock() 参照)。
   // Promise.all ではなく Promise.allSettled を使う(PR #75 の Opus レビュー should-fix S1):
@@ -3325,7 +3375,7 @@ var PAGE_HTML = `<!doctype html>
     var keys = selectionKeys();
     var chunks = chunkArray(keys, CLAUDE_ALL_CHUNK_SIZE);
     var settled = await Promise.allSettled(chunks.map(function (chunkKeys) {
-      return askAllClaudeChunk(puzzle, chunkKeys, excludeByKey, key, signal);
+      return askAllClaudeChunkWithRetry(puzzle, chunkKeys, excludeByKey, key, signal);
     }));
     var cells = {};
     var usage;
@@ -3340,6 +3390,9 @@ var PAGE_HTML = `<!doctype html>
         if (request === null) request = entry.value.request;
       } else if (!failure) {
         failure = entry.reason;
+        // 失敗したチャンク自身が内部で分割再試行していた場合、その中で成功していた
+        // 半分ぶんの usage(実際に課金されたトークン)を捨てない(Issue #93)。
+        if (failure && failure.innerPartialUsage) usage = combineClaudeUsage(usage, failure.innerPartialUsage);
       }
     }
     if (failure) {
