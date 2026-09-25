@@ -4532,6 +4532,362 @@ test("Z10: 一括モード(Claude 経路)でチャンクの一部だけ失敗し
   assert.equal(records[0].u.o, expectedPartialOutput + expectedRetryOutput, "先頭の記録の出力トークンに carryUsage が合算されていない");
 });
 
+/**
+ * Claude 一括モードのチャンク応答を、リクエストの schemaProps から自動で作る(Z9/Z10 と
+ * 同じ考え方)。keys は含めるマスのキー一覧。
+ */
+function buildClaudeAllAnswerBody(ctx, keys, schemaProps, inputTokens, outputTokens, msgId) {
+  var answer = {};
+  keys.forEach(function (k) {
+    var m = /^r(\d)c(\d)$/.exec(k);
+    var digit = ctx.SOLUTION[Number(m[1])][Number(m[2])];
+    var list = Array.prototype.slice.call(schemaProps[k].properties.choice.enum).map(String);
+    var probabilities = {};
+    var rest = list.length > 1 ? 0.4 / (list.length - 1) : 0;
+    list.forEach(function (d) { probabilities[d] = d === digit ? 0.6 : rest; });
+    answer[k] = { choice: digit, probabilities: probabilities, confidence: 0.4 };
+  });
+  return {
+    ok: true,
+    status: 200,
+    json: function () {
+      return Promise.resolve({
+        id: msgId,
+        type: "message",
+        role: "assistant",
+        model: "claude-opus-5",
+        stop_reason: "end_turn",
+        content: [{ type: "text", text: JSON.stringify(answer) }],
+        usage: { input_tokens: inputTokens, output_tokens: outputTokens },
+      });
+    },
+  };
+}
+
+/** Anthropic の実際のエラー文言(実機確認、Issue #74・#93)を模した 400 応答。 */
+function grammarTooLargeResponse() {
+  return {
+    ok: false,
+    status: 400,
+    headers: { get: function () { return null; } },
+    json: function () {
+      return Promise.resolve({
+        error: { message: "The compiled grammar is too large, which would cause performance issues. Simplify your tool schemas or reduce the number of strict tools." },
+      });
+    },
+  };
+}
+
+test("Z11: 一括モード(Claude 経路)で1チャンクが「compiled grammar is too large」の400を返しても、自動的に半分に割って再試行し完走する(Issue #93)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  assert.equal(ctx.saveAnthropicKey(TEST_KEY), true);
+  ctx.setModelMode("claude");
+  ctx.setOrderMode("all");
+  ctx.setSpeed("fast");
+  ctx.run();
+  var expectedChunks = Math.ceil(ctx.TOTAL_EMPTY / ctx.CLAUDE_ALL_CHUNK_SIZE);
+  await waitFor(function () { return af.pending.length === expectedChunks; }, "Z11: fetch 待ち(チャンク分割ぶん)");
+  var entries = af.pending.splice(0, af.pending.length);
+
+  // 先頭チャンク(10マス)だけ grammar-too-large の 400 にする。他は普通に成功させる。
+  var expectedOtherInput = 0;
+  var expectedOtherOutput = 0;
+  var failedChunkKeys = null;
+  entries.forEach(function (entry, i) {
+    var body = JSON.parse(entry.init.body);
+    var schemaProps = body.output_config.format.schema.properties;
+    var chunkKeys = Object.keys(schemaProps);
+    if (i === 0) {
+      failedChunkKeys = chunkKeys;
+      entry.resolve(grammarTooLargeResponse());
+      return;
+    }
+    var inputTokens = 100 + i;
+    var outputTokens = 50 + i;
+    expectedOtherInput += inputTokens;
+    expectedOtherOutput += outputTokens;
+    entry.resolve(buildClaudeAllAnswerBody(ctx, chunkKeys, schemaProps, inputTokens, outputTokens, "msg_z11_" + i));
+  });
+  assert.equal(failedChunkKeys.length, ctx.CLAUDE_ALL_CHUNK_SIZE, "先頭チャンクのマス数が CLAUDE_ALL_CHUNK_SIZE と違う");
+
+  // 400 を受けて、先頭チャンクを半分(5+5)に割った再試行の fetch が新たに2件届く
+  await waitFor(function () { return af.pending.length === 2; }, "Z11: 分割後の再試行 fetch 待ち");
+  var retryEntries = af.pending.splice(0, af.pending.length);
+  assert.equal(retryEntries.length, 2, "分割後の再試行が2件になっていない");
+  var expectedSplitInput = 0;
+  var expectedSplitOutput = 0;
+  var seenKeys = [];
+  retryEntries.forEach(function (entry, i) {
+    var body = JSON.parse(entry.init.body);
+    var schemaProps = body.output_config.format.schema.properties;
+    var chunkKeys = Object.keys(schemaProps);
+    assert.equal(chunkKeys.length, failedChunkKeys.length / 2, "分割後のチャンクが半分のマス数になっていない");
+    seenKeys = seenKeys.concat(chunkKeys);
+    var inputTokens = 10 + i;
+    var outputTokens = 5 + i;
+    expectedSplitInput += inputTokens;
+    expectedSplitOutput += outputTokens;
+    entry.resolve(buildClaudeAllAnswerBody(ctx, chunkKeys, schemaProps, inputTokens, outputTokens, "msg_z11_split_" + i));
+  });
+  assert.deepStrictEqual(seenKeys.slice().sort(), failedChunkKeys.slice().sort(), "分割後の2チャンクを合わせても先頭チャンクの全マスにならない");
+
+  await waitFor(function () { return ctx.state.done === true; }, "Z11: 完了待ち");
+  var records = ctx.getRecords();
+  assert.equal(records.length, ctx.TOTAL_EMPTY, "分割再試行を挟んでも記録の件数が空マス数と一致しない(取りこぼしがある)");
+  assert.equal(
+    records[0].u.i,
+    expectedOtherInput + expectedSplitInput,
+    "分割後の再試行ぶんの入力トークンが合算されていない"
+  );
+  assert.equal(
+    records[0].u.o,
+    expectedOtherOutput + expectedSplitOutput,
+    "分割後の再試行ぶんの出力トークンが合算されていない"
+  );
+  assert.equal(af.pending.length, 0, "余計な fetch が残っている");
+});
+
+test("Z12: 分割後の片方だけ一時的な失敗(429)になっても、成功していた片方の usage は失わない(Issue #93)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  assert.equal(ctx.saveAnthropicKey(TEST_KEY), true);
+  ctx.setModelMode("claude");
+  ctx.setOrderMode("all");
+  ctx.setSpeed("fast");
+  ctx.run();
+  var expectedChunks = Math.ceil(ctx.TOTAL_EMPTY / ctx.CLAUDE_ALL_CHUNK_SIZE);
+  await waitFor(function () { return af.pending.length === expectedChunks; }, "Z12: fetch 待ち(チャンク分割ぶん)");
+  var entries = af.pending.splice(0, af.pending.length);
+
+  var expectedOtherInput = 0;
+  var expectedOtherOutput = 0;
+  entries.forEach(function (entry, i) {
+    var body = JSON.parse(entry.init.body);
+    var schemaProps = body.output_config.format.schema.properties;
+    var chunkKeys = Object.keys(schemaProps);
+    if (i === 0) {
+      entry.resolve(grammarTooLargeResponse());
+      return;
+    }
+    var inputTokens = 100 + i;
+    var outputTokens = 50 + i;
+    expectedOtherInput += inputTokens;
+    expectedOtherOutput += outputTokens;
+    entry.resolve(buildClaudeAllAnswerBody(ctx, chunkKeys, schemaProps, inputTokens, outputTokens, "msg_z12_" + i));
+  });
+
+  await waitFor(function () { return af.pending.length === 2; }, "Z12: 分割後の再試行 fetch 待ち");
+  var retryEntries = af.pending.splice(0, af.pending.length);
+  var expectedSplitInput = 0;
+  var expectedSplitOutput = 0;
+  retryEntries.forEach(function (entry, i) {
+    if (i === 0) {
+      // 片方は一時的な失敗(429)。もう片方(i===1)は成功させる。
+      entry.resolve({
+        ok: false,
+        status: 429,
+        headers: { get: function () { return null; } },
+        json: function () { return Promise.resolve({ error: { message: "rate limited" } }); },
+      });
+      return;
+    }
+    var body = JSON.parse(entry.init.body);
+    var schemaProps = body.output_config.format.schema.properties;
+    var chunkKeys = Object.keys(schemaProps);
+    var inputTokens = 10;
+    var outputTokens = 5;
+    expectedSplitInput += inputTokens;
+    expectedSplitOutput += outputTokens;
+    entry.resolve(buildClaudeAllAnswerBody(ctx, chunkKeys, schemaProps, inputTokens, outputTokens, "msg_z12_split"));
+  });
+
+  // 429 は一時的な失敗として停止扱いになる(Issue #43)。成功していたぶん(他の5チャンク +
+  // 分割した片方)の usage は carryUsage に積まれて失われない(Issue #93)。
+  await waitFor(function () { return ctx.isPaused() && ctx.state.pauseReason !== null; }, "Z12: 一時的な失敗での停止待ち");
+  assert.ok(ctx.carryUsage, "成功していたぶんの usage が carryUsage に積まれていない");
+  assert.equal(
+    ctx.carryUsage.usage.i,
+    expectedOtherInput + expectedSplitInput,
+    "carryUsage の入力トークンに分割後の成功ぶんが合算されていない"
+  );
+  assert.equal(
+    ctx.carryUsage.usage.o,
+    expectedOtherOutput + expectedSplitOutput,
+    "carryUsage の出力トークンに分割後の成功ぶんが合算されていない"
+  );
+});
+
+test("Z13: 分割が入れ子になり、両方の枝が(内部でさらに分割して一部だけ成功したのち)最終的に失敗しても、それぞれの innerPartialUsage を取りこぼさない(PR #94 レビュー)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  var puzzle = ctx.GIVEN.join("");
+  var chunkKeys = ["r0c0", "r0c1", "r1c0", "r1c1"]; // 4マス。4→2+2→1+1+1+1 と入れ子に割れる
+
+  var resultPromise = ctx.askAllClaudeChunkWithRetry(puzzle, chunkKeys, {}, TEST_KEY, undefined);
+
+  // 1回目: 4マスまとめての呼び出しが grammar-too-large で失敗 → 2マスずつ(A・B)に分割される
+  await waitFor(function () { return af.pending.length === 1; }, "Z13: 最初の呼び出し待ち");
+  var first = af.pending.shift();
+  var firstKeys = Object.keys(JSON.parse(first.init.body).output_config.format.schema.properties);
+  assert.deepStrictEqual(firstKeys.slice().sort(), chunkKeys.slice().sort(), "最初の呼び出しが4マスまとめてになっていない");
+  first.resolve(grammarTooLargeResponse());
+
+  // 2回目: 2マスずつ(A=[r0c0,r0c1]・B=[r1c0,r1c1])の呼び出しが2件飛ぶ。両方とも
+  // grammar-too-large にして、さらに1マスずつに分割させる。
+  await waitFor(function () { return af.pending.length === 2; }, "Z13: 2分割後の呼び出し待ち");
+  var halfEntries = af.pending.splice(0, af.pending.length);
+  halfEntries.forEach(function (entry) {
+    entry.resolve(grammarTooLargeResponse());
+  });
+
+  // 3回目: 1マスずつの呼び出しが4件飛ぶ(A→r0c0,r0c1 / B→r1c0,r1c1)。各ペアで片方だけ
+  // 成功させ、もう片方は429(一時的な失敗。1マスなのでこれ以上は分割しない)にする。
+  await waitFor(function () { return af.pending.length === 4; }, "Z13: 1マスずつの呼び出し待ち");
+  var leafEntries = af.pending.splice(0, af.pending.length);
+  var expectedInnerInput = 0;
+  var expectedInnerOutput = 0;
+  leafEntries.forEach(function (entry, i) {
+    var body = JSON.parse(entry.init.body);
+    var schemaProps = body.output_config.format.schema.properties;
+    var keys = Object.keys(schemaProps);
+    var succeed = keys[0] === "r0c0" || keys[0] === "r1c0"; // 各ペアの先頭側だけ成功させる
+    if (succeed) {
+      var inputTokens = 10 + i;
+      var outputTokens = 5 + i;
+      expectedInnerInput += inputTokens;
+      expectedInnerOutput += outputTokens;
+      entry.resolve(buildClaudeAllAnswerBody(ctx, keys, schemaProps, inputTokens, outputTokens, "msg_z13_" + i));
+    } else {
+      entry.resolve({
+        ok: false,
+        status: 429,
+        headers: { get: function () { return null; } },
+        json: function () { return Promise.resolve({ error: { message: "rate limited" } }); },
+      });
+    }
+  });
+
+  var thrown = null;
+  try {
+    await resultPromise;
+  } catch (e) {
+    thrown = e;
+  }
+  assert.ok(thrown, "A・Bどちらも最終的に失敗したのに例外が投げられていない");
+  assert.ok(thrown.innerPartialUsage, "成功していたぶんの usage(innerPartialUsage)が付いていない");
+  assert.equal(
+    thrown.innerPartialUsage.input_tokens,
+    expectedInnerInput,
+    "innerPartialUsage の入力トークンが A・B 両方の成功ぶんの合算になっていない(2つ目以降の失敗ぶんを取りこぼしている疑い)"
+  );
+  assert.equal(
+    thrown.innerPartialUsage.output_tokens,
+    expectedInnerOutput,
+    "innerPartialUsage の出力トークンが A・B 両方の成功ぶんの合算になっていない(2つ目以降の失敗ぶんを取りこぼしている疑い)"
+  );
+  assert.equal(af.pending.length, 0, "余計な fetch が残っている");
+});
+
+test("Z14: 一括モード(Claude 経路)で2つ以上の先頭チャンクが分割再試行し、それぞれの成功ぶんを取りこぼさない(PR #94 レビュー)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  assert.equal(ctx.saveAnthropicKey(TEST_KEY), true);
+  ctx.setModelMode("claude");
+  ctx.setOrderMode("all");
+  ctx.setSpeed("fast");
+  ctx.run();
+  var expectedChunks = Math.ceil(ctx.TOTAL_EMPTY / ctx.CLAUDE_ALL_CHUNK_SIZE);
+  await waitFor(function () { return af.pending.length === expectedChunks; }, "Z14: fetch 待ち(チャンク分割ぶん)");
+  var entries = af.pending.splice(0, af.pending.length);
+
+  // 先頭2チャンク(0・1)は grammar-too-large にする。残り(2〜5)は普通に成功させる。
+  var expectedOtherInput = 0;
+  var expectedOtherOutput = 0;
+  var chunk0Keys = null;
+  var chunk1Keys = null;
+  entries.forEach(function (entry, i) {
+    var body = JSON.parse(entry.init.body);
+    var schemaProps = body.output_config.format.schema.properties;
+    var chunkKeys = Object.keys(schemaProps);
+    if (i === 0) { chunk0Keys = chunkKeys; entry.resolve(grammarTooLargeResponse()); return; }
+    if (i === 1) { chunk1Keys = chunkKeys; entry.resolve(grammarTooLargeResponse()); return; }
+    var inputTokens = 100 + i;
+    var outputTokens = 50 + i;
+    expectedOtherInput += inputTokens;
+    expectedOtherOutput += outputTokens;
+    entry.resolve(buildClaudeAllAnswerBody(ctx, chunkKeys, schemaProps, inputTokens, outputTokens, "msg_z14_" + i));
+  });
+
+  // 2チャンクぶんの分割再試行(5+5 × 2 = 4件)が新たに飛ぶ。どちらの元チャンク由来かを
+  // スキーマのキーで判定し(到着順は保証されないため)、チャンクごとに片方だけ成功させ、
+  // もう片方は429(一時的な失敗)にする。
+  await waitFor(function () { return af.pending.length === 4; }, "Z14: 分割後の再試行 fetch 待ち");
+  var retryEntries = af.pending.splice(0, af.pending.length);
+  var expectedSplitInput = 0;
+  var expectedSplitOutput = 0;
+  var seenForChunk = { 0: 0, 1: 0 };
+  retryEntries.forEach(function (entry, i) {
+    var body = JSON.parse(entry.init.body);
+    var schemaProps = body.output_config.format.schema.properties;
+    var chunkKeys = Object.keys(schemaProps);
+    var belongsToChunk0 = chunk0Keys.indexOf(chunkKeys[0]) !== -1;
+    var chunkId = belongsToChunk0 ? 0 : 1;
+    var isFirstForThisChunk = seenForChunk[chunkId] === 0;
+    seenForChunk[chunkId]++;
+    if (isFirstForThisChunk) {
+      var inputTokens = 10 + i;
+      var outputTokens = 5 + i;
+      expectedSplitInput += inputTokens;
+      expectedSplitOutput += outputTokens;
+      entry.resolve(buildClaudeAllAnswerBody(ctx, chunkKeys, schemaProps, inputTokens, outputTokens, "msg_z14_split_" + i));
+    } else {
+      entry.resolve({
+        ok: false,
+        status: 429,
+        headers: { get: function () { return null; } },
+        json: function () { return Promise.resolve({ error: { message: "rate limited" } }); },
+      });
+    }
+  });
+  assert.ok(chunk1Keys, "先頭2チャンク目のキーが取れていない(テストの前提が崩れている)");
+
+  // 2チャンクとも最終的に失敗する(どちらも429を含む半分がある)ので一時的な失敗として
+  // 停止扱いになる。成功していたぶん(chunks 2〜5 + 分割後に成功した2件、2つ目の
+  // 失敗チャンクぶんも含む)の usage が carryUsage に積まれて失われないことがポイント。
+  await waitFor(function () { return ctx.isPaused() && ctx.state.pauseReason !== null; }, "Z14: 一時的な失敗での停止待ち");
+  assert.ok(ctx.carryUsage, "成功していたぶんの usage が carryUsage に積まれていない");
+  assert.equal(
+    ctx.carryUsage.usage.i,
+    expectedOtherInput + expectedSplitInput,
+    "carryUsage の入力トークンに、2つ目以降の失敗チャンクの成功ぶんが合算されていない(取りこぼし)"
+  );
+  assert.equal(
+    ctx.carryUsage.usage.o,
+    expectedOtherOutput + expectedSplitOutput,
+    "carryUsage の出力トークンに、2つ目以降の失敗チャンクの成功ぶんが合算されていない(取りこぼし)"
+  );
+});
+
+test("Z15: 分割の再帰は1マスまで割ったら止まり、それでも grammar-too-large ならそのまま投げる(PR #94 レビュー)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  var puzzle = ctx.GIVEN.join("");
+  var resultPromise = ctx.askAllClaudeChunkWithRetry(puzzle, ["r0c0"], {}, TEST_KEY, undefined);
+  await waitFor(function () { return af.pending.length === 1; }, "Z15: fetch 待ち");
+  var entry = af.pending.shift();
+  entry.resolve(grammarTooLargeResponse());
+  var thrown = null;
+  try {
+    await resultPromise;
+  } catch (e) {
+    thrown = e;
+  }
+  assert.ok(thrown, "1マスでも grammar-too-large なら例外が投げられるはず");
+  assert.ok(ctx.isGrammarTooLargeClaudeError(thrown), "投げられた例外が grammar-too-large と判定されない");
+  assert.equal(af.pending.length, 0, "1マスなのにさらに分割して fetch が増えている(再帰の停止条件が効いていない)");
+});
+
 // ---------------------------------------------------------------------------
 // 計時・コスト(Issue #55・#56、SPEC 3章 F1・F1'・5章)。S/T/W/Y/Z 系と同じ
 // runScript / makeAbortAwareFetch / waitFor を使う。nowMs() を差し替えて

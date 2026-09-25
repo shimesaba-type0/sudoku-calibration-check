@@ -372,18 +372,33 @@ Cloudflare 側の都合で変わる。形が違っていたらこの節と `hand
     構造化出力が「The compiled grammar is too large, which would cause performance issues.
     Simplify your tool schemas or reduce the number of strict tools.」という 400 を返すことが
     実機で確認された。`askAllClaude(puzzle, excludeByKey, signal)` は `selectionKeys()` の結果を
-    `chunkArray(keys, CLAUDE_ALL_CHUNK_SIZE)`(既定 10。実キーで確かめた値ではなく、保守的に
-    選んだ推測値。**この値で「むずかしい」+ 消去法の両トグルなし + 思考ありの最悪ケースでも
-    400 を避けられるかは未検証**、`docs/HANDOFF.md` 6章の要オーナー判断に追記した)でチャンクに
-    区切り、チャンクごとに `askAllClaudeChunk(puzzle, chunkKeys, excludeByKey, key, signal)`
-    (旧 `askAllClaude` の fetch/検証本体をそのまま切り出したもの。1チャンクぶんの
-    `buildClaudeAllRequest` / `parseClaudeAllAnswer` を、そのチャンクのキーだけを
-    `expectedKeys` にして呼ぶ)を `Promise.allSettled` で**並列に**呼ぶ。全チャンクが同じ
-    `AbortController`(`signal`)を共有するので、停止すれば全部まとめて中断される。
+    `chunkArray(keys, CLAUDE_ALL_CHUNK_SIZE)`(既定 10)でチャンクに区切り、チャンクごとに
+    `askAllClaudeChunkWithRetry(puzzle, chunkKeys, excludeByKey, key, signal)` を
+    `Promise.allSettled` で**並列に**呼ぶ。全チャンクが同じ `AbortController`(`signal`)を
+    共有するので、停止すれば全部まとめて中断される。
+    - **分割してもなお超過したときの自動再分割(Issue #93)**: `CLAUDE_ALL_CHUNK_SIZE`(10)は
+      当初(#74)実キーで確かめた値ではなく保守的な推測値だった。2026-09-25、オーナーの実キーで
+      「むずかしい」・消去法(履歴・ルール候補)あり・`claude-haiku-4-5` の56マスを6チャンクに
+      分割してもなお1チャンクで400が再発することを確認した(消去法で候補を絞っていても起きた点が
+      #74 の想定と違う)。固定のチャンクサイズをこれ以上小さく決め打ちするのではなく、
+      `askAllClaudeChunkWithRetry(puzzle, chunkKeys, excludeByKey, key, signal)` が
+      `askAllClaudeChunk()` を呼んで「compiled grammar is too large」(`isGrammarTooLargeClaudeError()`
+      が文言で判定)だけを検知し、そのチャンクを半分に割って自分自身を再帰的に呼ぶ形にした
+      (`chunkKeys.length <= 1` になってもまだ起きる場合はそのまま諦めて投げる。通常は起きない
+      想定)。分割した2つは `Promise.allSettled` で並列に呼び、`cells`/`usage`/`request` を
+      チャンク本体と同じやり方でマージする。片方だけ失敗しても、成功していた片方の usage は
+      失敗オブジェクトの `innerPartialUsage` に載せて上に伝える(下記の `partialUsage` の
+      仕組みへ合流させ、捨てない)
     - **部分失敗の扱い(PR #75 レビュー S1)**: `Promise.all` ではなく `Promise.allSettled` を使う。
       いずれかのチャンクが失敗しても、成功していたチャンクの `cells` / `usage` を先に集計してから
       エラーを投げる(`err.partialUsage` に成功ぶんの合算 usage、`err.chunkCount` にチャンク数を
-      載せる)。`askAllRound()` の失敗ハンドラがこれを `toRecordUsage()` に通してから
+      載せる。失敗したチャンク自身が上記の自動再分割を内部で行っていた場合、その中で成功していた
+      半分ぶんの usage(`err.innerPartialUsage`)もここで合算する。Issue #93)。**2つ以上のチャンクが
+      同時に失敗しても、最初の1件だけでなく失敗した全チャンクの `innerPartialUsage` を拾う**
+      (`askAllClaudeChunkWithRetry()` 自身の分割マージも同じ形。最初の失敗だけを見て以降の失敗を
+      無視する実装だと、2件目以降の失敗が持っていた成功ぶんの usage を静かに取りこぼす。PR #94 の
+      Opus レビューで発見・修正。振る舞いテスト Z13・Z14)。`askAllRound()` の
+      失敗ハンドラがこれを `toRecordUsage()` に通してから
       `carryUsage`(4.1。停止中に持ち越す usage の置き場)へ積むので、「この実行の消費」パネルの
       累計から消えない。**ただし停止/再開ではその周をもう一度最初から呼び直す(全チャンク再送信)
       ため、成功していたチャンクぶんが実際に二重に課金されること自体は避けられない**(既知の
@@ -1158,6 +1173,11 @@ new_sqlite_classes = ["RateLimitCounter"]
     - Z8: Claude 経路の一括で全マスが確定し(固定問題の51マスなのでチャンク分割される)、記録の `m` が `claude-opus-5+think/all`・`o` が `"all"` になること、キーが DOM に出ないこと。Jev 経路で `cells` に対象マスが欠けた応答は、1 マスも確定・記録せず `queue` も減らさずにエラー停止すること(`askAllRound` がキャッシュに入れる前に queue の全キーを確かめる)
     - Z9(Issue #74): `chunkArray()` の境界(割り切れる・余りが出る・空・要素1個)、`combineClaudeUsage()` の合算(片方 `undefined`・`cache_read_input_tokens` の合算)。固定問題(51マス)なら `CLAUDE_ALL_CHUNK_SIZE`(既定10)で6チャンクになること。`run()` 経由でチャンクごとに異なる `usage` を返し、合算された値が周の先頭1件の記録にだけ付き(二重計上しない)、プロンプト枠に「(6回に分割。先頭の1回だけ表示)」の注記が出ること
     - Z10(PR #75 レビュー S1): 6チャンク中1つだけ429にし、残り5チャンクは成功させる。成功していた5チャンクぶんの usage が `carryUsage` に積まれること、プロンプト枠に「(6回に分割。失敗した1回を表示)」の注記が出ること(`git stash` で `Promise.allSettled` 化前のコードに戻すと落ちることを確認済み)。再開(全チャンク再送信)後、`carryUsage` の分と再送信ぶんの usage が両方とも周の先頭1件の記録に合算されること
+    - Z11(Issue #93): 6チャンク中先頭だけ「compiled grammar is too large」の400を模した応答にし、残り5チャンクは成功させる。先頭チャンク(10マス)の分割再試行として5+5マスの新しい fetch が2件飛ぶこと、両方成功させれば周が完走し記録の件数が空マス数と一致すること、分割再試行ぶんの usage が周の先頭1件の記録に合算されること(`git stash` で `askAllClaudeChunkWithRetry()` 導入前のコードに戻すと `waitFor` がタイムアウトして落ちることを確認済み)
+    - Z12(Issue #93): Z11 と同じく先頭チャンクを400で分割させ、分割後の片方だけさらに429(一時的な失敗)にする。もう片方は成功させる。一時的な失敗として停止扱いになり、成功していたぶん(他の5チャンク + 分割した片方)の usage が `carryUsage` に積まれて失われないこと(`err.innerPartialUsage` の合算を検証)
+    - Z13(PR #94 レビュー): `askAllClaudeChunkWithRetry()` を4マスのチャンクで直接呼び出し、4→2+2→1+1+1+1 と入れ子に分割させる。各ペア(2マスの塊が1+1に割れたもの)で片方だけ成功・もう片方は429にし、**A・B両方の塊が最終的に失敗する**状況を作る。投げられる例外の `innerPartialUsage` に、A・B両方の成功ぶんの usage が合算されていること(最初の失敗(A)ぶんしか拾わない実装だと B の成功ぶんを取りこぼす。`git stash` で該当ループの修正前に戻すと落ちることを確認済み)
+    - Z14(PR #94 レビュー): 一括モード(Claude 経路)で **先頭2チャンク(0・1)** をどちらも400にして5+5ずつに分割させ、それぞれのペアで片方だけ成功・もう片方は429にする(到着順は保証されないため、スキーマのキーでどちらの元チャンク由来かを判定してから成功/失敗を割り当てる)。2チャンクとも最終的に失敗して停止扱いになり、`carryUsage` に他の4チャンク+分割後に成功した2件(**2つ目の失敗チャンクの成功ぶんを含む**)の usage が合算されていること(Z13 と同じ実装ミスを `askAllClaude()` 側のループで検証。修正前に戻すと落ちることを確認済み)
+    - Z15(PR #94 レビュー): `askAllClaudeChunkWithRetry()` を1マスのチャンクで直接呼び出し、grammar-too-large を返させる。`chunkKeys.length <= 1` の基底条件でそれ以上分割せずそのまま投げること(余計な fetch が増えないこと)を検証
   - **計時・コスト**(`test/page.test.js` AA1〜AA13、Issue #55・#56)。S/T/W/Y/Z 系と同じ `runScript` / `makeAbortAwareFetch` / `waitFor` を使う。`ctx.nowMs = function(){...}` で `Date.now()` を差し替え(`RECORDS_MAX` の上書きと同じパターン)、実時間を待たずに確定値で検証する。`blankCells(solved, cells)` を新設(`ANSWER_KEY` の指定セルだけを `"."` にした81文字の盤面を作り、`applyPuzzleFromString()` で空マス数の少ない盤面に差し替えて周を短く終わらせる)
     - AA1: 空マス2つの盤面で `run()` → 1マス目確定 → 2マス目 in-flight のまま `nowMs` を進めて `stop()`(この時点で `totalElapsedMs` / `roundElapsedMs` が期待どおりの値になること、`runningSince` が `null` になること)→ 停止中にさらに `nowMs` を進める(3600ms 相当)→ `run()` で再開(`runningSince` が再開時刻に付け替わること)→ 2マス目を確定して完了。`state.roundLog[0].ms` と `totalElapsedMs` が、停止中の分を除いた合計(400ms + 200ms = 600ms)になること、`roundElapsedMs` が完了後に0へ戻っていること
     - AA2: `formatMs` / `formatUsd` の書式(3桁区切り、`$0.01` 未満は有効数字2桁程度、負値・0の扱い)。`formatRoundLogLine(entry)` が「N周目: M中K正解 (P%) — 3,214 ms / $0.0004」、`formatTotalSummary()` が `state.roundLog.length` を使って「合計 12,345 ms / $0.0012(3周)」になること
