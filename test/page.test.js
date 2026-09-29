@@ -4888,6 +4888,121 @@ test("Z15: 分割の再帰は1マスまで割ったら止まり、それでも g
   assert.equal(af.pending.length, 0, "1マスなのにさらに分割して fetch が増えている(再帰の停止条件が効いていない)");
 });
 
+test("Z16: 一括モード(Claude 経路)は超過して分割したチャンクサイズを覚え、次回以降は最初から小さいサイズで送る(オーナー報告2026-09-29「Claudeの回答が異様に遅くなった」への対応、Issue #96)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  assert.equal(ctx.saveAnthropicKey(TEST_KEY), true);
+  var puzzle = ctx.GIVEN.join("");
+
+  // 12マスぶんの queue を用意(既定の CLAUDE_ALL_CHUNK_SIZE=10 なら 10+2 の2チャンクになる)。
+  // askAllClaude() は selectionKeys() 経由で queue を読むので、run() を経由せず直接差し替える。
+  var cellList = [];
+  for (var r = 0; r < 9 && cellList.length < 12; r++) {
+    for (var c = 0; c < 9 && cellList.length < 12; c++) {
+      cellList.push({ r: r, c: c });
+    }
+  }
+  ctx.queue = cellList;
+
+  function schemaPropsOf(entry) {
+    return JSON.parse(entry.init.body).output_config.format.schema.properties;
+  }
+  function resolveWithAnswer(entry, inputTokens, outputTokens, msgId) {
+    var schemaProps = schemaPropsOf(entry);
+    var keys = Object.keys(schemaProps);
+    entry.resolve(buildClaudeAllAnswerBody(ctx, keys, schemaProps, inputTokens, outputTokens, msgId));
+  }
+
+  // 1回目: 10マスチャンクが grammar-too-large で失敗し、5+5 に分割される。
+  var firstPromise = ctx.askAllClaude(puzzle, {}, undefined);
+  await waitFor(function () { return af.pending.length === 2; }, "Z16: 1回目の fetch 待ち(10+2の2チャンク)");
+  var entries = af.pending.splice(0, af.pending.length);
+  var tenKeyEntry = entries.find(function (e) { return Object.keys(schemaPropsOf(e)).length === 10; });
+  var twoKeyEntry = entries.find(function (e) { return e !== tenKeyEntry; });
+  assert.ok(tenKeyEntry && twoKeyEntry, "想定どおりの10マス/2マスのチャンクになっていない");
+  tenKeyEntry.resolve(grammarTooLargeResponse());
+  resolveWithAnswer(twoKeyEntry, 10, 5, "msg_z16_a");
+
+  await waitFor(function () { return af.pending.length === 2; }, "Z16: 分割後の再試行 fetch 待ち");
+  var splitEntries = af.pending.splice(0, af.pending.length);
+  splitEntries.forEach(function (entry, i) {
+    resolveWithAnswer(entry, 1, 1, "msg_z16_split_" + i);
+  });
+  await firstPromise;
+
+  assert.equal(ctx.claudeAllChunkSizeHint, 5, "超過を検知したのに学習したチャンクサイズ(claudeAllChunkSizeHint)が記録されていない");
+
+  // 2回目: 同じ queue でもう一度呼ぶと、最初から学習済みサイズ(5件)で分割される
+  // (12マス ÷ 5 = 5+5+2 の3チャンク)。10マスまとめての無駄な最初の1回が飛ばないことが要点。
+  var secondPromise = ctx.askAllClaude(puzzle, {}, undefined);
+  await waitFor(function () { return af.pending.length === 3; }, "Z16: 2回目の fetch 待ち(学習済みサイズで最初から3チャンク)");
+  var secondEntries = af.pending.splice(0, af.pending.length);
+  var chunkSizes = secondEntries.map(function (e) { return Object.keys(schemaPropsOf(e)).length; }).sort(function (a, b) { return b - a; });
+  assert.deepStrictEqual(chunkSizes, [5, 5, 2], "2回目が学習済みサイズ(5件ずつ)で最初から分割されていない(毎回10件で試して無駄な失敗を繰り返している疑い)");
+  secondEntries.forEach(function (entry, i) {
+    resolveWithAnswer(entry, 1, 1, "msg_z16_round2_" + i);
+  });
+  await secondPromise;
+  assert.equal(af.pending.length, 0, "余計な fetch が残っている");
+});
+
+test("Z17: 学習したチャンクサイズは reset() で忘れる(Issue #96)", async () => {
+  var ctx = runScript(await getPageHtml());
+  ctx.claudeAllChunkSizeHint = 3;
+  ctx.reset();
+  assert.equal(ctx.claudeAllChunkSizeHint, null, "reset() 後も学習済みのチャンクサイズが残っている(異なる問題・設定で不適切に小さいサイズを引きずる)");
+});
+
+test("Z18: 学習したチャンクサイズは CLAUDE_ALL_CHUNK_SIZE_HINT_FLOOR 未満には下がらない(PR #97 レビュー S1)", { timeout: 10000 }, async () => {
+  var af = makeAbortAwareFetch();
+  var ctx = runScript(await getPageHtml(), { fetch: af.fetch });
+  assert.equal(ctx.saveAnthropicKey(TEST_KEY), true);
+  var puzzle = ctx.GIVEN.join("");
+
+  // 4マスの queue。既定サイズ(10)以下なので1チャンクで送られるが、それが
+  // grammar-too-large で失敗すると mid = Math.ceil(4/2) = 2 に分割される。
+  // 下限(3)が無ければ claudeAllChunkSizeHint は2まで下がってしまう。
+  var cellList = [{ r: 0, c: 0 }, { r: 0, c: 1 }, { r: 0, c: 2 }, { r: 0, c: 3 }];
+  ctx.queue = cellList;
+
+  function schemaPropsOf(entry) {
+    return JSON.parse(entry.init.body).output_config.format.schema.properties;
+  }
+  function resolveWithAnswer(entry, inputTokens, outputTokens, msgId) {
+    var schemaProps = schemaPropsOf(entry);
+    var keys = Object.keys(schemaProps);
+    entry.resolve(buildClaudeAllAnswerBody(ctx, keys, schemaProps, inputTokens, outputTokens, msgId));
+  }
+
+  var firstPromise = ctx.askAllClaude(puzzle, {}, undefined);
+  await waitFor(function () { return af.pending.length === 1; }, "Z18: 1回目の fetch 待ち(4マス1チャンク)");
+  var wholeEntry = af.pending.shift();
+  assert.equal(Object.keys(schemaPropsOf(wholeEntry)).length, 4, "4マスが1チャンクにまとまっていない");
+  wholeEntry.resolve(grammarTooLargeResponse());
+
+  await waitFor(function () { return af.pending.length === 2; }, "Z18: 分割後の再試行 fetch 待ち(2+2)");
+  var splitEntries = af.pending.splice(0, af.pending.length);
+  splitEntries.forEach(function (entry, i) {
+    resolveWithAnswer(entry, 1, 1, "msg_z18_split_" + i);
+  });
+  await firstPromise;
+
+  assert.equal(ctx.claudeAllChunkSizeHint, ctx.CLAUDE_ALL_CHUNK_SIZE_HINT_FLOOR, "分割で実際に必要になったサイズ(2)より下限(3)が優先されていない");
+  assert.equal(ctx.claudeAllChunkSizeHint >= 3, true, "学習したチャンクサイズが下限(3)を下回っている");
+
+  // 2回目: 同じ4マスの queue を学習済みサイズ(3)で送ると 3+1 の2チャンクになる。
+  var secondPromise = ctx.askAllClaude(puzzle, {}, undefined);
+  await waitFor(function () { return af.pending.length === 2; }, "Z18: 2回目の fetch 待ち(下限サイズで3+1)");
+  var secondEntries = af.pending.splice(0, af.pending.length);
+  var chunkSizes = secondEntries.map(function (e) { return Object.keys(schemaPropsOf(e)).length; }).sort(function (a, b) { return b - a; });
+  assert.deepStrictEqual(chunkSizes, [3, 1], "2回目が下限サイズ(3件)で分割されていない");
+  secondEntries.forEach(function (entry, i) {
+    resolveWithAnswer(entry, 1, 1, "msg_z18_round2_" + i);
+  });
+  await secondPromise;
+  assert.equal(af.pending.length, 0, "余計な fetch が残っている");
+});
+
 // ---------------------------------------------------------------------------
 // 計時・コスト(Issue #55・#56、SPEC 3章 F1・F1'・5章)。S/T/W/Y/Z 系と同じ
 // runScript / makeAbortAwareFetch / waitFor を使う。nowMs() を差し替えて
