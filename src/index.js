@@ -2035,15 +2035,30 @@ var PAGE_HTML = `<!doctype html>
   // 構造化出力が「compiled grammar is too large」で 400 を返す(実機確認、Issue #74)。
   // 1回のリクエストで聞くマス数をここで区切り、askAllClaude() が複数回に分けて呼ぶ。
   var CLAUDE_ALL_CHUNK_SIZE = 10;
+  // claudeAllChunkSizeHint(下記)が下方修正されても、これ未満には下げない(Issue #96 の
+  // レビューで指摘。1つの外れ値チャンクが極端に小さいサイズ(1〜2件)まで割れてしまうと、
+  // そのサイズが以後ずっと使われ続け、無関係な残りのマスまで大量の小さい並列リクエストに
+  // 分散してしまう。単価上昇や Anthropic 側レート制限(429)到達のリスクが上がるうえ、
+  // 1周の所要時間は並列チャンクのうち最も遅い1本で決まるため、チャンクを増やすほど
+  // かえって周が遅くなることもある)。このチャンク自体の再帰的な分割(この場しのぎで
+  // 400 を回避するための halves 計算)はこの下限の対象外で、超過が続く限りそのまま
+  // 割り続ける。
+  var CLAUDE_ALL_CHUNK_SIZE_HINT_FLOOR = 3;
   // CLAUDE_ALL_CHUNK_SIZE でもなお超過してチャンクを分割したことがあれば、そのサイズを
   // 覚えておく(Issue #96、オーナー報告 2026-09-29「Claude の回答が異様に遅くなった」の
   // 原因調査で判明)。askAllClaudeChunkWithRetry() は超過が起きたチャンクだけをその場で
   // 半分に割って再試行する(Issue #93)が、次に「新しい問題」/「リセット」するまでは
   // 覚えていなかったため、同じ組み合わせ(むずかしい・消去法あり・Haiku 等)では**毎周**
   // 「規定10件で試して400→半分に割って再試行」を繰り返し、周ごとに余計な直列の
-  // 往復(レイテンシ2倍前後)を払い続けていた。一度学習すれば、以後の周は最初から
-  // 小さいサイズで送るので、この無駄な往復が消える。reset() / newPuzzle() で
-  // null に戻す(問題や設定が変われば安全なサイズも変わりうるため)。
+  // 往復(レイテンシ2倍前後)を払い続けていた可能性が高い(実キーでの再現・比較検証は
+  // 未実施。オーナーの環境でこのPR適用前後の周ごとの所要時間(ms)を比較して確認できる)。
+  // 一度学習すれば、以後の周(この周の残りには間に合わない。次回の askAllClaude() 呼び出し
+  // から)は最初から小さいサイズで送るので、この無駄な往復が減る。reset() / newPuzzle() で
+  // null に戻す(問題や設定が変われば安全なサイズも変わりうるため)。**このフラグが説明する
+  // のはあくまで一括モード(Claude 経路)固有の1つの要因であり、「Claude の回答が異様に
+  // 遅い」という報告全体の唯一の原因とは限らない**(左上から/確信度順モードはこの分割の
+  // 対象外で無関係。既定モデル(claude-opus-5)+ adaptive thinking の基礎レイテンシや、
+  // Anthropic 側の一時的な遅延・障害の可能性は本PRでは検証も対処もしていない)。
   var JEV_MODEL_ID = "typesafe/jev";
   // Worker が Jev に渡すのと同じルール説明・質問文(比較条件を揃える)。Worker 側の
   // 定数をテンプレートに埋め込んでいるので、二重管理にならない。
@@ -3345,9 +3360,14 @@ var PAGE_HTML = `<!doctype html>
     } catch (e) {
       if (!isGrammarTooLargeClaudeError(e) || chunkKeys.length <= 1) throw e;
       var mid = Math.ceil(chunkKeys.length / 2);
-      // 次回以降(この周の残り・次の周)は、超過が分かったこのサイズを二度と最初から
-      // 試さないよう、学習した上限を下方修正しておく(Issue #93 のフォローアップ、#96)。
-      if (claudeAllChunkSizeHint === null || mid < claudeAllChunkSizeHint) claudeAllChunkSizeHint = mid;
+      // 今回すでに投げてしまったこの周の残りチャンクには間に合わないが、次回の
+      // askAllClaude() 呼び出し(次の周、または一時停止からの再開)からは、超過が
+      // 分かったこのサイズを二度と最初から試さないよう、学習した上限を下方修正して
+      // おく(Issue #93 のフォローアップ、#96)。極端に小さいサイズまで学習して以後
+      // 全チャンクを引きずり下ろさないよう、下限(CLAUDE_ALL_CHUNK_SIZE_HINT_FLOOR)は
+      // 割り込ませない(このチャンク自体は下限を無視してそのまま再帰的に割り続ける)。
+      var hintCandidate = Math.max(CLAUDE_ALL_CHUNK_SIZE_HINT_FLOOR, mid);
+      if (claudeAllChunkSizeHint === null || hintCandidate < claudeAllChunkSizeHint) claudeAllChunkSizeHint = hintCandidate;
       var halves = [chunkKeys.slice(0, mid), chunkKeys.slice(mid)];
       var settled = await Promise.allSettled(halves.map(function (half) {
         return askAllClaudeChunkWithRetry(puzzle, half, excludeByKey, key, signal);
