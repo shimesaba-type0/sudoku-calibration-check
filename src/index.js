@@ -2035,6 +2035,15 @@ var PAGE_HTML = `<!doctype html>
   // 構造化出力が「compiled grammar is too large」で 400 を返す(実機確認、Issue #74)。
   // 1回のリクエストで聞くマス数をここで区切り、askAllClaude() が複数回に分けて呼ぶ。
   var CLAUDE_ALL_CHUNK_SIZE = 10;
+  // CLAUDE_ALL_CHUNK_SIZE でもなお超過してチャンクを分割したことがあれば、そのサイズを
+  // 覚えておく(Issue #96、オーナー報告 2026-09-29「Claude の回答が異様に遅くなった」の
+  // 原因調査で判明)。askAllClaudeChunkWithRetry() は超過が起きたチャンクだけをその場で
+  // 半分に割って再試行する(Issue #93)が、次に「新しい問題」/「リセット」するまでは
+  // 覚えていなかったため、同じ組み合わせ(むずかしい・消去法あり・Haiku 等)では**毎周**
+  // 「規定10件で試して400→半分に割って再試行」を繰り返し、周ごとに余計な直列の
+  // 往復(レイテンシ2倍前後)を払い続けていた。一度学習すれば、以後の周は最初から
+  // 小さいサイズで送るので、この無駄な往復が消える。reset() / newPuzzle() で
+  // null に戻す(問題や設定が変われば安全なサイズも変わりうるため)。
   var JEV_MODEL_ID = "typesafe/jev";
   // Worker が Jev に渡すのと同じルール説明・質問文(比較条件を揃える)。Worker 側の
   // 定数をテンプレートに埋め込んでいるので、二重管理にならない。
@@ -2319,6 +2328,16 @@ var PAGE_HTML = `<!doctype html>
   // in-flight の間だけ「マス選びぶん」を覚えておく置き場(停止時に carryUsage へ移す)。
   var carryUsage = null;
   var inflightPriorUsage = null;
+  // 一括モード(Claude 経路)で学習した「安全なチャンクサイズ」の上限(Issue #93 の
+  // フォローアップ、#96)。null なら CLAUDE_ALL_CHUNK_SIZE をそのまま使う。
+  // askAllClaudeChunkWithRetry() が超過を検知するたびに下方修正し、reset() で戻す。
+  var claudeAllChunkSizeHint = null;
+
+  // 一括モード(Claude 経路)のチャンクサイズ。学習済みの上限(claudeAllChunkSizeHint)が
+  // あればそれを、無ければ既定の CLAUDE_ALL_CHUNK_SIZE を使う。
+  function claudeAllChunkSize() {
+    return claudeAllChunkSizeHint === null ? CLAUDE_ALL_CHUNK_SIZE : claudeAllChunkSizeHint;
+  }
 
   // 周の最初のリクエストを送る直前に呼ぶ(focusCellForDigit / selectNextCell /
   // askAllRound の先頭)。二度目以降は roundStarted で弾かれるので無条件に呼んでよい。
@@ -3326,6 +3345,9 @@ var PAGE_HTML = `<!doctype html>
     } catch (e) {
       if (!isGrammarTooLargeClaudeError(e) || chunkKeys.length <= 1) throw e;
       var mid = Math.ceil(chunkKeys.length / 2);
+      // 次回以降(この周の残り・次の周)は、超過が分かったこのサイズを二度と最初から
+      // 試さないよう、学習した上限を下方修正しておく(Issue #93 のフォローアップ、#96)。
+      if (claudeAllChunkSizeHint === null || mid < claudeAllChunkSizeHint) claudeAllChunkSizeHint = mid;
       var halves = [chunkKeys.slice(0, mid), chunkKeys.slice(mid)];
       var settled = await Promise.allSettled(halves.map(function (half) {
         return askAllClaudeChunkWithRetry(puzzle, half, excludeByKey, key, signal);
@@ -3382,7 +3404,7 @@ var PAGE_HTML = `<!doctype html>
     var key = loadAnthropicKey();
     if (!key) throw new Error("Claude の API キーが設定されていません(「Claude の設定」の「API キー(未設定)」を開いて保存してください)");
     var keys = selectionKeys();
-    var chunks = chunkArray(keys, CLAUDE_ALL_CHUNK_SIZE);
+    var chunks = chunkArray(keys, claudeAllChunkSize());
     var settled = await Promise.allSettled(chunks.map(function (chunkKeys) {
       return askAllClaudeChunkWithRetry(puzzle, chunkKeys, excludeByKey, key, signal);
     }));
@@ -4261,6 +4283,7 @@ var PAGE_HTML = `<!doctype html>
     pendingAllUsage = null;
     carryUsage = null;
     inflightPriorUsage = null;
+    claudeAllChunkSizeHint = null; // 学習したチャンクサイズもリセット/新しい問題で忘れる(Issue #93 のフォローアップ、#96)
     // 計時・コスト(Issue #55・#56)もリセット/新しい問題で0に戻す。
     runningSince = null;
     totalElapsedMs = 0;

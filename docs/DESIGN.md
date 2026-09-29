@@ -372,7 +372,8 @@ Cloudflare 側の都合で変わる。形が違っていたらこの節と `hand
     構造化出力が「The compiled grammar is too large, which would cause performance issues.
     Simplify your tool schemas or reduce the number of strict tools.」という 400 を返すことが
     実機で確認された。`askAllClaude(puzzle, excludeByKey, signal)` は `selectionKeys()` の結果を
-    `chunkArray(keys, CLAUDE_ALL_CHUNK_SIZE)`(既定 10)でチャンクに区切り、チャンクごとに
+    `chunkArray(keys, claudeAllChunkSize())`(既定 `CLAUDE_ALL_CHUNK_SIZE` = 10。下記の学習済み
+    サイズがあればそちらを使う)でチャンクに区切り、チャンクごとに
     `askAllClaudeChunkWithRetry(puzzle, chunkKeys, excludeByKey, key, signal)` を
     `Promise.allSettled` で**並列に**呼ぶ。全チャンクが同じ `AbortController`(`signal`)を
     共有するので、停止すれば全部まとめて中断される。
@@ -389,6 +390,22 @@ Cloudflare 側の都合で変わる。形が違っていたらこの節と `hand
       チャンク本体と同じやり方でマージする。片方だけ失敗しても、成功していた片方の usage は
       失敗オブジェクトの `innerPartialUsage` に載せて上に伝える(下記の `partialUsage` の
       仕組みへ合流させ、捨てない)
+    - **学習したチャンクサイズを周をまたいで記憶する(Issue #96)**: 上記の分割再試行は
+      当初、学習した「安全なチャンクサイズ」をどこにも保存していなかった。同じ組み合わせで
+      400 が出続ける状況(例: 「むずかしい」/「上級」+ 消去法あり + 特定のモデル)では、
+      **周(ラウンド)が変わるたびに毎回**「既定10件で試して400 → 半分に割って再試行」を
+      最初からやり直しており、1段目(失敗)→2段目(またはそれ以上)の往復は**直列**なので、
+      400 が出るたびにそのチャンクの実質レイテンシがほぼ2倍以上に膨らんでいた。15周回るような
+      通し実行ではこれが毎周繰り返され、「Claude の回答が異様に遅い」という体感につながって
+      いた(2026-09-29 オーナー報告。PR #94 の Opus レビューでも「should-fix(open for
+      discussion)」として指摘されていたが、当時は正しさに関わらない最適化として見送っていた)。
+      モジュール変数 `claudeAllChunkSizeHint`(既定 `null`)を追加し、`claudeAllChunkSize()`
+      が `null` なら `CLAUDE_ALL_CHUNK_SIZE` を、そうでなければヒントの値を返す。
+      `askAllClaudeChunkWithRetry()` は超過を検知して半分に割るたびに
+      `claudeAllChunkSizeHint = Math.min(現在のヒント, 割った後のサイズ)` で下方修正する
+      (既にヒントより小さい値を学習済みなら上書きしない)。`reset()` で `null` に戻す
+      (問題や設定が変われば安全なサイズも変わりうるため)。振る舞いテスト Z16(学習して
+      次回以降は最初から小さいサイズで送ること)・Z17(`reset()` で忘れること)
     - **部分失敗の扱い(PR #75 レビュー S1)**: `Promise.all` ではなく `Promise.allSettled` を使う。
       いずれかのチャンクが失敗しても、成功していたチャンクの `cells` / `usage` を先に集計してから
       エラーを投げる(`err.partialUsage` に成功ぶんの合算 usage、`err.chunkCount` にチャンク数を
@@ -1162,7 +1179,7 @@ new_sqlite_classes = ["RateLimitCounter"]
     - X4: `/compare` で2つの `iframe.compare-frame`(`model=jev` / `model=claude`)と上部バーが描かれること。「実行」(`compareRun()`)で両 `iframe.contentWindow.postMessage` に `{type:"run"}` が飛ぶこと。子からの `status` メッセージ(`event.source` で送信元を判定)で該当する見出し(`compareEls.statusJev` / `statusClaude`)だけが更新され、他オリジンの `status` は無視されること
     - X5: 比較シェルの上部バーに `CLAUDE_MODELS` の3択が出て既定値(`DEFAULT_CLAUDE_MODEL`)が選択済みであること(Issue #90)。`compareSetClaudeModel()` で `state.claudeModel` が変わり、`localStorage`(`scc.claude_settings.v1`)に保存され、両 iframe に `{type:"setClaudeModel", model}` が `postMessage` されること。不正なモデル名は無視されること。片方が `running:true` の `status` を送ってきた後は `compareSetClaudeModel()` がロックされ、`state`・`postMessage` とも変化しないこと
     - X6: 埋め込みモード(`embed=1&model=jev` / `embed=1&model=claude`)が `{type:"setClaudeModel"}` を受け取っても、`state.claudeModel` は更新するが `localStorage`(`scc.claude_settings.v1`)には一切書き戻らないこと(通常ページの保存済み `modelMode` を汚さない、PR #91 の Opus レビューで発見した回帰の再発防止)。`state.running` のときはロックされ `state.claudeModel` すら変わらないこと
-  - **一括モード**(`test/page.test.js` Z1〜Z8、Issue #48)。S/T/W/Y 系と同じ `runScript` / `makeAbortAwareFetch` / `waitFor` / `makeManualTimers` を使う。`makeAllResponse(ctx,puzzle,keys,wrongKeys)` を新設(Jev の `ask:"all"` 応答のモック。`wrongKeys` に挙げたキーだけ不正解の数字を返す。W5 の `makeCellResponse` と同じ考え方)
+  - **一括モード**(`test/page.test.js` Z1〜Z17、Issue #48)。S/T/W/Y 系と同じ `runScript` / `makeAbortAwareFetch` / `waitFor` / `makeManualTimers` を使う。`makeAllResponse(ctx,puzzle,keys,wrongKeys)` を新設(Jev の `ask:"all"` 応答のモック。`wrongKeys` に挙げたキーだけ不正解の数字を返す。W5 の `makeCellResponse` と同じ考え方)
     - Z1: 一括の1周は `fetch` 1回で `ask:"all"`・`target`/`digit` 無し、盤面は `buildSelectionSnapshot()` と一致し `SOLUTION` の各行を含まないこと。正解のみの応答なら1回の呼び出しで1周が完了すること
     - Z2: 応答後に全マス(`TOTAL_EMPTY` 件)が順に確定し、記録が `TOTAL_EMPTY` 件・すべて `m: "typesafe/jev/all"` / `o: "all"` になること
     - Z3: 一括の呼び出し中(`askAllRound` の `fetch` 待ち)の `stop()` は in-flight を abort し `queue` の長さを変えず、`run()` で再開するともう一度 `fetch` すること。応答後、確定途中(`focusCellFromCache` の確定前の待ち)の `stop()` は queue の先頭に戻り、`run()` で再開しても `fetch` せずキャッシュ(`allResults`)から続いて完走すること(`makeManualTimers()` で確定前の待ちタイマーを制御して検証)
@@ -1178,6 +1195,8 @@ new_sqlite_classes = ["RateLimitCounter"]
     - Z13(PR #94 レビュー): `askAllClaudeChunkWithRetry()` を4マスのチャンクで直接呼び出し、4→2+2→1+1+1+1 と入れ子に分割させる。各ペア(2マスの塊が1+1に割れたもの)で片方だけ成功・もう片方は429にし、**A・B両方の塊が最終的に失敗する**状況を作る。投げられる例外の `innerPartialUsage` に、A・B両方の成功ぶんの usage が合算されていること(最初の失敗(A)ぶんしか拾わない実装だと B の成功ぶんを取りこぼす。`git stash` で該当ループの修正前に戻すと落ちることを確認済み)
     - Z14(PR #94 レビュー): 一括モード(Claude 経路)で **先頭2チャンク(0・1)** をどちらも400にして5+5ずつに分割させ、それぞれのペアで片方だけ成功・もう片方は429にする(到着順は保証されないため、スキーマのキーでどちらの元チャンク由来かを判定してから成功/失敗を割り当てる)。2チャンクとも最終的に失敗して停止扱いになり、`carryUsage` に他の4チャンク+分割後に成功した2件(**2つ目の失敗チャンクの成功ぶんを含む**)の usage が合算されていること(Z13 と同じ実装ミスを `askAllClaude()` 側のループで検証。修正前に戻すと落ちることを確認済み)
     - Z15(PR #94 レビュー): `askAllClaudeChunkWithRetry()` を1マスのチャンクで直接呼び出し、grammar-too-large を返させる。`chunkKeys.length <= 1` の基底条件でそれ以上分割せずそのまま投げること(余計な fetch が増えないこと)を検証
+    - Z16(オーナー報告2026-09-29「Claude の回答が異様に遅くなった」への対応、Issue #96): `queue` を12マスに直接差し替えて `askAllClaude()` を呼ぶ。1回目は既定10件のチャンクが grammar-too-large で失敗し5+5に分割されること、`claudeAllChunkSizeHint` が5に学習されること。同じ `queue` でもう一度呼ぶ2回目は、最初から学習済みの5件ずつ(5+5+2の3チャンク)で送られ、10件まとめての無駄な最初の1回(400)が発生しないことを検証
+    - Z17(Issue #96): `claudeAllChunkSizeHint` に値を入れてから `reset()` を呼び、`null` に戻ることを検証(異なる問題・設定で不適切に小さいサイズを引きずらないため)
   - **計時・コスト**(`test/page.test.js` AA1〜AA13、Issue #55・#56)。S/T/W/Y/Z 系と同じ `runScript` / `makeAbortAwareFetch` / `waitFor` を使う。`ctx.nowMs = function(){...}` で `Date.now()` を差し替え(`RECORDS_MAX` の上書きと同じパターン)、実時間を待たずに確定値で検証する。`blankCells(solved, cells)` を新設(`ANSWER_KEY` の指定セルだけを `"."` にした81文字の盤面を作り、`applyPuzzleFromString()` で空マス数の少ない盤面に差し替えて周を短く終わらせる)
     - AA1: 空マス2つの盤面で `run()` → 1マス目確定 → 2マス目 in-flight のまま `nowMs` を進めて `stop()`(この時点で `totalElapsedMs` / `roundElapsedMs` が期待どおりの値になること、`runningSince` が `null` になること)→ 停止中にさらに `nowMs` を進める(3600ms 相当)→ `run()` で再開(`runningSince` が再開時刻に付け替わること)→ 2マス目を確定して完了。`state.roundLog[0].ms` と `totalElapsedMs` が、停止中の分を除いた合計(400ms + 200ms = 600ms)になること、`roundElapsedMs` が完了後に0へ戻っていること
     - AA2: `formatMs` / `formatUsd` の書式(3桁区切り、`$0.01` 未満は有効数字2桁程度、負値・0の扱い)。`formatRoundLogLine(entry)` が「N周目: M中K正解 (P%) — 3,214 ms / $0.0004」、`formatTotalSummary()` が `state.roundLog.length` を使って「合計 12,345 ms / $0.0012(3周)」になること
