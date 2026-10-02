@@ -802,6 +802,20 @@ function fillDigitCriteria(criteria, digits) {
   return criteria;
 }
 
+/**
+ * choice の候補(criteria)がちょうど1つしかないときの trivial な回答を作る(Issue #103)。
+ * Clef / Clef-flash は choice 質問の criteria が1個だけだと API 自体が
+ * 「Dictionary should have at least 2 items after validation」という 400 を返す(実機確認)。
+ * Jev はそのまま返す(criteria が1個でも、その1つを選ぶだけで問題なく200になる)ため、
+ * Jev の挙動はこの関数を呼ばないことで一切変えない。候補が1つしかない = 他に選びようが
+ * ないので、モデルに聞いても得られる情報は無い(確率1.0・確信度1.0は事実そのもの)。
+ */
+function trivialChoiceAnswer(keys) {
+  var probabilities = {};
+  probabilities[keys[0]] = 1;
+  return { choice: keys[0], probabilities: probabilities, confidence: 1 };
+}
+
 /** answers のキー集合が expectedKeys とちょうど一致(個数と各キー)するか。ずれていれば message を返す。 */
 function checkAnswerKeys(answers, expectedKeys, message) {
   if (Object.keys(answers).length !== expectedKeys.length) return message;
@@ -1028,6 +1042,16 @@ async function handleJudge(request, env) {
   // ask:"all" で exclude(Issue #61)により候補を絞ったマスだけの「残りの数字」
   // (readExcludeMap の byKey。validateAllAnswers にそのまま渡す)。
   var excludeByKey = {};
+  // Clef/Clef-flash(choice質問のcriteriaが1個だけだと400。実機確認、Issue #103)対応。
+  // jev はこの短絡を一切通らない(既存の挙動を変えないため)。
+  // skipAi: このリクエストで「候補1個のマスはモデルに聞かずに確定させる」短絡をしてよいか。
+  var skipAi = model !== MODEL_JEV;
+  // ask:"all" で聞かずに確定させたマスの答え({ key: {choice,probabilities,confidence} })。
+  var trivialAll = {};
+  // ask:"digit" / ask:"cell" で質問全体(選択肢が1個しかない)を丸ごと聞かずに確定させるとき、
+  // env.AI.run() 自体を呼ばない(bypassAi)。その答えは bypassAnswer に入れる。
+  var bypassAi = false;
+  var bypassAnswer = null;
 
   if (ask === ASK_ALL) {
     // 一括: 空マスごとに choice の質問を1つ作り、「そのマスに入る数字」を1回でまとめて
@@ -1045,6 +1069,12 @@ async function handleJudge(request, env) {
       var cellDigits = Object.prototype.hasOwnProperty.call(excludeByKey, allCell.key)
         ? excludeByKey[allCell.key]
         : undefined;
+      // 消去法で候補がちょうど1個に絞られたマスは、clef/clef-flash だけモデルに聞かずに
+      // 確定させ、質問自体から外す(Issue #103)。jev は skipAi が false なので常に聞く。
+      if (skipAi && cellDigits !== undefined && cellDigits.length === 1) {
+        trivialAll[allCell.key] = trivialChoiceAnswer(cellDigits);
+        continue;
+      }
       allQuestions[allCell.key] = {
         type: "choice",
         instructions: allInstructions(allCell.row, allCell.col),
@@ -1059,6 +1089,10 @@ async function handleJudge(request, env) {
       },
       questions: allQuestions,
     };
+    // 全マスが候補1個(終盤)で、聞く質問が1つも残らなければ env.AI.run() 自体を呼ばない。
+    // skipAi で明示的に絞る(jev では validateInput が空マス0個を400にするため今は
+    // 到達しないが、他の分岐と条件を揃えておく。Opus レビュー指摘)。
+    if (skipAi && expectedKeys.length === 0) bypassAi = true;
   } else if (ask === ASK_WHERE) {
     // 数字ごと: 空マスごとに noul の質問を1つ作り、「このマスに digit が入るか」を
     // まとめて1回で聞く(Issue #45)。criteria は使わず、質問キーがマスのキーになる。
@@ -1105,6 +1139,12 @@ async function handleJudge(request, env) {
         },
       },
     };
+    // 空マスが盤面全体でちょうど1個(終盤)のときは選びようが無いので聞かずに確定させる
+    // (Issue #103)。
+    if (skipAi && expectedKeys.length === 1) {
+      bypassAi = true;
+      bypassAnswer = trivialChoiceAnswer(expectedKeys);
+    }
   } else if (ask === ASK_DIGIT) {
     // exclude(Issue #61)で外した数字は criteria からも expectedKeys からも落とす。
     // 省略・空配列なら 1〜9 全部で従来とまったく同じ payload になる。
@@ -1127,6 +1167,11 @@ async function handleJudge(request, env) {
         },
       },
     };
+    // 消去法(exclude)で候補がちょうど1個に絞られたときは聞かずに確定させる(Issue #103)。
+    if (skipAi && expectedKeys.length === 1) {
+      bypassAi = true;
+      bypassAnswer = trivialChoiceAnswer(expectedKeys);
+    }
   } else {
     // validateInput が弾いているので通常ここには来ない。来ても 500 にせず 400 で返す(S2)。
     return errorResponse(ASK_ERROR, 400, rate.headers);
@@ -1137,36 +1182,47 @@ async function handleJudge(request, env) {
   // model フィールドを持たない(既存の payload 形式・テストを変えないため)。
   if (model !== MODEL_JEV) payload.model = model;
 
+  // bypassAi(Issue #103。候補が1個しかなく聞く意味が無い)のときは env.AI.run() 自体を
+  // 呼ばない。payload は「送るとしたらこの形」のまま request に残す(透明性のため)。
   var result;
-  try {
-    result = await env.AI.run(AI_BINDING_IDS[model], payload);
-  } catch (err) {
-    console.error("AI.run failed", err);
-    return jsonResponse(
-      {
-        error: "AIの呼び出しに失敗しました",
-        raw: truncate(String((err && err.message) || err)),
-        // env.AI.run に渡したペイロードそのもの(Issue #34)。失敗時もフロントで
-        // 「何を送って失敗したか」を確認できるように添える。
-        request: payload,
-      },
-      502,
-      rate.headers
-    );
+  if (!bypassAi) {
+    try {
+      result = await env.AI.run(AI_BINDING_IDS[model], payload);
+    } catch (err) {
+      console.error("AI.run failed", err);
+      return jsonResponse(
+        {
+          error: "AIの呼び出しに失敗しました",
+          raw: truncate(String((err && err.message) || err)),
+          // env.AI.run に渡したペイロードそのもの(Issue #34)。失敗時もフロントで
+          // 「何を送って失敗したか」を確認できるように添える。
+          request: payload,
+        },
+        502,
+        rate.headers
+      );
+    }
   }
 
   // where / all は質問が空マスの数だけあるので `answers` 全体を、digit / cell は
-  // `answers[ask]` 1件を取り出して検証する。
+  // `answers[ask]` 1件を取り出して検証する。bypassAi のときは呼び出し自体をしていないので
+  // 検証もせず、trivialChoiceAnswer() が返した値をそのまま使う(Issue #103)。
   var answers = null;
   var answer = null;
-  var badAnswer;
+  var badAnswer = null;
   if (ask === ASK_ALL) {
-    var extractedAll = extractAnswers(result);
-    if (extractedAll.error !== undefined) {
-      badAnswer = extractedAll.error;
+    if (bypassAi) {
+      // 全マスが候補1個で trivialAll に確定済み。answers は空のままでよい
+      // (下のcellsOut組み立てでは allCells を回してtrivialAllを優先して見る)。
+      answers = {};
     } else {
-      answers = extractedAll.answers;
-      badAnswer = validateAllAnswers(answers, expectedKeys, excludeByKey, ANSWER_MESSAGES[ask]);
+      var extractedAll = extractAnswers(result);
+      if (extractedAll.error !== undefined) {
+        badAnswer = extractedAll.error;
+      } else {
+        answers = extractedAll.answers;
+        badAnswer = validateAllAnswers(answers, expectedKeys, excludeByKey, ANSWER_MESSAGES[ask]);
+      }
     }
   } else if (ask === ASK_WHERE) {
     var extractedWhere = extractAnswers(result);
@@ -1176,6 +1232,9 @@ async function handleJudge(request, env) {
       answers = extractedWhere.answers;
       badAnswer = validateNoulAnswers(answers, expectedKeys, ANSWER_MESSAGES[ask]);
     }
+  } else if (bypassAi) {
+    // 候補が1個しかなく聞かずに確定させた(Issue #103)。検証は不要(他の値になりようが無い)。
+    answer = bypassAnswer;
   } else {
     var extracted = extractAnswer(result, ask);
     if (extracted.error !== undefined) {
@@ -1206,15 +1265,21 @@ async function handleJudge(request, env) {
 
   // Jev のトークン使用量。ask の種類によらず 200 にそのまま添える(コスト表示用)。
   // 取り出せなければ undefined で、その場合は 200 から usage ごと省略する。
-  var usage = extractUsage(result);
+  // bypassAi(Issue #103)のときは呼び出し自体をしていないので usage も無い(undefined のまま)。
+  var usage = bypassAi ? undefined : extractUsage(result);
 
   if (ask === ASK_ALL) {
     // マスごとに digit と同じ形({ choice, probabilities, confidence })を返す。
     // `type` は落とす(digit / cell の 200 でも返していないため)。キーは行優先。
+    // 候補1個で聞かずに確定させたマス(trivialAll、Issue #103)を優先し、それ以外は
+    // モデルの応答(answers)から取る。expectedKeys ではなく全空マス(allCells)を回す
+    // (expectedKeys は実際にモデルへ聞いたマスだけなので、trivialAll のぶんが漏れるため)。
     var cellsOut = {};
-    for (var oi = 0; oi < expectedKeys.length; oi++) {
-      var cellKey = expectedKeys[oi];
-      var cellAnswer = answers[cellKey];
+    for (var oi = 0; oi < allCells.length; oi++) {
+      var cellKey = allCells[oi].key;
+      var cellAnswer = Object.prototype.hasOwnProperty.call(trivialAll, cellKey)
+        ? trivialAll[cellKey]
+        : answers[cellKey];
       cellsOut[cellKey] = {
         choice: cellAnswer.choice,
         probabilities: cellAnswer.probabilities,
