@@ -348,6 +348,52 @@ Claude のチャンク分割(Issue #74)のような対応は本 Issue では入�
 約 $1/時 × 24 ≈ 1日あたり数ドル程度に増える計算になる(それでも小さいので上限は据え置き。
 CLAUDE.md 作業ルール4の「理由なく緩めない」には抵触しない、緩めてもいないため)。
 
+#### 候補が1個しかない質問は聞かない(オーナー報告2026-10-02「呼び出しに失敗する」、Issue #103)
+
+Clef/Clef-flash をデプロイした直後にオーナーから「clef および clef flash の呼び出しに失敗する」
+という報告があった(比較モードではなく通常ページでの利用)。実機で本番 `/api/judge` に
+Playwright 経由で実際にブラウザを操作して再現し、原因を特定した:
+
+- **choice 質問の `criteria` がちょうど1個だけだと、Clef/Clef-flash は 400 を返す**
+  (`"Request body failed validation"`、`fieldErrors.questions: ["Dictionary should have at
+  least 2 items after validation, ..."]`)。Worker はこれを 502「AIの呼び出しに失敗しました」
+  として返す
+- **消去法(`exclude`。履歴 Issue #61・ルール候補 Issue #63、どちらも既定で有効)でそのマスの
+  残り候補がちょうど1個に絞られるのは、終盤でごく普通に起きる**(ルール候補だけで初手から
+  絞られることもある)。そのため「候補が十分あるときは動く」のに「通常の利用でほぼ確実に
+  起きる」という、実機確認せずには気づきにくいバグだった
+- Jev は choice の `criteria` が1個でも問題なく 200 を返す(他に選びようが無いのでその1つを
+  選ぶだけ。`exclude`(消去法)のテスト「8個外して1つだけ残すのは可」がもともとこれを前提に
+  している)。**この制約は Clef/Clef-flash 固有の API の仕様**(`questions` 全体ではなく、
+  個々の質問の `criteria` のサイズの話であることを確認済み: criteria9個・質問1個の通常の
+  リクエストは問題なく通る)
+
+対応: `model` が `"jev"` 以外(`skipAi`)のときだけ、候補(`criteria`)がちょうど1個の質問は
+`env.AI.run()` を呼ばずに `trivialChoiceAnswer(keys)`(`{choice:keys[0], probabilities:
+{[keys[0]]:1}, confidence:1}`)で直接確定させる。候補が1個しかない = 他に選びようが無いので、
+モデルに聞いても得られる情報は無い(確率1.0・確信度1.0は事実そのもの)。
+
+- `ask:"digit"` / `ask:"cell"`: 質問全体(=唯一の choice 質問)の候補が1個なら、
+  `env.AI.run()` 自体を呼ばない(`bypassAi`)。`request` には「送るとしたらこの形」の
+  payload(criteria1個のまま)を参考情報として残す。`usage` は実際の呼び出しが無いので
+  200 から省く
+- `ask:"all"`: マスごとに候補を見て、**候補1個のマスだけを質問(`questions`)から外し**、
+  `trivialAll`(`{ マスのキー: trivialChoiceAnswer の結果 }`)にその答えを積む。残りの
+  マス(候補2個以上)だけを通常どおり1回の `env.AI.run()` にまとめる。**全マスが候補1個
+  (終盤)なら `env.AI.run()` 自体を呼ばない**。最終的な `cells` は `allCells`(空マス全部)を
+  回し、`trivialAll` にあればそれを、無ければモデルの応答を使う(`expectedKeys` は実際に
+  モデルへ聞いたマスだけなので、`trivialAll` のぶんが漏れないよう `allCells` を回す)
+- **`model` が `"jev"`(省略時)のときはこの短絡を一切行わない**(`skipAi = model !==
+  MODEL_JEV`)。Jev は criteria1個でも200を返すため、挙動を変える必要が無い。回帰テストで、
+  jev の場合は候補1個のマスがあっても従来どおり全マスが `questions` に残ること・
+  `env.AI.run()` が必ず呼ばれることを確認している
+- `ask:"where"` は noul(criteria を持たない)なのでこの問題の対象外。今回は対応していない
+  (フロントも未実装)
+
+振る舞いテストは `test/judge.test.js` の "Issue #103" を参照(10章)。本番デプロイ後、実際に
+`exclude` で候補を1個に絞ったリクエストを `model:"clef"`/`"clef-flash"` で叩いて200になる
+ことを確認する(`docs/HANDOFF.md` 6章に結果を記載)。
+
 ### 3.5 `PAGE_HTML`
 
 バッククォート付きテンプレートリテラルにHTML全体を格納。テンプレート内の `${...}` は **Worker側の定数・識別子をフロント(Claude 経路・Clef/Clef-flash 対応)に埋め込む箇所だけ**(`var NOTE = ${JSON.stringify(NOTE)};` の形。`NOTE` / `INSTRUCTIONS` / `CELL_NOTE` / `CELL_INSTRUCTIONS` / `ALL_NOTE`(Claude 経路が Jev と同じルール説明・質問文を使うため。3.6)、`CLEF_MODEL_ID` / `CLEF_FLASH_MODEL_ID`(Worker 側の `AI_BINDING_IDS` から引く。Issue #99)。二重管理にならないよう、この形を使い回す)。それ以外で `${}` を書く必要が出たら `\${}` とエスケープすること。
@@ -1209,6 +1255,7 @@ new_sqlite_classes = ["RateLimitCounter"]
   - **`usage`(Issue #56)**: 200(`digit` / `cell` / `where` / `all` すべて)に `usage: { input_tokens, output_tokens }` が付き、モックの実測値と一致すること。ラッパー無しの応答ではトップレベルの `usage` を読み、ラッパーがあるときはトップレベルの `usage` にフォールバックしないこと。`usage` が無い・オブジェクトでない・片方が非数値 / NaN / Infinity / 負値なら 200 のまま `usage` ごと省略されること。502 には付かないこと
   - **`model`(Clef / Clef-flash 対応、Issue #99、`test/judge.test.js`・`test/invariants.test.js`)**: 省略時・`"jev"` 明示のどちらも `env.AI.run` が `"typesafe/jev"` を呼び、payload に `model` フィールドを足さないこと。`"clef"` / `"clef-flash"` はそれぞれ `"@cf/cloudflare/clef"` / `"@cf/cloudflare/clef-flash"` を呼び、payload の `model` フィールドが同じ文字列になること。不正な値(文字列・数値・`null`・配列・オブジェクト)は400で `AI.run` を呼ばないこと。`ask:"all"` / `ask:"cell"` / `ask:"where"` のいずれと組み合わせても同様に動く(`ask` と `model` は直交)こと。不変条件1: `model:"clef"` の payload も `state` の形は jev と同じで正解表を含まず、足されるのは `model` フィールドだけであること。**`extractAnswers` の REST形式ラッパー対応(Opus レビュー指摘)**: `state` フィールドの無い `{result,success,errors,messages}` 形(実機確認したREST API そのままの形)でも `success:true` なら200になること、`success:false` なら502「AIの応答が失敗を示しています」になること(修正前は `state` が無いだけで常に502「AIの応答が完了していません」になっていたバグ。修正前に戻すと fail することを確認済み)
   - **Clef / Clef-flash(フロント、Issue #99、`test/page.test.js`)**: `currentModelId()` が `modelMode` に応じて `JEV_MODEL_ID` / `CLEF_MODEL_ID` / `CLEF_FLASH_MODEL_ID` を返すこと。`judgeCellJev` / `askCellJev` / `askAllJev` が `workerModelField()` に応じて `fetch` ボディの `model` を足す(jev は従来どおり付けない)こと。`model-toggle` の `<select>` に Clef/Clef-flash の `<option>` が出て、`setModelMode()` がこの2値も受け付け、不正な値は無視すること。単価テーブル(`defaultPrices()`)に `@cf/cloudflare/clef` / `@cf/cloudflare/clef-flash` が入力単価のみ(出力0)で入っていること
+  - **候補1個の質問はモデルに聞かない(Issue #103、`test/judge.test.js`「Issue #103」)**: `model:"clef"`/`"clef-flash"` で `ask` 省略(digit)/ `ask:"cell"` の候補(criteria)がちょうど1個なら `env.AI.run()` を呼ばずに200({choice,probabilities,confidence}がtrivialな値)を返し、`usage` が付かないこと。`ask:"all"` は候補1個のマスだけ質問(`questions`)から外し、残りのマスだけモデルに聞くこと(質問数が減ること・trivialなマスの答えが正しく `cells` に出ること)。全マスが候補1個なら `env.AI.run()` を一切呼ばず、`request.questions` が空になること。**`model` 省略(jev)では候補1個のマスがあっても従来どおり全マスを `questions` に含め、`env.AI.run()` を必ず呼ぶこと**(回帰テスト)
   - content-type: `text/plain` や content-type 無しのリクエストが 415 になり、`AI.run` もレート制限のカウンタも触られないこと
   - 入力検証: 3.3 の各項目について 400 になること(対象マスが空でない場合を含む)。正常入力で 200 と9キーの `probabilities` が返ること
   - レート制限: IP上限・全体上限それぞれの超過で 429 と `Retry-After` / `X-RateLimit-Scope` が返ること。全体超過時に全体を `peek` するだけで IP 側のインスタンスを呼ばないこと。`Retry-After` が `(bucket+1)*window - now` であること。`RATE_LIMITER` が無ければ通ること(フェイルオープン)。カウンタの呼び出しが例外を投げる / 500 を返せば 503 になり `AI.run` が呼ばれないこと(フェイルクローズ)。`[vars]` の値が反映され、紛らわしい表記が既定値に落ちること。残数ヘッダーが 200 / 400 / 502 に付き、429 / 503 には付かないこと

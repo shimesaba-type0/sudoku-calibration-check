@@ -1947,3 +1947,144 @@ test('REST API 形式のラッパーで success:false なら502になる(state�
   assert.equal(body.error, "AIの応答が失敗を示しています");
   assert.deepEqual(body.request, env.aiCalls[0].payload);
 });
+
+// -------------------------------------------------------------------
+// Issue #103: Clef/Clef-flash は choice 質問の criteria が1個だと400を返す
+// (実機確認: "Dictionary should have at least 2 items after validation")。
+// 消去法(exclude)で候補がちょうど1個に絞られたら、clef/clef-flash だけは
+// モデルに聞かずに確定させる(jev は従来どおり常に聞く)。
+// -------------------------------------------------------------------
+
+test('Issue #103: ask:"digit" + model:clef で候補が1個に絞られたら env.AI.run を呼ばずに確定させる', async () => {
+  var env = makeEnv();
+  var res = await worker.fetch(
+    judgeRequest(validBody({ model: "clef", exclude: ["1", "2", "3", "5", "6", "7", "8", "9"] })),
+    env
+  );
+  var body = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(body));
+  assert.equal(env.aiCalls.length, 0, "候補1個なのに env.AI.run を呼んでいる");
+  assert.deepStrictEqual(body.choice, "4");
+  assert.deepStrictEqual(body.probabilities, { "4": 1 });
+  assert.deepStrictEqual(body.confidence, 1);
+  assert.equal(body.usage, undefined, "AIを呼んでいないのにusageが付いている");
+  // request には「送るとしたらこの形」の payload が参考として残る(criteria は1個)
+  assert.deepStrictEqual(body.request.questions.digit.criteria, { 4: "the digit 4" });
+});
+
+test('Issue #103: ask:"digit" + model:clef-flash でも同様に候補1個ならAIを呼ばない', async () => {
+  var env = makeEnv();
+  var res = await worker.fetch(
+    judgeRequest(validBody({ model: "clef-flash", exclude: ["1", "2", "3", "4", "6", "7", "8", "9"] })),
+    env
+  );
+  var body = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(body));
+  assert.equal(env.aiCalls.length, 0);
+  assert.deepStrictEqual(body.choice, "5");
+  assert.deepStrictEqual(body.probabilities, { "5": 1 });
+  assert.deepStrictEqual(body.confidence, 1);
+});
+
+test('Issue #103: ask:"digit" + model省略(jev)は候補1個でも従来どおり必ず env.AI.run を呼ぶ(挙動を変えない)', async () => {
+  var env = makeEnv({ aiResult: digitResponseWith(["4"], "4") });
+  var res = await worker.fetch(
+    judgeRequest(validBody({ exclude: ["1", "2", "3", "5", "6", "7", "8", "9"] })),
+    env
+  );
+  var body = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(body));
+  assert.equal(env.aiCalls.length, 1, "jev なのに env.AI.run を呼んでいない(Issue #103 対応で jev の挙動を変えてしまっている)");
+  assert.equal(env.aiCalls[0].model, "typesafe/jev");
+});
+
+test('Issue #103: ask:"cell" + model:clef で空マスが盤面全体で1個しかなければAIを呼ばずに確定させる', async () => {
+  var puzzle = filledPuzzle(80, { row: 4, col: 4 });
+  var env = makeEnv();
+  var res = await worker.fetch(judgeRequest(validCellBody({ puzzle: puzzle, model: "clef" })), env);
+  var body = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(body));
+  assert.equal(env.aiCalls.length, 0, "空マス1個なのに env.AI.run を呼んでいる");
+  assert.equal(body.choice, "r4c4");
+  assert.deepStrictEqual(body.cell, { row: 4, col: 4 });
+  assert.deepStrictEqual(body.probabilities, { r4c4: 1 });
+  assert.deepStrictEqual(body.confidence, 1);
+  assert.equal(body.usage, undefined);
+});
+
+test('Issue #103: ask:"all" + model:clef: 候補1個のマスだけ聞かずに確定させ、残りは通常どおりモデルに聞く', async () => {
+  var trivialKey = GIVEN_CELL_KEYS[0];
+  var exclude = {};
+  exclude[trivialKey] = ["1", "2", "3", "4", "6", "7", "8", "9"]; // 残り "5" の1個だけ
+  var seenQuestionKeys = null;
+  var env = { aiCalls: [] };
+  env.AI = {
+    async run(model, payload) {
+      env.aiCalls.push({ model: model, payload: payload });
+      seenQuestionKeys = Object.keys(payload.questions);
+      var answers = {};
+      for (var i = 0; i < seenQuestionKeys.length; i++) {
+        var probs = {};
+        for (var d = 1; d <= 9; d++) probs[String(d)] = d === 7 ? 0.6 : 0.05;
+        answers[seenQuestionKeys[i]] = { type: "choice", choice: "7", probabilities: probs, confidence: 0.5 };
+      }
+      return { model: "clef", answers: answers, usage: { input_tokens: 500, output_tokens: 0 } };
+    },
+  };
+  var res = await worker.fetch(judgeRequest(validAllBody({ model: "clef", exclude: exclude })), env);
+  var body = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(body));
+  assert.equal(env.aiCalls.length, 1);
+  assert.equal(
+    seenQuestionKeys.indexOf(trivialKey) === -1,
+    true,
+    "候補1個のマスがAIへの質問に残ってしまっている"
+  );
+  assert.equal(seenQuestionKeys.length, GIVEN_CELL_KEYS.length - 1, "候補1個のマスの分だけ質問数が減っていない");
+  assert.deepStrictEqual(body.cells[trivialKey], { choice: "5", probabilities: { "5": 1 }, confidence: 1 });
+  // 他のマスは通常どおりモデルの応答から
+  var otherKey = GIVEN_CELL_KEYS[1];
+  assert.equal(body.cells[otherKey].choice, "7");
+  assert.deepStrictEqual(body.usage, { input_tokens: 500, output_tokens: 0 });
+});
+
+test('Issue #103: ask:"all" + model:clef: 全マスの候補が1個(終盤)ならAIを一切呼ばずに全部確定させる', async () => {
+  var puzzle = filledPuzzle(79);
+  var emptyKeys = emptyCellKeys(puzzle);
+  assert.equal(emptyKeys.length, 2, "この盤面は空マスが2個のはず(テストの前提)");
+  var exclude = {};
+  exclude[emptyKeys[0]] = ["1", "2", "3", "4", "6", "7", "8", "9"]; // 残り "5"
+  exclude[emptyKeys[1]] = ["1", "2", "3", "4", "5", "7", "8", "9"]; // 残り "6"
+  var aiCalled = false;
+  var env = { aiCalls: [] };
+  env.AI = { async run(model, payload) { aiCalled = true; env.aiCalls.push({ model: model, payload: payload }); return {}; } };
+  var res = await worker.fetch(judgeRequest(validAllBody({ puzzle: puzzle, model: "clef", exclude: exclude })), env);
+  var body = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(body));
+  assert.equal(aiCalled, false, "全マス候補1個なのにAIを呼んでいる");
+  assert.deepStrictEqual(body.cells[emptyKeys[0]], { choice: "5", probabilities: { "5": 1 }, confidence: 1 });
+  assert.deepStrictEqual(body.cells[emptyKeys[1]], { choice: "6", probabilities: { "6": 1 }, confidence: 1 });
+  assert.equal(body.usage, undefined, "AIを呼んでいないのにusageが付いている");
+  assert.deepStrictEqual(body.request.questions, {}, "質問が1つも残っていないはず");
+});
+
+test('Issue #103(不変条件): ask:"all" + model省略(jev)は候補1個のマスがあっても従来どおり全マスを質問に含める', async () => {
+  var trivialKey = GIVEN_CELL_KEYS[0];
+  var exclude = {};
+  exclude[trivialKey] = ["1", "2", "3", "4", "6", "7", "8", "9"]; // 残り "5" の1個だけ
+  var response = allResponseWithExclude({});
+  response.result.answers[trivialKey] = {
+    type: "choice",
+    choice: "5",
+    probabilities: { 5: 1 },
+    confidence: 1,
+  };
+  var out = await postAll(response, validAllBody({ exclude: exclude }));
+  assert.equal(out.res.status, 200, JSON.stringify(out.body));
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(out.env.aiCalls[0].payload.questions, trivialKey),
+    true,
+    "jev なのに候補1個のマスが質問から外れてしまっている(Issue #103 対応で jev の挙動を変えてしまっている)"
+  );
+  assert.equal(Object.keys(out.env.aiCalls[0].payload.questions).length, GIVEN_CELL_KEYS.length);
+});
