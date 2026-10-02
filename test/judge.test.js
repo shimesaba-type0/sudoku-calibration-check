@@ -23,6 +23,7 @@ import {
   jevAllAnswers,
   jevAllResponse,
   emptyCellKeys,
+  clefResponse,
 } from "./helpers.js";
 
 async function judge(body, envOptions) {
@@ -1829,4 +1830,79 @@ test("exclude: 付けても1呼び出し=1カウント(レート制限は不変)
   var increments = limiter.calls.filter((c) => c.op === "increment");
   assert.equal(increments.length, 2, "IP と全体を1回ずつ");
   assert.equal(env.aiCalls.length, 1);
+});
+
+// -------------------------------------------------------------------
+// model(呼び出すモデル。Issue #99。Clef / Clef-flash 対応)
+// -------------------------------------------------------------------
+
+test("model省略時は従来どおり typesafe/jev を呼び、payload に model フィールドを足さない", async () => {
+  var out = await judge(validBody());
+  assert.equal(out.res.status, 200);
+  assert.equal(out.env.aiCalls[0].model, "typesafe/jev");
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(out.env.aiCalls[0].payload, "model"),
+    false,
+    "jev の payload に model フィールドが付いている(既存の形式を変えてしまっている)"
+  );
+});
+
+test('model:"jev" を明示しても省略時と同じ(payload に model フィールドを足さない)', async () => {
+  var out = await judge(validBody({ model: "jev" }));
+  assert.equal(out.res.status, 200);
+  assert.equal(out.env.aiCalls[0].model, "typesafe/jev");
+  assert.equal(Object.prototype.hasOwnProperty.call(out.env.aiCalls[0].payload, "model"), false);
+});
+
+test('model:"clef" は @cf/cloudflare/clef を呼び、payload.model === "clef"', async () => {
+  var env = makeEnv({ aiResult: clefResponse("clef") });
+  var res = await worker.fetch(judgeRequest(validBody({ model: "clef" })), env);
+  var body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(env.aiCalls[0].model, "@cf/cloudflare/clef");
+  assert.equal(env.aiCalls[0].payload.model, "clef");
+  assert.equal(body.choice, "4");
+  assert.deepEqual(Object.keys(body.probabilities).sort(), ["1", "2", "3", "4", "5", "6", "7", "8", "9"]);
+});
+
+test('model:"clef-flash" は @cf/cloudflare/clef-flash を呼び、payload.model === "clef-flash"', async () => {
+  var env = makeEnv({ aiResult: clefResponse("clef-flash") });
+  var res = await worker.fetch(judgeRequest(validBody({ model: "clef-flash" })), env);
+  var body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(env.aiCalls[0].model, "@cf/cloudflare/clef-flash");
+  assert.equal(env.aiCalls[0].payload.model, "clef-flash");
+  assert.equal(body.choice, "4");
+});
+
+test("modelが不正な値なら400(AI呼び出しは発生しない)", async () => {
+  var cases = ["gpt-4", "Jev", "CLEF", 1, null, [], {}];
+  for (var i = 0; i < cases.length; i++) {
+    var out = await judge(validBody({ model: cases[i] }));
+    assert.equal(out.res.status, 400, JSON.stringify(cases[i]));
+    assert.equal(
+      out.body.error,
+      'modelは省略するか"jev"・"clef"・"clef-flash"のいずれかである必要があります',
+      JSON.stringify(cases[i])
+    );
+    assert.equal(out.env.aiCalls.length, 0, JSON.stringify(cases[i]));
+  }
+});
+
+test("ask:all でも model:clef を渡せば @cf/cloudflare/clef を呼ぶ(askとmodelは直交)", async () => {
+  var env = makeEnv({
+    aiResult: function () {
+      return {
+        model: "clef",
+        answers: jevAllAnswers(emptyCellKeys(GIVEN)),
+        usage: { input_tokens: 9000, output_tokens: 0 },
+      };
+    },
+  });
+  var res = await worker.fetch(judgeRequest(validAllBody({ model: "clef" })), env);
+  var body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(env.aiCalls[0].model, "@cf/cloudflare/clef");
+  assert.equal(env.aiCalls[0].payload.model, "clef");
+  assert.equal(Object.keys(body.cells).length, emptyCellKeys(GIVEN).length);
 });
