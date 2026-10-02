@@ -2307,6 +2307,18 @@ test("model-toggle(通常モード)に Clef/Clef-flash の選択肢が出て、s
   assert.equal(ctx.state.modelMode, "clef-flash", "不正な値で変わってしまった");
 });
 
+test("Clef/Clef-flash: localStorage 復元(loadClaudeSettings)と URL パラメータ(?model=)の両方で modelMode に反映される(Opus レビュー指摘でカバレッジ追加、Issue #99)", async () => {
+  var storage = makeLocalStorage();
+  storage.setItem("scc.claude_settings.v1", JSON.stringify({ modelMode: "clef", model: "claude-opus-5", thinking: true }));
+  var ctxRestored = runScript(await getPageHtml(), { localStorage: storage });
+  assert.equal(ctxRestored.state.modelMode, "clef", "localStorage の modelMode:\"clef\" が復元されない");
+
+  var ctxUrl = runScript(await getPageHtml(), {
+    location: { pathname: "/", search: "?model=clef-flash", origin: "https://example.com" },
+  });
+  assert.equal(ctxUrl.state.modelMode, "clef-flash", "URL パラメータ ?model=clef-flash が反映されない");
+});
+
 test("V4: Claude API のエラー(401 / refusal / JSON 不正)はエラーボックスに出て止まり、失敗したリクエストがパネルに残る。ネットワーク失敗は一時的な失敗として停止扱い(Issue #43)", { timeout: 10000 }, async () => {
   // opts.transient: true ならネットワーク失敗など一時的な失敗(Issue #43)として、
   // showError() ではなく pauseForTransientError() での停止(isPaused())を待つ。
@@ -5257,6 +5269,8 @@ test("AA4: costOf() と formatUsd()(Jev出力無料・Claudeの入力/出力単�
   // Clef / Clef-flash(Issue #99): 入力のみ課金、出力は常に0(Cloudflare公式ドキュメント)
   approxEqual(ctx.costOf({ m: "@cf/cloudflare/clef", u: { i: 1000000, o: 0 } }), 0.24, "Clef の入力単価");
   approxEqual(ctx.costOf({ m: "@cf/cloudflare/clef-flash", u: { i: 1000000, o: 0 } }), 0.09, "Clef-flash の入力単価");
+  // "/all" を剥がして同じ単価を引く(一括モード、Opus レビュー指摘でカバレッジ追加)
+  approxEqual(ctx.costOf({ m: "@cf/cloudflare/clef/all", u: { i: 1000000, o: 0 } }), 0.24, "@cf/cloudflare/clef/all");
   assert.equal(ctx.isPricedModel("@cf/cloudflare/clef"), true);
   assert.equal(ctx.isPricedModel("@cf/cloudflare/clef-flash"), true);
   // Claude opus(+think を剥がす。入力5・出力25)

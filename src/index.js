@@ -868,6 +868,13 @@ function validateNoulAnswers(answers, expectedKeys, messages) {
  * `result.answers` を優先し、`result` がオブジェクトでなければトップレベルの
  * `answers` に落とす。
  *
+ * Clef / Clef-flash(Issue #99)はネイティブの Workers AI モデルで、Cloudflare の
+ * REST API(`api.cloudflare.com/.../ai/run/...`)は `{ result, success, errors, messages }`
+ * という別のラッパー(`state` を持たない)を返すことを実機で確認した(Opus レビューで
+ * 指摘。`env.AI.run()` バインディングがこの形をそのまま返す可能性がある)。
+ * `state` フィールドが無いレスポンスは「未完了」の判定をせず、`success === false` の
+ * ときだけ失敗として扱う(`state` があるときは従来どおり Jev の規則のまま)。
+ *
  * 取り出せたら `{ answers }`、駄目なら `{ error }`(日本語の理由)を返す。
  * ask:"where"(Issue #45)は質問がマスの数だけあるので、1つの質問キーを取り出す
  * `extractAnswer` ではなくこちらを直接使う。
@@ -877,14 +884,19 @@ function extractAnswers(response) {
     return { error: "AIの応答が予期しない形式です" };
   }
 
-  // ゲートウェイのラッパー(result 付き)で、完了以外の状態なら中身を見ずに止める。
+  // ゲートウェイのラッパー(result 付き、Jev)で、完了以外の状態なら中身を見ずに止める。
+  // `state` フィールドが無いラッパー(REST API 形式の `{result,success,errors,messages}`
+  // など。Issue #99)は、`success === false` のときだけ失敗として扱う。
   // ラッパーが無い素の応答は state を見ない(Jev のリクエスト側の最上位フィールド名も
   // state なので、将来それがエコーされても誤って 502 にしないため)。
-  if (
-    Object.prototype.hasOwnProperty.call(response, "result") &&
-    response.state !== "Completed"
-  ) {
-    return { error: "AIの応答が完了していません" };
+  if (Object.prototype.hasOwnProperty.call(response, "result")) {
+    if (Object.prototype.hasOwnProperty.call(response, "state")) {
+      if (response.state !== "Completed") {
+        return { error: "AIの応答が完了していません" };
+      }
+    } else if (response.success === false) {
+      return { error: "AIの応答が失敗を示しています" };
+    }
   }
 
   var inner = response.result;

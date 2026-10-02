@@ -203,6 +203,34 @@ export function clefResponse(modelName) {
 }
 
 /**
+ * Clef / Clef-flash の REST API 形式のラッパー(`state` を持たない点が Jev と違う。
+ * Opus レビュー指摘、Issue #99)。`env.AI.run()` バインディングが実機で REST API と
+ * 同じラッパーをそのまま返した場合でも `extractAnswers` が 200 にできることの確認用。
+ */
+export function clefRestEnvelopeResponse(modelName) {
+  return {
+    result: {
+      model: modelName,
+      answers: { digit: jevAnswer() },
+      usage: { input_tokens: 321, output_tokens: 0 },
+    },
+    success: true,
+    errors: [],
+    messages: [],
+  };
+}
+
+/** 上の REST API 形式のラッパーで `success:false`(失敗)のときの形。 */
+export function clefRestEnvelopeFailureResponse() {
+  return {
+    result: {},
+    success: false,
+    errors: [{ message: "something went wrong" }],
+    messages: [],
+  };
+}
+
+/**
  * Map ベースの Durable Object(RateLimitCounter)スタブ。
  *
  * 本物と同じ形で使えるようにしてある: `idFromName(name)` で ID を作り、`get(id)` で

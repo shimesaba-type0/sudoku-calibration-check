@@ -322,9 +322,18 @@ Cloudflare REST API(`POST /client/v4/accounts/{account}/ai/run/@cf/cloudflare/cl
 `{state:"Completed", result:{...}, gatewayMetadata:{...}}` という特有のラッパーを返すのは
 AI Gateway を経由する外部モデルだからで(上記)、Clef/Clef-flash はそれに該当しないネイティブ
 モデルのため、一般的な Workers AI バインディングの挙動どおり **ラッパー無しの `{model,answers,usage}`
-を直接返す**と見込んでいる。`extractAnswers`/`extractUsage` はどちらの形でも動くように書かれている
-(`result` フィールドの有無で分岐する)ので、恐らく無改修で動くはずだが、本番デプロイ後に実際に
-`/api/judge` を `model:"clef"` で叩いて確認し、形が違えば `handleJudge` とこの節を同時に直す
+を直接返す**と見込んでいる。
+
+**Opus レビュー指摘(should-fix、対応済み)**: `extractAnswers` の「完了以外の状態なら 502」の
+ガードが、`result` フィールドがあって `state` フィールドが無いレスポンス(= 上記で実機確認した
+REST API そのままの `{result,success,errors,messages}` の形)に対して、`response.state !== "Completed"`
+(`undefined !== "Completed"`)が常に真になり、**`env.AI.run()` が実際にこの形で返ってきた場合に
+毎回 502「AIの応答が完了していません」になってしまう**不具合があった。`state` フィールドが
+そもそも無いレスポンスは「未完了」の判定をせず、`success === false` のときだけ失敗として扱うよう
+修正した(`state` があるときは従来どおり Jev の規則のまま)。振る舞いテストを追加(REST形式の
+成功レスポンスで200になること・`success:false` で502「AIの応答が失敗を示しています」になること)。
+これでも `env.AI.run()` が上記いずれとも異なる第三の形で返す可能性は残るので、本番デプロイ後に
+実際に `/api/judge` を `model:"clef"` で叩いて確認し、形が違えばこの節と `handleJudge` を直す
 (9 章 不変条件5 / `CLAUDE.md` 作業ルール3)。
 
 **既知の制約(未対応)**: Clef系のドキュメントに「1リクエストあたり最大64問」という上限記載が
@@ -332,6 +341,12 @@ AI Gateway を経由する外部モデルだからで(上記)、Clef/Clef-flash 
 まで生成器が収束すると空マスは64個(81-17)になり、ちょうど上限に達する。現実には「上級」の
 ベンチマーク(`docs/HANDOFF.md`)で22〜29程度にしか収束しないため、ほぼ起こらない想定。
 Claude のチャンク分割(Issue #74)のような対応は本 Issue では入れていない。
+
+**コストの上限について(Opus レビュー指摘、nit)**: Clef の入力単価($0.24/M)は Jev($0.042/M)の
+約5.7倍。呼び出し回数の上限(`wrangler.toml` の `[vars]`)は変えていないが、全体上限(500回/時)に
+24時間張り付いた最悪値は `ask:"all"` 一括モード(1回あたり入力約9,000トークン想定)で
+約 $1/時 × 24 ≈ 1日あたり数ドル程度に増える計算になる(それでも小さいので上限は据え置き。
+CLAUDE.md 作業ルール4の「理由なく緩めない」には抵触しない、緩めてもいないため)。
 
 ### 3.5 `PAGE_HTML`
 
@@ -1192,7 +1207,7 @@ new_sqlite_classes = ["RateLimitCounter"]
   - **`ask:"all"`(Issue #48)**: `payload` が期待どおりのオブジェクトと完全に一致する(`state` が `puzzle` / `note` の2つだけで `target` も `digit` も無い・`note` が `ALL_NOTE`・質問キーが空マスの一覧と行優先の順で一致・各問が `type:"choice"` で `ALL_INSTRUCTIONS_TEMPLATE` どおりの文言と `digit` と同じ 1〜9 の criteria)。200 の形(`cells` / `request` の2つだけで、`cells` の各値が `{ choice, probabilities, confidence }`(`type` は落とす)、トップレベルに `choice` / `confidence` / `probabilities` / `cell` / `digit` が付かない)と `request` が `payload` そのものであること。400(`ask` が不正(文言も)/ `target` 付き / `digit` 付き / 全部埋まった盤面 / 17個未満 / puzzle 形式)、502(`answers` が取り出せない / `state` が `"Completed"` でない / キーが質問と一致しない(余計・欠け・キー名違い)/ あるマスの `probabilities` が8キー・`choice` が `"0"`・`confidence` が文字列・値が非数値・`probabilities` ごと無い・回答がオブジェクトでない。いずれも **どのマスで落ちたか** が文言に出ること)。ラッパー無しでも 200。レート制限が1呼び出し=1カウントであること。不変条件1(`payload` の完全一致・未知キー非混入)。空マス1個・64個(17個埋まり)の境界。**`digit` / `cell` / `where` の挙動が従来どおりであること**
   - **`exclude`(消去法。Issue #61)**: `ask:"digit"` で `criteria` が残りの数字(昇順)だけになること、空配列が省略と同じ payload になること、8個外して1つ残すのは可。応答の `probabilities` が残りのキーとちょうど一致しないと 502(9キー全部を返してきた・欠け・外した数字へのすり替え)、`choice` が外した数字なら 502。400(配列でない・`null`・数値や範囲外の要素・重複・9個全部。いずれも `AI.run` を呼ばない)。`ask:"all"` でマスごとの criteria(`exclude` のあるマスだけ残り、空配列のマスと他のマスは 1〜9)と応答検証がマスごとの残りキーで行われること(どのマスで落ちたかが文言に出る)、空オブジェクトは省略と同じ、400(オブジェクトでない・キーが埋まっているマス / 形式違い / 範囲外・値が不正)。`ask:"cell"` / `ask:"where"` に付いていたら(`null` / `[]` / `{}` でも)400。1呼び出し=1カウントのまま。不変条件1(`digit` / `all` の `exclude` 付き payload の完全一致と、`exclude` の文字列も正解表も payload に載らないこと)
   - **`usage`(Issue #56)**: 200(`digit` / `cell` / `where` / `all` すべて)に `usage: { input_tokens, output_tokens }` が付き、モックの実測値と一致すること。ラッパー無しの応答ではトップレベルの `usage` を読み、ラッパーがあるときはトップレベルの `usage` にフォールバックしないこと。`usage` が無い・オブジェクトでない・片方が非数値 / NaN / Infinity / 負値なら 200 のまま `usage` ごと省略されること。502 には付かないこと
-  - **`model`(Clef / Clef-flash 対応、Issue #99、`test/judge.test.js`・`test/invariants.test.js`)**: 省略時・`"jev"` 明示のどちらも `env.AI.run` が `"typesafe/jev"` を呼び、payload に `model` フィールドを足さないこと。`"clef"` / `"clef-flash"` はそれぞれ `"@cf/cloudflare/clef"` / `"@cf/cloudflare/clef-flash"` を呼び、payload の `model` フィールドが同じ文字列になること。不正な値(文字列・数値・`null`・配列・オブジェクト)は400で `AI.run` を呼ばないこと。`ask:"all"` と組み合わせても同様に動く(`ask` と `model` は直交)こと。不変条件1: `model:"clef"` の payload も `state` の形は jev と同じで正解表を含まず、足されるのは `model` フィールドだけであること
+  - **`model`(Clef / Clef-flash 対応、Issue #99、`test/judge.test.js`・`test/invariants.test.js`)**: 省略時・`"jev"` 明示のどちらも `env.AI.run` が `"typesafe/jev"` を呼び、payload に `model` フィールドを足さないこと。`"clef"` / `"clef-flash"` はそれぞれ `"@cf/cloudflare/clef"` / `"@cf/cloudflare/clef-flash"` を呼び、payload の `model` フィールドが同じ文字列になること。不正な値(文字列・数値・`null`・配列・オブジェクト)は400で `AI.run` を呼ばないこと。`ask:"all"` / `ask:"cell"` / `ask:"where"` のいずれと組み合わせても同様に動く(`ask` と `model` は直交)こと。不変条件1: `model:"clef"` の payload も `state` の形は jev と同じで正解表を含まず、足されるのは `model` フィールドだけであること。**`extractAnswers` の REST形式ラッパー対応(Opus レビュー指摘)**: `state` フィールドの無い `{result,success,errors,messages}` 形(実機確認したREST API そのままの形)でも `success:true` なら200になること、`success:false` なら502「AIの応答が失敗を示しています」になること(修正前は `state` が無いだけで常に502「AIの応答が完了していません」になっていたバグ。修正前に戻すと fail することを確認済み)
   - **Clef / Clef-flash(フロント、Issue #99、`test/page.test.js`)**: `currentModelId()` が `modelMode` に応じて `JEV_MODEL_ID` / `CLEF_MODEL_ID` / `CLEF_FLASH_MODEL_ID` を返すこと。`judgeCellJev` / `askCellJev` / `askAllJev` が `workerModelField()` に応じて `fetch` ボディの `model` を足す(jev は従来どおり付けない)こと。`model-toggle` の `<select>` に Clef/Clef-flash の `<option>` が出て、`setModelMode()` がこの2値も受け付け、不正な値は無視すること。単価テーブル(`defaultPrices()`)に `@cf/cloudflare/clef` / `@cf/cloudflare/clef-flash` が入力単価のみ(出力0)で入っていること
   - content-type: `text/plain` や content-type 無しのリクエストが 415 になり、`AI.run` もレート制限のカウンタも触られないこと
   - 入力検証: 3.3 の各項目について 400 になること(対象マスが空でない場合を含む)。正常入力で 200 と9キーの `probabilities` が返ること
