@@ -2088,3 +2088,58 @@ test('Issue #103(不変条件): ask:"all" + model省略(jev)は候補1個のマ�
   );
   assert.equal(Object.keys(out.env.aiCalls[0].payload.questions).length, GIVEN_CELL_KEYS.length);
 });
+
+test('Issue #103(不変条件): ask:"cell" + model省略(jev)は空マスが1個でも従来どおり env.AI.run を呼ぶ', async () => {
+  var puzzle = filledPuzzle(80, { row: 4, col: 4 });
+  var env = makeEnv({ aiResult: jevCellResponse(["r4c4"]) });
+  var res = await worker.fetch(judgeRequest(validCellBody({ puzzle: puzzle })), env);
+  var body = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(body));
+  assert.equal(env.aiCalls.length, 1, "jev なのに空マス1個で env.AI.run を呼んでいない(Issue #103 対応で jev の挙動を変えてしまっている)");
+  assert.equal(env.aiCalls[0].model, "typesafe/jev");
+});
+
+test('Issue #103: ask:"digit" + model:clef で候補が2個以上あれば従来どおり env.AI.run を呼ぶ', async () => {
+  var env = makeEnv({ aiResult: digitResponseWith(["4", "5"], "4") });
+  var res = await worker.fetch(
+    judgeRequest(validBody({ model: "clef", exclude: ["1", "2", "3", "6", "7", "8", "9"] })), // 残り "4"/"5" の2個
+    env
+  );
+  var body = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(body));
+  assert.equal(env.aiCalls.length, 1, "候補2個なのに env.AI.run を呼んでいない");
+  assert.deepStrictEqual(Object.keys(env.aiCalls[0].payload.questions.digit.criteria).sort(), ["4", "5"]);
+});
+
+test('Issue #103: ask:"all" + model:clef: 候補2個以上に絞られたマスは(trivialにせず)そのままモデルに聞く', async () => {
+  var narrowedKey = GIVEN_CELL_KEYS[0];
+  var exclude = {};
+  exclude[narrowedKey] = ["1", "2", "3", "6", "7", "8", "9"]; // 残り "4"/"5" の2個
+  var seenCriteria = null;
+  var env = { aiCalls: [] };
+  env.AI = {
+    async run(model, payload) {
+      env.aiCalls.push({ model: model, payload: payload });
+      seenCriteria = payload.questions[narrowedKey].criteria;
+      var answers = {};
+      var keys = Object.keys(payload.questions);
+      for (var i = 0; i < keys.length; i++) {
+        var cellCriteria = payload.questions[keys[i]].criteria;
+        var cellKeys = Object.keys(cellCriteria);
+        var probs = {};
+        for (var j = 0; j < cellKeys.length; j++) probs[cellKeys[j]] = j === 0 ? 0.6 : 0.4 / (cellKeys.length - 1);
+        answers[keys[i]] = { type: "choice", choice: cellKeys[0], probabilities: probs, confidence: 0.5 };
+      }
+      return { model: "clef", answers: answers, usage: { input_tokens: 400, output_tokens: 0 } };
+    },
+  };
+  var res = await worker.fetch(judgeRequest(validAllBody({ model: "clef", exclude: exclude })), env);
+  var body = await res.json();
+  assert.equal(res.status, 200, JSON.stringify(body));
+  assert.deepStrictEqual(Object.keys(seenCriteria).sort(), ["4", "5"], "候補2個のマスの criteria がモデルに送られていない");
+  assert.equal(
+    Object.prototype.hasOwnProperty.call(env.aiCalls[0].payload.questions, narrowedKey),
+    true,
+    "候補2個のマスが誤って質問から外れている(trivial 扱いされてしまっている)"
+  );
+});

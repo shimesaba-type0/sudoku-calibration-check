@@ -1090,7 +1090,9 @@ async function handleJudge(request, env) {
       questions: allQuestions,
     };
     // 全マスが候補1個(終盤)で、聞く質問が1つも残らなければ env.AI.run() 自体を呼ばない。
-    if (expectedKeys.length === 0) bypassAi = true;
+    // skipAi で明示的に絞る(jev では validateInput が空マス0個を400にするため今は
+    // 到達しないが、他の分岐と条件を揃えておく。Opus レビュー指摘)。
+    if (skipAi && expectedKeys.length === 0) bypassAi = true;
   } else if (ask === ASK_WHERE) {
     // 数字ごと: 空マスごとに noul の質問を1つ作り、「このマスに digit が入るか」を
     // まとめて1回で聞く(Issue #45)。criteria は使わず、質問キーがマスのキーになる。
@@ -1211,7 +1213,7 @@ async function handleJudge(request, env) {
   if (ask === ASK_ALL) {
     if (bypassAi) {
       // 全マスが候補1個で trivialAll に確定済み。answers は空のままでよい
-      // (下のcellsOut組み立てでは allCells を totalしてtrivialAllを優先して見る)。
+      // (下のcellsOut組み立てでは allCells を回してtrivialAllを優先して見る)。
       answers = {};
     } else {
       var extractedAll = extractAnswers(result);
