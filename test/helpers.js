@@ -185,6 +185,52 @@ export function bareJevResponse() {
 }
 
 /**
+ * Clef / Clef-flash(Issue #99)の env.AI.run() 応答。Cloudflare REST API
+ * (api.cloudflare.com/.../ai/run/@cf/cloudflare/clef)を実機で叩いて確認した形は
+ * `{result:{model,answers,usage},success,errors,messages}` だったが、これは HTTP API
+ * 自体のラッパーであり、Workers AI バインディング(env.AI.run())はネイティブモデルでは
+ * 通常ラッパー無しの中身だけを返す(Jev が `{state,result,gatewayMetadata}` という
+ * 特有の形を返すのは AI Gateway 経由の外部モデルだからで、Clef はそれに該当しない)。
+ * 本番デプロイ後に実際に確認し、違えばこのヘルパーと handleJudge を直す
+ * (CLAUDE.md 作業ルール3)。
+ */
+export function clefResponse(modelName) {
+  return {
+    model: modelName,
+    answers: { digit: jevAnswer() },
+    usage: { input_tokens: 321, output_tokens: 0 },
+  };
+}
+
+/**
+ * Clef / Clef-flash の REST API 形式のラッパー(`state` を持たない点が Jev と違う。
+ * Opus レビュー指摘、Issue #99)。`env.AI.run()` バインディングが実機で REST API と
+ * 同じラッパーをそのまま返した場合でも `extractAnswers` が 200 にできることの確認用。
+ */
+export function clefRestEnvelopeResponse(modelName) {
+  return {
+    result: {
+      model: modelName,
+      answers: { digit: jevAnswer() },
+      usage: { input_tokens: 321, output_tokens: 0 },
+    },
+    success: true,
+    errors: [],
+    messages: [],
+  };
+}
+
+/** 上の REST API 形式のラッパーで `success:false`(失敗)のときの形。 */
+export function clefRestEnvelopeFailureResponse() {
+  return {
+    result: {},
+    success: false,
+    errors: [{ message: "something went wrong" }],
+    messages: [],
+  };
+}
+
+/**
  * Map ベースの Durable Object(RateLimitCounter)スタブ。
  *
  * 本物と同じ形で使えるようにしてある: `idFromName(name)` で ID を作り、`get(id)` で

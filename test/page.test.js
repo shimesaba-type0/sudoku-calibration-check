@@ -2245,6 +2245,78 @@ test("V3: thinking の指定はモデルごとに変わる(Opus/Sonnet: adaptive
   assert.equal(ctx.currentModelId(), "claude-haiku-4-5+think");
   ctx.setModelMode("jev");
   assert.equal(ctx.currentModelId(), "typesafe/jev");
+  ctx.setModelMode("clef");
+  assert.equal(ctx.currentModelId(), "@cf/cloudflare/clef");
+  ctx.setModelMode("clef-flash");
+  assert.equal(ctx.currentModelId(), "@cf/cloudflare/clef-flash");
+});
+
+test("Clef/Clef-flash(Issue #99): judgeCellJev/askCellJev/askAllJev が modelMode に応じて body.model を足す(jevは従来どおり足さない)", async () => {
+  var capturedBody = null;
+  var ctx = runScript(await getPageHtml(), {
+    fetch: function (url, init) {
+      capturedBody = JSON.parse(init.body);
+      return Promise.resolve({
+        ok: true,
+        json: async function () {
+          return { probabilities: { "4": 0.9 }, choice: "4", confidence: 0.5, request: {} };
+        },
+      });
+    },
+  });
+
+  ctx.setModelMode("jev");
+  await ctx.judgeCellJev(ctx.GIVEN, 0, 2, [], null);
+  assert.equal(Object.prototype.hasOwnProperty.call(capturedBody, "model"), false, "jev なのに body.model が付いている");
+
+  ctx.setModelMode("clef");
+  await ctx.judgeCellJev(ctx.GIVEN, 0, 2, [], null);
+  assert.equal(capturedBody.model, "clef");
+
+  ctx.setModelMode("clef-flash");
+  await ctx.judgeCellJev(ctx.GIVEN, 0, 2, [], null);
+  assert.equal(capturedBody.model, "clef-flash");
+
+  await ctx.askCellJev(ctx.GIVEN, null);
+  assert.equal(capturedBody.model, "clef-flash");
+  assert.equal(capturedBody.ask, "cell");
+
+  await ctx.askAllJev(ctx.GIVEN, {}, null);
+  assert.equal(capturedBody.model, "clef-flash");
+  assert.equal(capturedBody.ask, "all");
+
+  ctx.setModelMode("jev");
+  await ctx.askCellJev(ctx.GIVEN, null);
+  assert.equal(Object.prototype.hasOwnProperty.call(capturedBody, "model"), false, "jev の askCellJev に body.model が付いている");
+  await ctx.askAllJev(ctx.GIVEN, {}, null);
+  assert.equal(Object.prototype.hasOwnProperty.call(capturedBody, "model"), false, "jev の askAllJev に body.model が付いている");
+});
+
+test("model-toggle(通常モード)に Clef/Clef-flash の選択肢が出て、setModelMode が受け付ける(Issue #99)", async () => {
+  var ctx = runScript(await getPageHtml());
+  ctx.render();
+  var html = ctx.appElement.innerHTML;
+  assert.ok(html.includes('<option value="clef"'), "Clef の選択肢が無い");
+  assert.ok(html.includes('<option value="clef-flash"'), "Clef-flash の選択肢が無い");
+
+  ctx.setModelMode("clef");
+  assert.equal(ctx.state.modelMode, "clef");
+  ctx.setModelMode("clef-flash");
+  assert.equal(ctx.state.modelMode, "clef-flash");
+  ctx.setModelMode("not-a-model");
+  assert.equal(ctx.state.modelMode, "clef-flash", "不正な値で変わってしまった");
+});
+
+test("Clef/Clef-flash: localStorage 復元(loadClaudeSettings)と URL パラメータ(?model=)の両方で modelMode に反映される(Opus レビュー指摘でカバレッジ追加、Issue #99)", async () => {
+  var storage = makeLocalStorage();
+  storage.setItem("scc.claude_settings.v1", JSON.stringify({ modelMode: "clef", model: "claude-opus-5", thinking: true }));
+  var ctxRestored = runScript(await getPageHtml(), { localStorage: storage });
+  assert.equal(ctxRestored.state.modelMode, "clef", "localStorage の modelMode:\"clef\" が復元されない");
+
+  var ctxUrl = runScript(await getPageHtml(), {
+    location: { pathname: "/", search: "?model=clef-flash", origin: "https://example.com" },
+  });
+  assert.equal(ctxUrl.state.modelMode, "clef-flash", "URL パラメータ ?model=clef-flash が反映されない");
 });
 
 test("V4: Claude API のエラー(401 / refusal / JSON 不正)はエラーボックスに出て止まり、失敗したリクエストがパネルに残る。ネットワーク失敗は一時的な失敗として停止扱い(Issue #43)", { timeout: 10000 }, async () => {
@@ -5194,6 +5266,13 @@ test("AA4: costOf() と formatUsd()(Jev出力無料・Claudeの入力/出力単�
   approxEqual(ctx.costOf({ m: "typesafe/jev", u: { i: 1000000, o: 1000000 } }), 0.042, "Jev の入力単価");
   // "/all" を剥がして typesafe/jev の単価を引く
   approxEqual(ctx.costOf({ m: "typesafe/jev/all", u: { i: 1000000, o: 0 } }), 0.042, "typesafe/jev/all");
+  // Clef / Clef-flash(Issue #99): 入力のみ課金、出力は常に0(Cloudflare公式ドキュメント)
+  approxEqual(ctx.costOf({ m: "@cf/cloudflare/clef", u: { i: 1000000, o: 0 } }), 0.24, "Clef の入力単価");
+  approxEqual(ctx.costOf({ m: "@cf/cloudflare/clef-flash", u: { i: 1000000, o: 0 } }), 0.09, "Clef-flash の入力単価");
+  // "/all" を剥がして同じ単価を引く(一括モード、Opus レビュー指摘でカバレッジ追加)
+  approxEqual(ctx.costOf({ m: "@cf/cloudflare/clef/all", u: { i: 1000000, o: 0 } }), 0.24, "@cf/cloudflare/clef/all");
+  assert.equal(ctx.isPricedModel("@cf/cloudflare/clef"), true);
+  assert.equal(ctx.isPricedModel("@cf/cloudflare/clef-flash"), true);
   // Claude opus(+think を剥がす。入力5・出力25)
   approxEqual(ctx.costOf({ m: "claude-opus-5+think", u: { i: 1000000, o: 1000000 } }), 30, "claude-opus-5+think");
   // "+think" と "/all" の両方を剥がす

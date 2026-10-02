@@ -2,7 +2,8 @@
  * sudoku-calibration-check — Cloudflare Worker 本体
  *
  * GET  /           … フロントエンド一式(PAGE_HTML)
- * POST /api/judge  … 盤面と対象マスを受け取り、typesafe/jev に1マス分の確率を聞いて返す
+ * POST /api/judge  … 盤面と対象マスを受け取り、Jev/Clef/Clef-flash(model、省略時jev)に
+ *                     1マス分の確率を聞いて返す
  * GET  /api/status … レート制限の残り回数を読むだけ(カウンタは加算しない)
  *
  * 設計は docs/DESIGN.md 3章・6章・7章・10章に対応する。
@@ -18,6 +19,24 @@
 var MIN_FILLED_CELLS = 17;
 
 var DIGITS = ["1", "2", "3", "4", "5", "6", "7", "8", "9"];
+
+// Worker 側で呼べるモデル(Issue #99)。いずれも Jev と同じ「System One API」
+// (state + questions、noul/choice/score)に従うので、ask ごとの質問文・criteria の
+// 組み立ては共通で、呼び出すバインディングと payload の model フィールドだけが変わる。
+// "jev" が既定(省略時。後方互換のため payload に model フィールドを足さない)。
+// clef/clef-flash は Cloudflare 自前の decision model(2026-10-01 発表)。実機で
+// 「@cf/cloudflare/clef には model:"clef"、@cf/cloudflare/clef-flash には
+// model:"clef-flash" でなければ 400(Unsupported model)」と確認済み(バインディングIDと
+// payload の model は1対1)。
+var MODEL_JEV = "jev";
+var MODEL_CLEF = "clef";
+var MODEL_CLEF_FLASH = "clef-flash";
+var AI_BINDING_IDS = {
+  jev: "typesafe/jev",
+  clef: "@cf/cloudflare/clef",
+  "clef-flash": "@cf/cloudflare/clef-flash",
+};
+var MODEL_ERROR = 'modelは省略するか"jev"・"clef"・"clef-flash"のいずれかである必要があります';
 
 // レート制限の既定値(wrangler.toml の [vars] が無い・読めないときだけ使う)
 var DEFAULT_WINDOW_SECONDS = 3600;
@@ -497,6 +516,19 @@ function readAsk(body) {
 }
 
 /**
+ * リクエストの model(呼び出すモデル。Issue #99)を読む。省略時は従来どおり "jev"。
+ * 未知の値は null を返し、呼び出し側が 400 にする(readAsk と同じ考え方)。
+ */
+function readModel(body) {
+  if (body === null || typeof body !== "object") return null;
+  if (body.model === undefined) return MODEL_JEV;
+  if (body.model === MODEL_JEV || body.model === MODEL_CLEF || body.model === MODEL_CLEF_FLASH) {
+    return body.model;
+  }
+  return null;
+}
+
+/**
  * 盤面の空マスを行優先の順で列挙する。
  * 戻り値は `{ key: "r0c2", row: 0, col: 2 }` の配列(ask:"cell" の criteria の元)。
  */
@@ -585,15 +617,18 @@ function readExcludeMap(value, puzzle) {
  * 空マスが1個も無ければ聞くものが無いので 400。where はさらに digit("1"〜"9" の文字列)が
  * 必須で、逆に all は digit を取らない(付いていたら 400)。
  */
-function validateInput(body, ask) {
+function validateInput(body, ask, model) {
   if (body === null || typeof body !== "object" || Array.isArray(body)) {
     return "puzzle(9行の配列)とtarget({row,col})が必要です";
   }
 
-  // ask は呼び出し元(handleJudge)が readAsk で 1 回だけ解釈して渡す(レビュー指摘 S1。
-  // 2 か所で別々に解釈すると、検証順の変更で null が素通りする余地ができる)。
+  // ask / model は呼び出し元(handleJudge)が readAsk / readModel で 1 回だけ解釈して渡す
+  // (レビュー指摘 S1。2 か所で別々に解釈すると、検証順の変更で null が素通りする余地ができる)。
   if (ask !== ASK_DIGIT && ask !== ASK_CELL && ask !== ASK_WHERE && ask !== ASK_ALL) {
     return ASK_ERROR;
+  }
+  if (model !== MODEL_JEV && model !== MODEL_CLEF && model !== MODEL_CLEF_FLASH) {
+    return MODEL_ERROR;
   }
 
   var puzzle = body.puzzle;
@@ -833,6 +868,13 @@ function validateNoulAnswers(answers, expectedKeys, messages) {
  * `result.answers` を優先し、`result` がオブジェクトでなければトップレベルの
  * `answers` に落とす。
  *
+ * Clef / Clef-flash(Issue #99)はネイティブの Workers AI モデルで、Cloudflare の
+ * REST API(`api.cloudflare.com/.../ai/run/...`)は `{ result, success, errors, messages }`
+ * という別のラッパー(`state` を持たない)を返すことを実機で確認した(Opus レビューで
+ * 指摘。`env.AI.run()` バインディングがこの形をそのまま返す可能性がある)。
+ * `state` フィールドが無いレスポンスは「未完了」の判定をせず、`success === false` の
+ * ときだけ失敗として扱う(`state` があるときは従来どおり Jev の規則のまま)。
+ *
  * 取り出せたら `{ answers }`、駄目なら `{ error }`(日本語の理由)を返す。
  * ask:"where"(Issue #45)は質問がマスの数だけあるので、1つの質問キーを取り出す
  * `extractAnswer` ではなくこちらを直接使う。
@@ -842,14 +884,19 @@ function extractAnswers(response) {
     return { error: "AIの応答が予期しない形式です" };
   }
 
-  // ゲートウェイのラッパー(result 付き)で、完了以外の状態なら中身を見ずに止める。
+  // ゲートウェイのラッパー(result 付き、Jev)で、完了以外の状態なら中身を見ずに止める。
+  // `state` フィールドが無いラッパー(REST API 形式の `{result,success,errors,messages}`
+  // など。Issue #99)は、`success === false` のときだけ失敗として扱う。
   // ラッパーが無い素の応答は state を見ない(Jev のリクエスト側の最上位フィールド名も
   // state なので、将来それがエコーされても誤って 502 にしないため)。
-  if (
-    Object.prototype.hasOwnProperty.call(response, "result") &&
-    response.state !== "Completed"
-  ) {
-    return { error: "AIの応答が完了していません" };
+  if (Object.prototype.hasOwnProperty.call(response, "result")) {
+    if (Object.prototype.hasOwnProperty.call(response, "state")) {
+      if (response.state !== "Completed") {
+        return { error: "AIの応答が完了していません" };
+      }
+    } else if (response.success === false) {
+      return { error: "AIの応答が失敗を示しています" };
+    }
   }
 
   var inner = response.result;
@@ -962,9 +1009,11 @@ async function handleJudge(request, env) {
     return errorResponse("リクエストボディをJSONとして解釈できません", 400, rate.headers);
   }
 
-  // ask(質問の種類)はここで 1 回だけ解釈し、検証にも payload 構築にも同じ値を使う。
+  // ask(質問の種類)/ model(呼び出すモデル。Issue #99)はここで1回だけ解釈し、
+  // 検証にも payload 構築にも同じ値を使う。
   var ask = readAsk(body);
-  var invalid = validateInput(body, ask);
+  var model = readModel(body);
+  var invalid = validateInput(body, ask, model);
   if (invalid !== null) {
     return errorResponse(invalid, 400, rate.headers);
   }
@@ -1083,9 +1132,14 @@ async function handleJudge(request, env) {
     return errorResponse(ASK_ERROR, 400, rate.headers);
   }
 
+  // clef/clef-flash だけ payload に model フィールドを足す(Issue #99。実機確認済み:
+  // バインディングIDと payload の model は1対1でなければ400)。jev は従来どおり
+  // model フィールドを持たない(既存の payload 形式・テストを変えないため)。
+  if (model !== MODEL_JEV) payload.model = model;
+
   var result;
   try {
-    result = await env.AI.run("typesafe/jev", payload);
+    result = await env.AI.run(AI_BINDING_IDS[model], payload);
   } catch (err) {
     console.error("AI.run failed", err);
     return jsonResponse(
@@ -2014,7 +2068,8 @@ var PAGE_HTML = `<!doctype html>
   // Claude(Anthropic API)経路(Issue #37、SPEC 7 章 拡張 3、docs/DESIGN.md 3.6)。
   // BYOK: 利用者自身の API キーをこのブラウザの localStorage にだけ置き、
   // api.anthropic.com への呼び出し以外には送らない。Worker は一切関与しない
-  // (Worker 側の AI 呼び出しは env.AI.run("typesafe/jev") のまま)。
+  // (Worker 側の AI 呼び出しは env.AI.run(jev/clef/clef-flash のいずれか)のまま。
+  // Clef / Clef-flash 対応は Issue #99)。
   // -------------------------------------------------------------------
   var ANTHROPIC_MESSAGES_URL = "https://api.anthropic.com/v1/messages";
   var ANTHROPIC_VERSION = "2023-06-01";
@@ -2060,6 +2115,13 @@ var PAGE_HTML = `<!doctype html>
   // 対象外で無関係。既定モデル(claude-opus-5)+ adaptive thinking の基礎レイテンシや、
   // Anthropic 側の一時的な遅延・障害の可能性は本PRでは検証も対処もしていない)。
   var JEV_MODEL_ID = "typesafe/jev";
+  // Clef / Clef-flash(Issue #99)の識別子。Worker 側の AI_BINDING_IDS をテンプレートに
+  // 埋め込んでいるので二重管理にならない(記録の m・単価テーブルのキーに使う)。
+  var CLEF_MODEL_ID = ${JSON.stringify(AI_BINDING_IDS.clef)};
+  var CLEF_FLASH_MODEL_ID = ${JSON.stringify(AI_BINDING_IDS["clef-flash"])};
+  // state.modelMode が取りうる値(Issue #99 で "clef"/"clef-flash" を追加)。
+  // setModelMode() / localStorage 復元 / URL パラメータ(model=)のどれも同じ集合で検証する。
+  var MODEL_MODES = ["jev", "clef", "clef-flash", "claude"];
   // Worker が Jev に渡すのと同じルール説明・質問文(比較条件を揃える)。Worker 側の
   // 定数をテンプレートに埋め込んでいるので、二重管理にならない。
   var NOTE = ${JSON.stringify(NOTE)};
@@ -2501,9 +2563,14 @@ var PAGE_HTML = `<!doctype html>
   var PRICES_STORAGE_KEY = "scc.prices.v1";
 
   // 呼び出しのたびに新しいオブジェクトを返す(呼び出し元が書き換えても定数を汚さない)。
+  // Clef / Clef-flash(Issue #99)の単価は Cloudflare 公式ドキュメント(2026-10-01)の
+  // 「$0.24 per M input tokens」「$0.09 per M input tokens」。出力トークンの単価は
+  // 記載が無く、decision model は常に output_tokens=0(Jev と同じ)なので out:0 にする。
   function defaultPrices() {
     return {
       "typesafe/jev": { in: 0.042, out: 0 },
+      "@cf/cloudflare/clef": { in: 0.24, out: 0 },
+      "@cf/cloudflare/clef-flash": { in: 0.09, out: 0 },
       "claude-opus-5": { in: 5, out: 25 },
       "claude-sonnet-5": { in: 2, out: 10 },
       "claude-haiku-4-5": { in: 1, out: 5 }
@@ -2646,9 +2713,17 @@ var PAGE_HTML = `<!doctype html>
     return result;
   }
 
+  // Worker 経由の3モデル("jev"/"clef"/"clef-flash")共通。jev は既定なので省略し、
+  // 既存の payload 形式を変えない(Issue #99)。
+  function workerModelField() {
+    return state.modelMode === "jev" ? undefined : state.modelMode;
+  }
+
   async function judgeCellJev(puzzle, r, c, exclude, signal) {
     var body = { puzzle: puzzle, target: { row: r, col: c } };
     if (exclude && exclude.length > 0) body.exclude = exclude;
+    var workerModel = workerModelField();
+    if (workerModel) body.model = workerModel;
     var res = await fetch("/api/judge", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -2702,10 +2777,13 @@ var PAGE_HTML = `<!doctype html>
   }
 
   async function askCellJev(puzzle, signal) {
+    var cellBody = { puzzle: puzzle, ask: "cell" };
+    var workerModel = workerModelField();
+    if (workerModel) cellBody.model = workerModel;
     var res = await fetch("/api/judge", {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ puzzle: puzzle, ask: "cell" }),
+      body: JSON.stringify(cellBody),
       signal: signal
     });
     if (res.ok) return res.json();
@@ -2743,6 +2821,8 @@ var PAGE_HTML = `<!doctype html>
   async function askAllJev(puzzle, excludeByKey, signal) {
     var body = { puzzle: puzzle, ask: "all" };
     if (excludeByKey && Object.keys(excludeByKey).length > 0) body.exclude = excludeByKey;
+    var workerModel = workerModelField();
+    if (workerModel) body.model = workerModel;
     var res = await fetch("/api/judge", {
       method: "POST",
       headers: { "content-type": "application/json" },
@@ -2826,7 +2906,7 @@ var PAGE_HTML = `<!doctype html>
       if (!raw) return;
       var parsed = JSON.parse(raw);
       if (!parsed || typeof parsed !== "object") return;
-      if (parsed.modelMode === "claude" || parsed.modelMode === "jev") state.modelMode = parsed.modelMode;
+      if (MODEL_MODES.indexOf(parsed.modelMode) !== -1) state.modelMode = parsed.modelMode;
       if (CLAUDE_MODELS.indexOf(parsed.model) !== -1) state.claudeModel = parsed.model;
       if (typeof parsed.thinking === "boolean") state.claudeThinking = parsed.thinking;
     } catch (e) {
@@ -2861,7 +2941,7 @@ var PAGE_HTML = `<!doctype html>
   }
 
   function setModelMode(mode) {
-    if (mode !== "jev" && mode !== "claude") return;
+    if (MODEL_MODES.indexOf(mode) === -1) return;
     if (modelSettingsLocked()) return;
     state.modelMode = mode;
     saveClaudeSettings();
@@ -2919,8 +2999,11 @@ var PAGE_HTML = `<!doctype html>
   }
 
   // 記録(scc.records.v1)の m に入れるモデル識別子。Claude は思考の有無で分ける。
+  // Worker 経由の3モデル(Issue #99)はそれぞれのバインディングIDをそのまま使う。
   function currentModelId() {
     if (state.modelMode === "claude") return state.claudeModel + (state.claudeThinking ? "+think" : "");
+    if (state.modelMode === "clef") return CLEF_MODEL_ID;
+    if (state.modelMode === "clef-flash") return CLEF_FLASH_MODEL_ID;
     return JEV_MODEL_ID;
   }
 
@@ -4378,7 +4461,7 @@ var PAGE_HTML = `<!doctype html>
     var params = parseQueryString(typeof location !== "undefined" ? location.search : "");
     var opts = {};
     if (typeof params.puzzle === "string" && params.puzzle.length === 81) opts.puzzle = params.puzzle;
-    if (params.model === "jev" || params.model === "claude") opts.model = params.model;
+    if (MODEL_MODES.indexOf(params.model) !== -1) opts.model = params.model;
     if (params.order === "scan" || params.order === "confidence" || params.order === "all") opts.order = params.order;
     if (params.speed === "slow" || params.speed === "fast") opts.speed = params.speed;
     // 消去法の2トグル(Issue #61・#63、比較シェル/埋め込み用)。不正値(0/1以外)は無視する。
@@ -4958,6 +5041,8 @@ var PAGE_HTML = `<!doctype html>
       "</select>" +
       "<select id=\\"model-toggle\\" aria-label=\\"モデル\\" onchange=\\"setModelMode(this.value)\\" " + modelDisabled + ">" +
       "<option value=\\"jev\\"" + (state.modelMode === "jev" ? " selected" : "") + ">Jev</option>" +
+      "<option value=\\"clef\\"" + (state.modelMode === "clef" ? " selected" : "") + ">Clef</option>" +
+      "<option value=\\"clef-flash\\"" + (state.modelMode === "clef-flash" ? " selected" : "") + ">Clef-flash</option>" +
       "<option value=\\"claude\\"" + (state.modelMode === "claude" ? " selected" : "") + ">Claude</option>" +
       "</select>" +
       "<select id=\\"order-toggle\\" aria-label=\\"順番\\" onchange=\\"setOrderMode(this.value)\\" " + orderDisabled + ">" +
@@ -5531,7 +5616,7 @@ var PAGE_HTML = `<!doctype html>
     } else {
       app.innerHTML =
         "<h1>数独キャリブレーションチェック</h1>" +
-        "<p class=\\"subtitle\\">Jev (typesafe/jev) または Claude に1マスずつ数字を聞き、確率の較正を目で確かめる</p>" +
+        "<p class=\\"subtitle\\">Jev / Clef / Clef-flash / Claude に1マスずつ数字を聞き、確率の較正を目で確かめる</p>" +
         "<p class=\\"compare-link\\"><a href=\\"/compare\\">比較モード(Jev / Claude を並べて実行)</a></p>" +
         // 完了/強制終了のバナーは見逃されないよう見出しの直下(ページの一番上)に出す(オーナー要望 2026-09-22)
         renderBanner() +

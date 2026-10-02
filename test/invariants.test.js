@@ -152,6 +152,31 @@ test("不変条件1: payload に正解表の行が一切含まれない", async 
   assert.deepEqual(Object.keys(env.aiCalls[0].payload.state).sort(), ["note", "puzzle", "target"]);
 });
 
+test('不変条件1: model:"clef" でも payload は jev と同じ state を持ち、正解表を含まない(足されるのは model フィールドだけ)', async () => {
+  var env = makeEnv({ aiResult: { model: "clef", answers: { digit: { type: "choice", choice: "4", probabilities: { 1: 0.1, 2: 0.1, 3: 0.1, 4: 0.2, 5: 0.1, 6: 0.1, 7: 0.1, 8: 0.1, 9: 0.1 }, confidence: 0.2 } }, usage: { input_tokens: 300, output_tokens: 0 } } });
+  var puzzle = [
+    "53.67....",
+    "6721953.8",
+    ".98....6.",
+    "8...6...3",
+    "4..8.3..1",
+    "7...2...6",
+    ".6....28.",
+    "...419..5",
+    "....8..79",
+  ];
+  await worker.fetch(judgeRequest({ puzzle: puzzle, target: { row: 0, col: 2 }, model: "clef" }), env);
+
+  assert.equal(env.aiCalls[0].model, "@cf/cloudflare/clef");
+  var serialized = JSON.stringify(env.aiCalls[0].payload);
+  for (var i = 0; i < ANSWER_KEY.length; i++) {
+    assert.ok(!serialized.includes(ANSWER_KEY[i]), "payload に正解表の " + (i + 1) + " 行目が含まれている");
+  }
+  assert.deepEqual(Object.keys(env.aiCalls[0].payload).sort(), ["model", "questions", "state"]);
+  assert.deepEqual(Object.keys(env.aiCalls[0].payload.state).sort(), ["note", "puzzle", "target"]);
+  assert.equal(env.aiCalls[0].payload.model, "clef");
+});
+
 // ask:"cell"(Issue #38)の期待値。こちらも src/index.js の CELL_NOTE /
 // CELL_INSTRUCTIONS を **意図的に複製** している(実装から import しない)。
 var EXPECTED_CELL_NOTE =
