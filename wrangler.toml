@@ -2,6 +2,15 @@ name = "sudoku-calibration-check"
 main = "src/index.js"
 compatibility_date = "2026-09-01"
 
+# サービスの一時停止(Issue #106、オーナー要望2026-10-12「終了ではなく停止、今後また
+# テストするかもしれない」)。*.workers.dev サブドメインへのルーティングを外すだけで、
+# DNSレコードの削除ではない(そもそも利用者側で管理するDNSレコードは存在しない)。
+# Worker本体のコード・Durable Object(RATE_LIMITERのレート制限カウンタ)・Workers AI
+# バインディング設定は一切変更しない。再開はこの行を削除(または false→true)して
+# npm run deploy するだけ。トップレベルのキーなので [vars] の中には置かないこと
+# ([vars] に置くと env.workers_dev という無関係な環境変数になってしまい効かない)。
+workers_dev = false
+
 # Workers AI バインディング。Worker 内では env.AI として見える。
 [ai]
 binding = "AI"
